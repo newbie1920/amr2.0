@@ -198,10 +198,25 @@ void read_ina3221() {
     int16_t rawBus = ina3221_readReg(2 + (ch - 1) * 2);
     int16_t rawShunt = ina3221_readReg(1 + (ch - 1) * 2);
     // Shift right 3 bits, LSB = 8mV
-    ina_busV[ch - 1] = (rawBus >> 3) * 0.008f;
+    float voltage = (rawBus >> 3) * 0.008f;
+    if (voltage > 1.0f) {
+        voltage -= 0.85f; // Bù trừ sai số của mạch INA3221 (so với đồng hồ đo thực tế)
+    }
+    ina_busV[ch - 1] = voltage;
+
     // Shift right 3 bits, LSB = 40uV, Shunt = 0.1Ohm -> I(A) = Vshunt / 0.1 = Vshunt * 10
     // => Current = (raw >> 3) * 0.00004 * 10 = (raw >> 3) * 0.0004
     ina_currentA[ch - 1] = (rawShunt >> 3) * 0.0004f; 
+  }
+
+  // Debug INA3221 mỗi 5 giây
+  static unsigned long lastInaDebug = 0;
+  if (millis() - lastInaDebug > 5000) {
+    lastInaDebug = millis();
+    Serial.printf("[INA3221] CH1: %.2fV %.3fA | CH2: %.2fV %.3fA | CH3: %.2fV %.3fA\n",
+                  ina_busV[0], ina_currentA[0],
+                  ina_busV[1], ina_currentA[1],
+                  ina_busV[2], ina_currentA[2]);
   }
 }
 
