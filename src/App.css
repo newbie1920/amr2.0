@@ -123,6 +123,18 @@ body {
   overflow: hidden;
 }
 
+/* Collapsed sidebars */
+.sidebar-left.collapsed {
+  width: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+.sidebar-right.collapsed {
+  width: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
 @media (max-width: 1024px) {
   .app-layout {
     grid-template-columns: 0px 1fr 300px;

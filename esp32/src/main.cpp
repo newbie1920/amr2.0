@@ -11,14 +11,19 @@
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <esp_wifi.h>
+#include <ArduinoOTA.h>
+#include <TelnetStream.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <RPLidar.h>
 #include "config.h"
 #include "navigator.h"
+#include "wheel_pid.h"
 
 // ─── MPU6050 & OLED ──────────────────────────────────────────
 #define MPU6050_ADDR 0x68
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+SemaphoreHandle_t i2cMutex;
 
 
 // ─── GLOBAL STATE ────────────────────────────────────────────
@@ -31,7 +36,8 @@ float targetLeftVel = 0, targetRightVel = 0;
 unsigned long lastCmdTime = 0;
 
 // Motor control
-float errorIntL = 0, errorIntR = 0;
+WheelPID* leftPID;
+WheelPID* rightPID;
 float lastPwmLeft = 0, lastPwmRight = 0;
 
 // Velocity measurement (low-pass filtered)
@@ -50,18 +56,25 @@ bool brakeEnabled = false;
 // Autonomous Navigator
 Navigator navigator;
 
-// Odometry (Mặc định khởi động tại Trụ Sạc 1)
+// Odometry
 float robotX = 2.5, robotY = 9.0, robotTheta = -PI/2;
 float robotDistance = 0;
 float filteredVBatt = 12.0f;
 
+// ── Lidar A1M8 ──────────────────────────────────────────────
+HardwareSerial lidarSerial(1);
+RPLidar lidar;
+uint16_t lidarDists[360] = {0}; // Lưu khoảng cách (mm) theo từng độ
+bool lidarRunning = false;
+bool obstacleDetected = false;
+unsigned long timeObstacleLastDetected = 0;
+// ────────────────────────────────────────────────────────────
+
 // Timing
-long prevT = 0;
 long lastTicksL = 0, lastTicksR = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long lastOledTime = 0;
-#define OLED_INTERVAL 1000 // Update màn hình mỗi 1s (giảm tải I²C bus)
-
+#define OLED_INTERVAL 1000
 
 // Network
 WebServer server(HTTP_PORT);
@@ -72,19 +85,23 @@ WiFiManager wm;
 //   MPU6050 BARE-METAL FUNCTIONS
 // ============================================================
 void mpu6050_writeReg(uint8_t reg, uint8_t val) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   Wire.write(val);
   Wire.endTransmission();
+  xSemaphoreGive(i2cMutex);
 }
 
 int16_t mpu6050_readReg16(uint8_t reg) {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    xSemaphoreGive(i2cMutex);
     return 0;
   }
   uint8_t rcv = Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)2);
@@ -93,12 +110,16 @@ int16_t mpu6050_readReg16(uint8_t reg) {
     delay(2);
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    xSemaphoreGive(i2cMutex);
     return 0;
   }
-  return (Wire.read() << 8) | Wire.read();
+  int16_t res = (Wire.read() << 8) | Wire.read();
+  xSemaphoreGive(i2cMutex);
+  return res;
 }
 
 bool mpu6050_init() {
+  xSemaphoreTake(i2cMutex, portMAX_DELAY);
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x75);
   Wire.endTransmission(false);
@@ -106,10 +127,12 @@ bool mpu6050_init() {
 
   if (Wire.available() < 1) {
     Serial.println("[IMU] MPU6050 KHONG TIM THAY!");
+    xSemaphoreGive(i2cMutex);
     return false;
   }
 
   uint8_t whoAmI = Wire.read();
+  xSemaphoreGive(i2cMutex);
   Serial.printf("[IMU] WHO_AM_I: 0x%02X\n", whoAmI);
 
   mpu6050_writeReg(0x6B, 0x00); // Wake up
@@ -192,240 +215,14 @@ void setMotor(int pinIN1, int pinIN2, int pwmCh, float u) {
 }
 
 // ============================================================
-//   SETUP
+//   FREERTOS CONTROL TASK (50Hz)
 // ============================================================
-void setup() {
-  Serial.begin(115200);
-  delay(500);
+void controlTask(void *pvParameters) {
+  const TickType_t xFrequency = pdMS_TO_TICKS(1000 / CONTROL_FREQ_HZ);
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  float deltaT = 1.0f / CONTROL_FREQ_HZ;
 
-  // Motor Pins
-  pinMode(MOTOR_LEFT_IN1, OUTPUT);
-  pinMode(MOTOR_LEFT_IN2, OUTPUT);
-  pinMode(MOTOR_RIGHT_IN3, OUTPUT);
-  pinMode(MOTOR_RIGHT_IN4, OUTPUT);
-
-  // PWM Setup — 5kHz optimal cho L298N (BJT driver)
-  // 20kHz gây 6% switching loss → nóng quá mức
-  // 5kHz chỉ 1.5% switching loss, tiếng vo nhỏ chấp nhận được
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(MOTOR_LEFT_EN, 0);
-  ledcSetup(1, 5000, 8);
-  ledcAttachPin(MOTOR_RIGHT_EN, 1);
-
-  // Safety: motors OFF at boot
-  ledcWrite(0, 0);
-  ledcWrite(1, 0);
-
-  // Battery ADC
-  analogSetPinAttenuation(BATT_PIN, ADC_11db);
-  pinMode(BATT_PIN, INPUT);
-
-  // Encoders
-  pinMode(ENCODER_LEFT_A, INPUT_PULLUP);
-  pinMode(ENCODER_LEFT_B, INPUT_PULLUP);
-  pinMode(ENCODER_RIGHT_A, INPUT_PULLUP);
-  pinMode(ENCODER_RIGHT_B, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_A), leftISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_B), leftISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_A), rightISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_B), rightISR, CHANGE);
-
-  // I2C Init
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);
-  Wire.setTimeout(20);
-
-  // OLED Init
-  if(display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("AMR 2.0 Booting...");
-    display.display();
-  }
-
-  // IMU
-  imuAvailable = mpu6050_init();
-
-  // WiFi
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  wm.setConnectTimeout(15);
-  wm.setConfigPortalTimeout(120);
-
-  if (!wm.autoConnect(WIFI_AP_NAME)) {
-    Serial.println("[WIFI] Ket noi that bai!");
-  }
-  WiFi.setSleep(false);
-
-  // WebSocket
-  webSocket.begin();
-  webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
-    if (type != WStype_TEXT) return;
-
-    JsonDocument doc;
-    deserializeJson(doc, payload);
-
-    // PING/PONG
-    if (doc["type"] == "ping") {
-      JsonDocument pong;
-      pong["type"] = "pong";
-      pong["ts"] = doc["ts"];
-      String out;
-      serializeJson(pong, out);
-      webSocket.sendTXT(num, out);
-      return;
-    }
-
-    // RESET ODOMETRY
-    if (doc["cmd"] == "reset_odom") {
-      robotX = 2.5; robotY = 9.0; robotTheta = -PI/2; robotDistance = 0;
-      leftTicks = rightTicks = lastTicksL = lastTicksR = 0;
-      targetLeftVel = targetRightVel = 0;
-      gyroTheta = encoderTheta = fusedTheta = robotTheta;
-      Serial.println("[CMD] Odometry reset to Charger 1.");
-    }
-
-    // SET POSE MỚI TỪ WEB
-    if (doc["cmd"] == "set_pose") {
-      if (!doc["x"].isNull()) robotX = doc["x"];
-      if (!doc["y"].isNull()) robotY = doc["y"];
-      if (!doc["theta"].isNull()) robotTheta = doc["theta"];
-      gyroTheta = encoderTheta = fusedTheta = robotTheta;
-      Serial.printf("[CMD] Set Pose: X=%.2f Y=%.2f H=%.2f\n", robotX, robotY, robotTheta * 180.0f/PI);
-    }
-
-    // ══════════════════════════════════════════════════════
-    //   NAVIGATE — Nhận lộ trình từ App, xe tự lái
-    // ══════════════════════════════════════════════════════
-    if (doc["cmd"] == "navigate") {
-      JsonArray pathArr = doc["path"].as<JsonArray>();
-      int count = pathArr.size();
-      if (count > 0 && count <= MAX_WAYPOINTS) {
-        // Parse trực tiếp vào navigator.waypoints[] — không tạo mảng tạm trên stack
-        navigator.waypointCount = count;
-        navigator.currentWpIdx = 0;
-        for (int i = 0; i < count; i++) {
-          navigator.waypoints[i].x = pathArr[i]["x"];
-          navigator.waypoints[i].y = pathArr[i]["y"];
-          navigator.waypoints[i].heading = NAN;
-          navigator.waypoints[i].useReverse = false;
-        }
-        
-        // Heading cuối cùng
-        float endH = NAN;
-        if (!doc["finalHeading"].isNull()) {
-          endH = doc["finalHeading"].as<float>() * PI / 180.0f;
-        }
-        navigator.finalHeading = endH;
-        
-        // Khởi động navigator
-        navigator.state = NAV_TURNING;
-        navigator.cmdLinear = 0;
-        navigator.cmdAngular = 0;
-        navigator.navStartTime = millis();
-        navigator.lastWpReachTime = millis();
-        
-        Serial.printf("[NAV] Path loaded: %d waypoints, finalH=%.1f\u00b0\n", 
-                      count, isnan(endH) ? -999.0f : endH * 180.0f / PI);
-        
-        // Phản hồi App
-        JsonDocument ack;
-        ack["type"] = "nav_ack";
-        ack["wp_count"] = count;
-        ack["finalH"] = isnan(endH) ? -1 : (int)(endH * 180.0f / PI);
-        String out;
-        serializeJson(ack, out);
-        webSocket.sendTXT(num, out);
-      }
-    }
-    
-    // STOP NAVIGATION
-    if (doc["cmd"] == "nav_stop") {
-      navigator.abort();
-    }
-
-    // RECALIBRATE GYRO
-    if (doc["cmd"] == "recal_gyro") {
-      gyroCalibrated = false;
-      gyroCalSamples = 0;
-      gyroCalSum = 0;
-      gyroZBias = 0;
-      Serial.println("[IMU] Gyro recalibrating...");
-    }
-
-    // BRAKE
-    if (doc["cmd"] == "brake") {
-      brakeEnabled = doc["val"];
-    }
-
-    // CONFIG
-    if (doc["type"] == "config") {
-      Serial.println("[CONFIG] Updated from App.");
-    }
-
-    // VELOCITY COMMAND (Joystick thủ công — chỉ hoạt động khi không navigate)
-    if (!doc["linear"].isNull() && !navigator.isNavigating()) {
-      float v = doc["linear"];
-      float w = doc["angular"];
-      targetLeftVel = constrain(
-        (v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-      targetRightVel = constrain(
-        (v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-      lastCmdTime = millis();
-    }
-  });
-
-  server.begin();
-  prevT = micros();
-
-  Serial.println("================================================");
-  Serial.println("  AMR 2.0 FIRMWARE — ESP32-S3 N16R8             ");
-  Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("  IMU: %s\n", imuAvailable ? "MPU6050 OK" : "KHONG CO");
-  Serial.printf("  WebSocket port: %d\n", WEBSOCKET_PORT);
-  Serial.println("================================================");
-}
-
-// ============================================================
-//   MAIN LOOP — 50Hz Control
-// ============================================================
-void loop() {
-  yield();
-  webSocket.loop();
-  server.handleClient();
-
-  // Safety timeout (chỉ áp dụng khi không tự lái)
-  if (!navigator.isNavigating() && millis() - lastCmdTime > CMD_TIMEOUT_MS) {
-    targetLeftVel = 0;
-    targetRightVel = 0;
-  }
-
-  // ── AUTONOMOUS NAVIGATOR ─────────────────────────────
-  // Moved BELOW odometry so navigator uses LATEST position
-  // (Nếu để trước odo, navigator đọc vị trí cũ 1 frame = 3mm sai số)
-  // Navigator được gọi trong 50Hz control block phía dưới
-
-  // ── EMERGENCY BRAKE ────────────────────────────────────
-  // Tắt ngay mọi chuyển động nếu có lệnh thắng gấp
-  if (brakeEnabled) {
-    targetLeftVel = 0;
-    targetRightVel = 0;
-    if (navigator.isNavigating()) {
-        navigator.abort(); // Hủy tự lái nếu bị khóa an toàn
-        Serial.println("[ESTOP] Emergency Brake! Aborting Navigator.");
-    }
-  }
-
-  // ── Control Loop: 50Hz ──────────────────────────────────
-  long currT = micros();
-  float deltaT = ((float)(currT - prevT)) / 1.0e6f;
-
-  if (deltaT >= (1.0f / CONTROL_FREQ_HZ)) {
-    prevT = currT;
-
+  for (;;) {
     // ── IMU Read ────────────────────────────────────────
     if (imuAvailable) {
       gyroZ_raw = mpu6050_readGyroZ();
@@ -435,8 +232,7 @@ void loop() {
       } else {
         gyroZ_raw -= gyroZBias;
         // Zero-velocity clamping
-        if (fabs(targetLeftVel) < 0.01f && fabs(targetRightVel) < 0.01f &&
-            fabs(gyroZ_raw) < 0.01f)
+        if (fabs(targetLeftVel) < 0.01f && fabs(targetRightVel) < 0.01f && fabs(gyroZ_raw) < 0.01f)
           gyroZ_raw = 0;
         gyroTheta += gyroZ_raw * deltaT;
         gyroTheta = atan2(sin(gyroTheta), cos(gyroTheta));
@@ -486,40 +282,33 @@ void loop() {
     robotX += dist * cos(robotTheta);
     robotY += dist * sin(robotTheta);
 
-    // ── AUTONOMOUS NAVIGATOR (sau odometry → dùng vị trí mới nhất) ──
+    // ── AUTONOMOUS NAVIGATOR ──
     if (navigator.isNavigating()) {
       navigator.update(robotX, robotY, robotTheta);
       float navV = navigator.cmdLinear;
       float navW = navigator.cmdAngular;
-      targetLeftVel = constrain(
-        (navV + navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-      targetRightVel = constrain(
-        (navV - navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-      lastCmdTime = millis();
+      targetLeftVel = constrain((navV + navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      targetRightVel = constrain((navV - navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
     }
 
     // ── Motor PI + Feedforward ──────────────────────────
-    float pwmLeft = 0, pwmRight = 0;
-    float targetL = targetLeftVel, targetR = targetRightVel;
-
+    float targetL = targetLeftVel;
+    float targetR = targetRightVel;
+    
+    // Cross-coupling sync
+    float sync = (vL_meas - vR_meas) - (targetL - targetR);
     if (fabs(targetL) > 0.01f || fabs(targetR) > 0.01f) {
-      float errL = targetL - vL_meas;
-      float errR = targetR - vR_meas;
-      errorIntL = constrain(errorIntL + errL * deltaT, -5.0f, 5.0f);
-      errorIntR = constrain(errorIntR + errR * deltaT, -5.0f, 5.0f);
-      pwmLeft = (targetL * FF_GAIN_LEFT) + KP_VEL * errL + KI_VEL * errorIntL;
-      pwmRight = (targetR * FF_GAIN_RIGHT) + KP_VEL * errR + KI_VEL * errorIntR;
+        targetL -= 0.5f * sync;
+        targetR += 0.5f * sync;
+    }
 
-      // Cross-coupling sync
-      float sync = (vL_meas - vR_meas) - (targetL - targetR);
-      pwmLeft -= 3.0f * sync;
-      pwmRight += 3.0f * sync;
+    float pwmLeft = leftPID->update(vL_meas, targetL);
+    float pwmRight = rightPID->update(vR_meas, targetR);
 
-      // Deadzone compensation
-      pwmLeft += (targetL > 0) ? MIN_PWM : -MIN_PWM;
-      pwmRight += (targetR > 0) ? MIN_PWM : -MIN_PWM;
-    } else {
-      errorIntL = errorIntR = 0;
+    // Cross-coupling pwm additional adjustment
+    if (fabs(targetL) > 0.01f || fabs(targetR) > 0.01f) {
+        pwmLeft -= 3.0f * sync; 
+        pwmRight += 3.0f * sync;
     }
 
     pwmLeft = constrain(pwmLeft, -255.0f, 255.0f);
@@ -533,62 +322,377 @@ void loop() {
     setMotor(MOTOR_LEFT_IN1, MOTOR_LEFT_IN2, 0, pwmLeft);
     setMotor(MOTOR_RIGHT_IN3, MOTOR_RIGHT_IN4, 1, pwmRight);
 
-    // ── Telemetry Broadcast (4Hz) ───────────────────────
-    if (millis() - lastTelemetryTime > TELEMETRY_INTERVAL) {
-      lastTelemetryTime = millis();
-
-      // Battery
-      long b_sum = 0;
-      for (int i = 0; i < 20; i++) b_sum += analogRead(BATT_PIN);
-      float v_now = (b_sum / 20.0f / 4095.0f) * 3.3f * BATT_SCALE_FACTOR + BATT_OFFSET;
-      filteredVBatt = filteredVBatt * 0.9f + v_now * 0.1f;
-      if (filteredVBatt < 1.0f) filteredVBatt = v_now;
-      int battPct = constrain(
-        (int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
-
-      // Build JSON telemetry — dùng static buffer tránh heap fragmentation
-      JsonDocument telem;
-      telem["telem"] = true;
-      telem["vx"] = v_robot;
-      telem["wz"] = w_fused;
-      telem["theta"] = robotTheta;
-      telem["h"] = robotTheta * 180.0f / PI;
-      telem["d"] = robotDistance;
-      telem["x"] = robotX;
-      telem["y"] = robotY;
-      telem["imu"] = imuAvailable;
-      telem["imu_cal"] = gyroCalibrated;
-      telem["gyroZ"] = gyroZ_raw;
-      telem["fTheta"] = fusedTheta * 180.0f / PI;
-
-      JsonObject enc = telem["enc"].to<JsonObject>();
-      enc["l"] = cL;
-      enc["r"] = cR;
-
-      telem["vL_t"] = targetLeftVel;
-      telem["vR_t"] = targetRightVel;
-      telem["vL_r"] = vL_meas;
-      telem["vR_r"] = vR_meas;
-      telem["pwmL"] = (int)lastPwmLeft;
-      telem["pwmR"] = (int)lastPwmRight;
-      telem["batt"] = battPct;
-
-      // Navigator state
-      telem["nav"] = navigator.getStateName();
-      telem["nav_wp"] = navigator.currentWpIdx;
-      telem["nav_total"] = navigator.waypointCount;
-
-      // Serialize vào static buffer thay vì String động
-      static char telemBuf[512];
-      size_t len = serializeJson(telem, telemBuf, sizeof(telemBuf));
-      webSocket.broadcastTXT(telemBuf, len);
-
-      // Debug serial
-      Serial.printf("[AMR2] Enc:%ld,%ld V:%.1f,%.1f IMU:%s Bat:%d%% X:%.2f Y:%.2f H:%.1f\n",
-                    cL, cR, vL_meas, vR_meas,
-                    imuAvailable ? "OK" : "--", battPct,
-                    robotX, robotY, robotTheta * 180.0f / PI);
+    // Obstacle Avoidance Auto-Pause Logic
+    if (obstacleDetected && millis() - timeObstacleLastDetected < 500) {
+        if (navigator.isNavigating() && navigator.state == NAV_TRACKING) {
+            navigator.pause();
+            Serial.println("[LIDAR] E-STOP: Phat hien vat can truoc xe!");
+        }
+        // Force stop if not navigating but manually driving with positive velocity
+        if (targetL > 0 || targetR > 0) {
+            targetLeftVel = 0;
+            targetRightVel = 0;
+        }
+    } else if (obstacleDetected && millis() - timeObstacleLastDetected >= 500) {
+        // Clear obstacle
+        obstacleDetected = false;
+        if (navigator.isNavigating() && navigator.state == NAV_PAUSED) {
+            navigator.resume();
+            Serial.println("[LIDAR] Vat can da di chuyen, RESUME!");
+        }
     }
+
+    // Hard real-time sleep
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+// ============================================================
+//   LIDAR FREERTOS TASK
+// ============================================================
+void lidarTask(void *pvParameters) {
+  lidarRunning = true;
+  for (;;) {
+    if (IS_OK(lidar.waitPoint())) {
+      float distance = lidar.getCurrentPoint().distance; // distance value in mm
+      float angle    = lidar.getCurrentPoint().angle;    // angle value in degrees
+      uint8_t quality = lidar.getCurrentPoint().quality; // quality of the current measurement
+
+      if (quality > 0) {
+        // Lưu khoảng cách vào mảng 360 độ (làm tròn độ)
+        int deg = (int)round(angle) % 360;
+        lidarDists[deg] = (uint16_t)distance;
+
+        // Xử lý E-STOP: Kiểm tra góc phía trước [-30 đến 30 độ tương ứng 330->359 và 0->30]
+        if ((deg <= 30 || deg >= 330) && distance > 50 && distance < 450) {
+            obstacleDetected = true;
+            timeObstacleLastDetected = millis();
+        }
+      }
+    } else {
+      // Mất kết nối hoặc quay quá chậm, restart
+      analogWrite(LIDAR_PWM_PIN, 0); 
+      vTaskDelay(pdMS_TO_TICKS(100));
+      lidar.begin(lidarSerial);
+      // Chạy lại động cơ Lidar (PWM ≈ 60% vòng tua 5.5Hz)
+      analogWrite(LIDAR_PWM_PIN, 150); 
+    }
+  }
+}
+
+// ============================================================
+//   SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  printf("\n\n[BOOT] Bat dau setup()...\n");
+
+  pinMode(MOTOR_LEFT_IN1, OUTPUT);
+  pinMode(MOTOR_LEFT_IN2, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN3, OUTPUT);
+  pinMode(MOTOR_RIGHT_IN4, OUTPUT);
+
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(MOTOR_LEFT_EN, 0);
+  ledcSetup(1, 5000, 8);
+  ledcAttachPin(MOTOR_RIGHT_EN, 1);
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
+
+  // Initialize Lidar
+  pinMode(LIDAR_PWM_PIN, OUTPUT);
+  lidar.begin(lidarSerial);
+  // Fix RPLidar library bug: it calls begin() natively, overwriting our RX/TX pins.
+  // We MUST call lidarSerial.begin again with our custom pins!
+  lidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
+  
+  // RPM Lidar (5.5Hz tiêu chuẩn)
+  analogWrite(LIDAR_PWM_PIN, 150); 
+
+  leftPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_LEFT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);
+  rightPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_RIGHT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);
+
+  analogSetPinAttenuation(BATT_PIN, ADC_11db);
+  pinMode(BATT_PIN, INPUT);
+
+  pinMode(ENCODER_LEFT_A, INPUT_PULLUP);
+  pinMode(ENCODER_LEFT_B, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_A, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_A), leftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT_B), leftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_A), rightISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT_B), rightISR, CHANGE);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  Wire.setTimeout(20);
+
+  i2cMutex = xSemaphoreCreateMutex();
+  
+  if(i2cMutex != NULL) {
+      xSemaphoreTake(i2cMutex, portMAX_DELAY);
+      if(display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("AMR 2.0 Booting...");
+        display.display();
+      }
+      xSemaphoreGive(i2cMutex);
+  }
+
+  printf("[BOOT] Khoi tao MPU6050...\n");
+  imuAvailable = mpu6050_init();
+  printf("[BOOT] Khoi tao WiFi...\n");
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_15dBm);
+  wm.setConnectTimeout(15);
+  wm.setConfigPortalTimeout(120);
+  
+  printf("[BOOT] Chay WiFiManager autoConnect...\n");
+  if (!wm.autoConnect(WIFI_AP_NAME)) {
+    printf("[WIFI] Ket noi that bai hoac Timeout Portal!\n");
+  }
+  printf("[BOOT] WiFi autoConnect xong, vong lap Loop bat dau! IP: %s\n", WiFi.localIP().toString().c_str());
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+
+  ArduinoOTA.setHostname("AMR2_S3");
+  ArduinoOTA.onStart([]() { Serial.println("\n[OTA] Start..."); });
+  ArduinoOTA.onEnd([]() { Serial.println("\n[OTA] Done!"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("\n[OTA] Error[%u]\n", error);
+  });
+  ArduinoOTA.begin();
+
+  TelnetStream.begin();
+
+  webSocket.begin();
+  webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+    if (type != WStype_TEXT) return;
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+
+    if (doc["type"] == "ping") {
+      JsonDocument pong;
+      pong["type"] = "pong";
+      pong["ts"] = doc["ts"];
+      static char outBuf[128];
+      serializeJson(pong, outBuf, sizeof(outBuf));
+      webSocket.sendTXT(num, outBuf);
+      return;
+    }
+
+    if (doc["cmd"] == "reset_odom") {
+      robotX = 2.5; robotY = 9.0; robotTheta = -PI/2; robotDistance = 0;
+      leftTicks = rightTicks = lastTicksL = lastTicksR = 0;
+      targetLeftVel = targetRightVel = 0;
+      gyroTheta = encoderTheta = fusedTheta = robotTheta;
+      leftPID->reset();
+      rightPID->reset();
+      Serial.println("[CMD] Odometry reset.");
+    }
+
+    if (doc["cmd"] == "set_pose") {
+      if (!doc["x"].isNull()) robotX = doc["x"];
+      if (!doc["y"].isNull()) robotY = doc["y"];
+      if (!doc["theta"].isNull()) robotTheta = doc["theta"];
+      gyroTheta = encoderTheta = fusedTheta = robotTheta;
+    }
+
+    if (doc["cmd"] == "navigate") {
+      JsonArray pathArr = doc["path"].as<JsonArray>();
+      int count = pathArr.size();
+      if (count > 0 && count <= MAX_WAYPOINTS) {
+        navigator.waypointCount = count;
+        navigator.currentWpIdx = 0;
+        for (int i = 0; i < count; i++) {
+          navigator.waypoints[i].x = pathArr[i]["x"];
+          navigator.waypoints[i].y = pathArr[i]["y"];
+          navigator.waypoints[i].heading = NAN;
+          navigator.waypoints[i].useReverse = false;
+        }
+        float endH = NAN;
+        if (!doc["finalHeading"].isNull()) {
+          endH = doc["finalHeading"].as<float>() * PI / 180.0f;
+        }
+        navigator.finalHeading = endH;
+        
+        navigator.state = NAV_TRACKING;
+        navigator.cmdLinear = 0;
+        navigator.cmdAngular = 0;
+        navigator.navStartTime = millis();
+        navigator.lastWpReachTime = millis();
+        
+        JsonDocument ack;
+        ack["type"] = "nav_ack";
+        ack["wp_count"] = count;
+        ack["finalH"] = isnan(endH) ? -1 : (int)(endH * 180.0f / PI);
+        static char outBuf[128];
+        serializeJson(ack, outBuf, sizeof(outBuf));
+        webSocket.sendTXT(num, outBuf);
+      }
+    }
+    
+    if (doc["cmd"] == "nav_stop") {
+      navigator.abort();
+    }
+
+    if (doc["cmd"] == "pause") {
+      navigator.pause();
+    }
+
+    if (doc["cmd"] == "resume") {
+      navigator.resume();
+    }
+
+    if (doc["cmd"] == "recal_gyro") {
+      gyroCalibrated = false;
+      gyroCalSamples = 0;
+      gyroCalSum = 0;
+      gyroZBias = 0;
+    }
+
+    if (doc["cmd"] == "brake") {
+      brakeEnabled = doc["val"];
+    }
+
+    if (!doc["linear"].isNull() && !navigator.isNavigating()) {
+      float v = doc["linear"];
+      float w = doc["angular"];
+      targetLeftVel = constrain((v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      targetRightVel = constrain((v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      lastCmdTime = millis();
+    }
+  });
+
+  server.begin();
+
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 10, NULL, 1);
+  xTaskCreatePinnedToCore(lidarTask, "LidarTask", 4096, NULL, 1, NULL, 0);
+
+  Serial.println("================================================");
+  Serial.println("  AMR 2.0 FIRMWARE — ESP32-S3 N16R8             ");
+  Serial.printf("  IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("  IMU: %s\n", imuAvailable ? "MPU6050 OK" : "KHONG CO");
+  Serial.printf("  WebSocket port: %d\n", WEBSOCKET_PORT);
+  Serial.println("================================================");
+}
+
+
+// ============================================================
+//   MAIN LOOP — Network, Telemetry & Display Only
+// ============================================================
+void loop() {
+  webSocket.loop();
+  server.handleClient();
+  
+  static unsigned long lastPrint = 0;
+  if(millis() - lastPrint > 5000) {
+      lastPrint = millis();
+      printf("[LOOP] AMR dang chay... IP: %s\n", WiFi.localIP().toString().c_str());
+  }
+  ArduinoOTA.handle();
+
+  if (!navigator.isNavigating() && millis() - lastCmdTime > CMD_TIMEOUT_MS) {
+    targetLeftVel = 0;
+    targetRightVel = 0;
+  }
+
+  static unsigned long lastWifiCheck = 0;
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiCheck > 5000) {
+    lastWifiCheck = millis();
+    Serial.println("[WIFI] Mat ket noi! Dang thu reconnect...");
+    WiFi.reconnect();
+  }
+
+  if (brakeEnabled) {
+    targetLeftVel = 0;
+    targetRightVel = 0;
+    if (navigator.isNavigating()) {
+        navigator.abort();
+    }
+  }
+
+  // ── Telemetry Broadcast (4Hz) ───────────────────────
+  if (millis() - lastTelemetryTime > TELEMETRY_INTERVAL) {
+    lastTelemetryTime = millis();
+
+    long b_sum = 0;
+    for (int i = 0; i < 20; i++) b_sum += analogRead(BATT_PIN);
+    float v_now = (b_sum / 20.0f / 4095.0f) * 3.3f * BATT_SCALE_FACTOR + BATT_OFFSET;
+    filteredVBatt = filteredVBatt * 0.9f + v_now * 0.1f;
+    if (filteredVBatt < 1.0f) filteredVBatt = v_now;
+    int battPct = constrain((int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
+
+    float v_robot = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
+    float w_fused; 
+    if (imuAvailable && gyroCalibrated) w_fused = gyroZ_raw;
+    else w_fused = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
+
+    JsonDocument telem;
+    telem["telem"] = true;
+    telem["vx"] = v_robot;
+    telem["wz"] = w_fused;
+    telem["theta"] = robotTheta;
+    telem["h"] = robotTheta * 180.0f / PI;
+    telem["d"] = robotDistance;
+    telem["x"] = robotX;
+    telem["y"] = robotY;
+    telem["imu"] = imuAvailable;
+    telem["imu_cal"] = gyroCalibrated;
+    telem["gyroZ"] = gyroZ_raw;
+    telem["fTheta"] = fusedTheta * 180.0f / PI;
+
+    JsonObject enc = telem["enc"].to<JsonObject>();
+    enc["l"] = leftTicks;
+    enc["r"] = rightTicks;
+
+    telem["vL_t"] = targetLeftVel;
+    telem["vR_t"] = targetRightVel;
+    telem["vL_r"] = vL_meas;
+    telem["vR_r"] = vR_meas;
+    telem["pwmL"] = (int)lastPwmLeft;
+    telem["pwmR"] = (int)lastPwmRight;
+    telem["batt"] = battPct;
+
+    telem["nav"] = navigator.getStateName();
+    telem["nav_wp"] = navigator.currentWpIdx;
+    telem["nav_total"] = navigator.waypointCount;
+    telem["eX"] = navigator.error_x;
+    telem["eY"] = navigator.error_y;
+    telem["eYaw"] = navigator.error_yaw;
+
+    // Lidar payload culling
+    JsonArray ls = telem["lidar"].to<JsonArray>();
+    bool hasObstruction = obstacleDetected && millis() - timeObstacleLastDetected < 500;
+    telem["obs"] = hasObstruction;
+    for (int i = 0; i < 360; i += 2) { // Giảm băng thông lấy độ cách 2 (180 điểm)
+      if (lidarDists[i] > 0 && lidarDists[i] < 3000) {
+        // Format object gộp: { a: angle, d: distance }
+        JsonObject p = ls.add<JsonObject>();
+        p["a"] = i;             // Angle 0-359
+        p["d"] = lidarDists[i]; // Distance in mm
+      }
+    }
+
+    static char telemBuf[2048]; // Tăng buffer size để chứa Lidar Data
+    size_t len = serializeJson(telem, telemBuf, sizeof(telemBuf));
+    webSocket.broadcastTXT(telemBuf, len);
+    
+    Serial.printf("[AMR2] V:%.1f,%.1f IMU:%s Bat:%d%% X:%.2f Y:%.2f H:%.1f OBS:%s\n",
+                  vL_meas, vR_meas,
+                  imuAvailable ? "OK" : "--", battPct,
+                  robotX, robotY, robotTheta * 180.0f / PI,
+                  hasObstruction ? "YES" : "NO");
   }
 
   // ── OLED Update (1Hz) ──────────────────────────────────
@@ -597,40 +701,35 @@ void loop() {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
+    display.setTextWrap(false);
+    display.setTextSize(1, 2);
     
-    // Line 1: Header
     display.setCursor(0, 0);
-    display.print("AMR 2.0 ");
-    display.print(WiFi.status() == WL_CONNECTED ? "ONLINE" : "OFFLINE");
+    display.printf("AMR %s %s", WiFi.localIP().toString().c_str(), WiFi.status() == WL_CONNECTED ? "ON" : "OFF");
 
-    // Line 2: IP
-    display.setCursor(0, 10);
-    display.print("IP: ");
-    display.print(WiFi.localIP().toString());
+    display.setCursor(0, 16);
+    int b_pct = (int)map(constrain(filteredVBatt, BATT_MIN_V, BATT_MAX_V), BATT_MIN_V, BATT_MAX_V, 0, 100);
+    display.printf("Bat:%d%% IMU:%s WS:%d", b_pct, imuAvailable ? "OK" : "--", webSocket.connectedClients());
 
-    // Line 3: Battery & IMU
-    display.setCursor(0, 20);
-    display.printf("Bat: %d%% | IMU: %s", 
-      (int)map(constrain(filteredVBatt, BATT_MIN_V, BATT_MAX_V), BATT_MIN_V, BATT_MAX_V, 0, 100),
-      imuAvailable ? "OK" : "--");
-
-    // Line 4: Speed + Nav
-    display.setCursor(0, 30);
+    display.setCursor(0, 32);
     if (navigator.isNavigating()) {
-      display.printf("NAV: %s WP%d/%d", navigator.getStateName(), 
-                     navigator.currentWpIdx + 1, navigator.waypointCount);
+      String st = navigator.getStateName();
+      if (st == "NAV_TURNING") st = "TURN";
+      else if (st == "NAV_DRIVING") st = "DRIVE";
+      else if (st == "NAV_FINAL_TURN") st = "F_TURN";
+      display.printf("NAV:%s WP:%d/%d", st.c_str(), navigator.currentWpIdx + 1, navigator.waypointCount);
     } else {
-      display.printf("V: %.2fm/s H: %.0f", (vR_meas + vL_meas)/2.0f * WHEEL_RADIUS, fusedTheta * 180.0f / PI);
+      float v_avg = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
+      display.printf("Spd:%.2fm/s H:%.0f", v_avg, fusedTheta * 180.0f / PI);
     }
 
-    // Line 5: Position
-    display.setCursor(0, 40);
-    display.printf("X: %.1f Y: %.1f", robotX, robotY);
+    display.setCursor(0, 48);
+    display.printf("Pos X:%.1f Y:%.1f", robotX, robotY);
 
-    // Line 6: Websocket clients
-    display.setCursor(0, 50);
-    display.printf("WS Clients: %d", webSocket.connectedClients());
-
-    display.display();
+    if (i2cMutex != NULL) {
+        xSemaphoreTake(i2cMutex, portMAX_DELAY);
+        display.display();
+        xSemaphoreGive(i2cMutex);
+    }
   }
 }

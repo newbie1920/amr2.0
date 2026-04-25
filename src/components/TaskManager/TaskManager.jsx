@@ -48,7 +48,7 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
                    
                    if (isSelected) {
                      borderColor = 'var(--accent-primary)';
-                     bgColor = 'rgba(5b, 130, 246, 0.2)'; // blueish selection
+                     bgColor = 'rgba(91, 130, 246, 0.2)'; // blueish selection
                      if (isOccupied) bgColor = 'rgba(239, 68, 68, 0.4)'; 
                    }
                    
@@ -182,10 +182,36 @@ export default function TaskManager({ onPathGenerated }) {
       importType: taskType === 'import' ? importType : undefined
     });
 
-    // Auto routing → Gửi lộ trình xuống ESP32, xe tự lái
-    if (connectedRobots.length > 0) {
-      const robot = connectedRobots[0];
+    // Auto routing → Tìm xe rảnh rỗi và đủ pin
+    // 1. Lọc xe đang rảnh (nav === 'IDLE' hoặc DONE/ERROR) và pin > 20%
+    const availableRobots = connectedRobots.filter(r => {
+      const navStatus = r.telemetry?.nav || 'IDLE';
+      const batt = r.telemetry?.batt ?? 100;
+      // Xe chưa nhận nhiệm vụ chạy nào hoặc đã xong
+      const isIdle = navStatus === 'IDLE' || navStatus === 'DONE' || navStatus === 'ERROR';
+      return isIdle && batt > 20;
+    });
+
+    if (availableRobots.length > 0) {
+      // 2. Tìm xe gần điểm bắt đầu nhất
+      let startPoint = { x: 0, y: 0 };
       const slotInfo = findSlotById(targetSlotId);
+      
+      if (taskType === 'import') {
+         const gate = Object.values(GATES).find(g => g.id === selectedGateId);
+         if (gate) { startPoint = { x: gate.x, y: gate.y }; }
+      } else {
+         if (slotInfo) { startPoint = { x: slotInfo.slot.approach.x, y: slotInfo.slot.approach.y }; }
+      }
+
+      availableRobots.sort((a, b) => {
+         const distA = Math.hypot((a.telemetry?.x || 0) - startPoint.x, (a.telemetry?.y || 0) - startPoint.y);
+         const distB = Math.hypot((b.telemetry?.x || 0) - startPoint.x, (b.telemetry?.y || 0) - startPoint.y);
+         return distA - distB;
+      });
+
+      const robot = availableRobots[0];
+
       if (slotInfo) {
         // Bước 1: Tìm đường A* từ xe → ô kệ
         const result = findPath(
@@ -210,6 +236,8 @@ export default function TaskManager({ onPathGenerated }) {
           });
         }
       }
+    } else {
+      console.warn("Không có robot nào đang rảnh và đủ pin! Nhiệm vụ đang ở trạng thái chờ.");
     }
 
     // Reset
@@ -224,81 +252,15 @@ export default function TaskManager({ onPathGenerated }) {
   };
 
   // ==========================================
-  // SYNC LOOP: ĐỢI LỆNH DONE TỪ ROBOT THÌ MỚI UPDATE DB
+  // Lắng nghe sự kiện hoàn thành Task từ Store
   // ==========================================
   useEffect(() => {
-    const checkCompletedTasks = async () => {
-      const { tasks, updateTask } = useTaskStore.getState();
-      const { robots } = useRobotStore.getState();
-
-      const activeList = tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId);
-
-      for (const t of activeList) {
-        const robot = robots[t.assignedRobotId];
-        if (!robot || !robot.telemetry) continue;
-        
-        const navState = robot.telemetry.nav;
-        
-        // ⛔ Robot bị lỗi (timeout/kẹt) → đánh dấu task thất bại
-        if (navState === 'ERROR' && !t.dbUpdated) {
-          updateTask(t.id, { 
-            dbUpdated: true, 
-            status: 'failed', 
-            error: 'Robot navigation timeout — xe bị kẹt hoặc mất tọa độ' 
-          });
-          console.warn(`[Task Sync] Task ${t.id} FAILED — NAV_ERROR`);
-          continue;
-        }
-        
-        // ✅ Robot đã tới đích → update database
-        if (navState === 'DONE' && !t.dbUpdated) {
-          
-          // 1. Phải khóa lại ngay tránh chạy 2 lần
-          updateTask(t.id, { dbUpdated: true });
-
-          try {
-            const info = t.orderInfo;
-            if (t.type === 'import') {
-              if (info.importType === 'new') {
-                await supabase.from('inventory').insert([{
-                  sku: info.sku,
-                  name: info.name,
-                  quantity: info.qty,
-                  slot_id: t.slotId
-                }]);
-              } else {
-                const currentQty = inventory.find(i => i.sku === info.sku)?.quantity || 0;
-                await supabase.from('inventory').update({ quantity: currentQty + info.qty }).eq('sku', info.sku);
-              }
-            } else {
-              // Export
-              const invItem = inventory.find(i => i.sku === info.sku);
-              if (invItem) {
-                if (info.qty >= invItem.quantity) {
-                  await supabase.from('inventory').delete().eq('sku', info.sku);
-                } else {
-                  await supabase.from('inventory').update({ quantity: invItem.quantity - info.qty }).eq('sku', info.sku);
-                }
-              }
-            }
-            
-            // 2. Chuyển task sang Hoàn thành
-            updateTask(t.id, { status: 'completed', completedAt: Date.now() });
-            loadInventory();
-            console.log(`[Task Sync] Task ${t.id} completed. DB Updated!`);
-
-          } catch (e) {
-            console.error('Lỗi khi update database:', e);
-            updateTask(t.id, { status: 'failed', error: e.message });
-          }
-        }
-      }
+    const handleInventoryChange = () => {
+       loadInventory();
     };
-
-    // Chạy loop check liên tục mỗi 1s
-    const interval = setInterval(checkCompletedTasks, 1000);
-    return () => clearInterval(interval);
-  }, [inventory, connectedRobots]); // Phụ thuộc vào robots để react khi telemetry đổi
+    window.addEventListener('inventory_changed', handleInventoryChange);
+    return () => window.removeEventListener('inventory_changed', handleInventoryChange);
+  }, []);
 
 
   const activeTasks = tasks.filter(t => t.status === 'in_progress' || t.status === 'assigned');
@@ -529,6 +491,10 @@ export default function TaskManager({ onPathGenerated }) {
  * Task Card
  */
 function TaskCard({ task }) {
+  const { navStopRobot } = useRobotStore();
+  const robots = useRobotStore((s) => s.robots);
+  const robot = task.assignedRobotId ? robots[task.assignedRobotId] : null;
+
   const statusColors = {
     pending: 'var(--text-muted)',
     assigned: 'var(--accent-warning)',
@@ -540,6 +506,12 @@ function TaskCard({ task }) {
   const statusBorder = task.status === 'completed' ? 'card--success' :
                        task.status === 'failed' ? 'card--danger' :
                        task.status === 'in_progress' ? '' : '';
+
+  // Navigator waypoint progress (from robot telemetry)
+  const navWp = robot?.telemetry?.navWp ?? 0;
+  const navTotal = robot?.telemetry?.navTotal ?? 0;
+  const navState = robot?.telemetry?.nav ?? 'IDLE';
+  const wpProgress = navTotal > 0 ? Math.round((navWp / navTotal) * 100) : 0;
 
   return (
     <div className={`card task-card ${statusBorder}`}>
@@ -554,9 +526,35 @@ function TaskCard({ task }) {
         📍 {task.slotId}
       </div>
 
-      <div style={{ fontSize: '11px', color: statusColors[task.status], marginTop: '4px', fontWeight: '500' }}>
-        {vi.task.status[task.status === 'in_progress' ? 'inProgress' : task.status] || task.status}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px' }}>
+        <span style={{ fontSize: '11px', color: statusColors[task.status], fontWeight: '500' }}>
+          {vi.task.status[task.status === 'in_progress' ? 'inProgress' : task.status] || task.status}
+        </span>
+        {task.status === 'in_progress' && navState !== 'IDLE' && (
+          <span style={{ fontSize: '10px', color: 'var(--text-muted)', marginLeft: 'auto' }}>
+            [{navState}]
+          </span>
+        )}
       </div>
+
+      {/* Waypoint progress bar — hiển thị khi robot đang tự lái */}
+      {task.status === 'in_progress' && navTotal > 0 && (
+        <div style={{ marginTop: '6px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '10px', color: 'var(--text-muted)', marginBottom: '3px' }}>
+            <span>WP {navWp}/{navTotal}</span>
+            <span>{wpProgress}%</span>
+          </div>
+          <div style={{ height: '4px', background: 'var(--bg-dark)', borderRadius: '2px', overflow: 'hidden' }}>
+            <div style={{
+              height: '100%',
+              width: `${wpProgress}%`,
+              background: navState === 'DONE' ? 'var(--accent-success)' : 'var(--accent-primary)',
+              borderRadius: '2px',
+              transition: 'width 0.3s ease',
+            }} />
+          </div>
+        </div>
+      )}
 
       {task.steps.length > 0 && (
         <div className="task-card__steps">
@@ -573,6 +571,17 @@ function TaskCard({ task }) {
             );
           })}
         </div>
+      )}
+
+      {/* Nav Stop button — chỉ hiện khi xe đang tự lái */}
+      {task.status === 'in_progress' && task.assignedRobotId && robot?.status === 'connected' && navState !== 'IDLE' && navState !== 'DONE' && navState !== 'ERROR' && (
+        <button
+          className="btn btn--danger btn--sm btn--full"
+          style={{ marginTop: '8px', fontSize: '11px' }}
+          onClick={() => navStopRobot(task.assignedRobotId)}
+        >
+          ⛔ Dừng Tự Lái
+        </button>
       )}
     </div>
   );

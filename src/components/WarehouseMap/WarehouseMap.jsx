@@ -26,7 +26,7 @@ const C_ROBOT = '#10b981';
 
 // ── Components ──────────────────────────────────────────────
 
-function RobotModel({ position, rotation, battery, label }) {
+function RobotModel({ position, rotation, battery, label, lidar, hasObs }) {
   const isHealthy = battery > 20;
   const color = isHealthy ? C_ROBOT : '#ef4444';
 
@@ -41,7 +41,7 @@ function RobotModel({ position, rotation, battery, label }) {
       {/* Lidar/Sensor on top */}
       <mesh position={[0, 0.35, 0.1]}>
         <cylinderGeometry args={[0.1, 0.1, 0.1, 16]} />
-        <meshStandardMaterial color="#334155" />
+        <meshStandardMaterial color="#ef4444" emissive={hasObs ? "#ef4444" : "#000"} emissiveIntensity={hasObs ? 1 : 0} />
       </mesh>
       {/* Wheels */}
       <mesh position={[-0.35, 0.1, 0]} rotation={[0, 0, Math.PI / 2]}>
@@ -58,6 +58,27 @@ function RobotModel({ position, rotation, battery, label }) {
         <coneGeometry args={[0.15, 0.2, 16]} />
         <meshStandardMaterial color="#22c55e" />
       </mesh>
+
+      {/* Lidar Point Cloud (Red dots) */}
+      {lidar && lidar.length > 0 && (
+        <group position={[0, 0.4, 0]}>
+          {lidar.map((pt, i) => {
+            // Front is +Z. Lidar angle 0 = front => +Z.
+            // Lidar spins clockwise.
+            const rad = -(pt.a * Math.PI) / 180.0;
+            const dist_m = pt.d / 1000.0;
+            const lx = Math.sin(rad) * dist_m;
+            const lz = Math.cos(rad) * dist_m;
+            return (
+              <mesh key={i} position={[lx, 0, lz]}>
+                <boxGeometry args={[0.04, 0.04, 0.04]} />
+                <meshBasicMaterial color="#ef4444" />
+              </mesh>
+            );
+          })}
+        </group>
+      )}
+
       {/* Label */}
       <Text
         position={[0, 0.8, 0]}
@@ -67,7 +88,7 @@ function RobotModel({ position, rotation, battery, label }) {
         anchorY="middle"
         rotation={[...rotation].map(r => -r)} // Look somewhat to camera or just fix it? Better use Billboard for text usually, but simple text is ok.
       >
-        {label} ({battery}%)
+        {label} ({battery}%) {hasObs ? "⚠️" : ""}
       </Text>
     </group>
   );
@@ -308,6 +329,8 @@ function WarehouseScene({ robots, activePath }) {
             rotation={[0, rotY, 0]}
             battery={robot.telemetry.battery}
             label={robot.name}
+            lidar={robot.telemetry.lidar || []}
+            hasObs={robot.telemetry.obs || false}
           />
         );
       })}

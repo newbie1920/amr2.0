@@ -183,6 +183,20 @@ export class RobotConnection {
   }
 
   /**
+   * Tạm dừng tự lái (Nhường đường)
+   */
+  pause() {
+    this._send({ cmd: 'pause' });
+  }
+
+  /**
+   * Tiếp tục tự lái
+   */
+  resume() {
+    this._send({ cmd: 'resume' });
+  }
+
+  /**
    * Gửi cấu hình robot
    */
   sendConfig(config) {

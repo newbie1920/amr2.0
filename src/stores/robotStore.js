@@ -19,6 +19,8 @@ function saveRobotsToStorage(robots) {
 const useRobotStore = create((set, get) => ({
   // State
   robots: {},           // { robotId: { id, name, ip, port, connection, telemetry, status } }
+  lidarScans: {},      // { robotId: [{a, d}] }
+  occupancyGrid: {},   // { robotId: { width, height, resolution, data: Uint8Array } }
   selectedRobotId: null,
 
   // ============================================================
@@ -40,21 +42,48 @@ const useRobotStore = create((set, get) => ({
   addRobot: (name, ip, port = 81, forcedId = null) => {
     const id = forcedId || `robot_${Date.now()}`;
     const connection = new RobotConnection(ip, port, name);
+    // Gắn id robot để các callback có thể truy cập store
+    connection.robotId = id;
 
+    let lastUpdate = 0;
     // Lắng nghe telemetry
     connection.onTelemetry = (telem) => {
-      set((state) => {
-        if (!state.robots[id]) return state;
-        return {
-          robots: {
-            ...state.robots,
-            [id]: {
-              ...state.robots[id],
-              telemetry: { ...telem },
+      const now = Date.now();
+      
+      // Transient state update (For Canvas/3D without rendering UI)
+      const currentState = get();
+      if (!currentState.transientRobots) currentState.transientRobots = {};
+      currentState.transientRobots[id] = telem;
+      
+      // Throttle UI update to ~1Hz (1000ms) to rescue React re-render cycle
+      if (now - lastUpdate > 1000) {
+        lastUpdate = now;
+        set((state) => {
+          if (!state.robots[id]) return state;
+          return {
+            robots: {
+              ...state.robots,
+              [id]: {
+                ...state.robots[id],
+                telemetry: { ...telem },
+              },
             },
-          },
-        };
-      });
+          };
+        });
+      }
+
+      // Sync Navigation Status with Task System (replaces older setInterval in UI)
+      if (telem.nav === 'ERROR' || telem.nav === 'DONE') {
+         // Dynamically import to avoid circular dependency issues at boot
+         import('./taskStore.js').then(module => {
+            const useTaskStore = module.default;
+            const state = useTaskStore.getState();
+            const activeTasks = state.tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId === id && !t.dbUpdated);
+            if (activeTasks.length > 0) {
+              state.processTaskCompletion(activeTasks[0].id, telem.nav, 'Robot navigation error - timeout or stuck');
+            }
+         });
+      }
     };
 
     connection.onConnect = () => {
@@ -169,6 +198,19 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
+  // Cập nhật dữ liệu LIDAR cho robot
+  updateLidar: (id, scan) => {
+    set((state) => {
+      const newScans = { ...state.lidarScans, [id]: scan };
+      // Cập nhật telemetry.lidar để UI có thể dùng
+      const robot = state.robots[id];
+      if (robot) {
+        robot.telemetry = { ...robot.telemetry, lidar: scan };
+      }
+      return { lidarScans: newScans, robots: { ...state.robots } };
+    });
+  },
+
   /**
    * Dừng robot
    */
@@ -219,6 +261,40 @@ const useRobotStore = create((set, get) => ({
     const robot = get().robots[id];
     if (robot && robot.connection.connected) {
       robot.connection.navStop();
+    }
+  },
+
+  pauseRobot: (id) => {
+    const robot = get().robots[id];
+    if (robot && robot.connection.connected) {
+      robot.connection.pause();
+    }
+  },
+
+  resumeRobot: (id) => {
+    const robot = get().robots[id];
+    if (robot && robot.connection.connected) {
+      robot.connection.resume();
+    }
+  },
+
+  /**
+   * Recalibrate con quay hồi chuyển (robot phải đứng yên!)
+   */
+  recalibrateGyro: (id) => {
+    const robot = get().robots[id];
+    if (robot && robot.connection.connected) {
+      robot.connection.recalibrateGyro();
+    }
+  },
+
+  /**
+   * Bật/tắt chế độ khóa phanh khẩn cấp
+   */
+  setBrake: (id, enabled) => {
+    const robot = get().robots[id];
+    if (robot && robot.connection.connected) {
+      robot.connection.setBrake(enabled);
     }
   },
 

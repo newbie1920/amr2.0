@@ -8,11 +8,17 @@ import './App.css';
 import WarehouseMap from './components/WarehouseMap/WarehouseMap.jsx';
 import ConnectionPanel from './components/ConnectionPanel/ConnectionPanel.jsx';
 import TaskManager from './components/TaskManager/TaskManager.jsx';
+import TelemetryChart from './components/TelemetryChart/TelemetryChart.jsx';
+import CollisionManager from './components/CollisionManager/CollisionManager.jsx';
 import useRobotStore from './stores/robotStore.js';
 import vi from './i18n/vi.js';
 
 function App() {
   const [activePath, setActivePath] = useState(null);
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
+  const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
+  const toggleLeftSidebar = () => setLeftSidebarOpen(prev => !prev);
+  const toggleRightSidebar = () => setRightSidebarOpen(prev => !prev);
   const robots = useRobotStore((s) => s.robots);
   const loadStoredRobots = useRobotStore((s) => s.loadStoredRobots);
 
@@ -39,6 +45,8 @@ function App() {
 
   return (
     <div className="app-layout">
+      <CollisionManager />
+      
       {/* ── HEADER ──────────────────────────────────────────── */}
       <header className="app-header">
         <div className="app-header__logo">
@@ -80,6 +88,7 @@ function App() {
       {/* ── SIDEBAR LEFT — Robot Panel ──────────────────────── */}
       <aside className="sidebar-left">
         <ConnectionPanel />
+        <TelemetryChart />
       </aside>
 
       {/* ── MAIN — Warehouse Map ────────────────────────────── */}

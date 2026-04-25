@@ -138,6 +138,15 @@ export default function ConnectionPanel() {
                       <span>{vi.robot.speed}:</span>
                       <span className="robot-card__info-value">{robot.telemetry.linearVel.toFixed(2)}</span>
                     </div>
+                    <div className="robot-card__info-item" style={{ gridColumn: 'span 2' }}>
+                      <span>Trạng thái:</span>
+                      <span className="robot-card__info-value" style={{ 
+                        color: robot.telemetry.nav === 'PAUSED' ? 'var(--accent-warning)' : 'inherit',
+                        fontWeight: robot.telemetry.nav === 'PAUSED' ? 'bold' : 'normal'
+                      }}>
+                        {robot.telemetry.nav === 'PAUSED' ? '⚠️ YIELDING (Nhường đường)' : robot.telemetry.nav}
+                      </span>
+                    </div>
                   </div>
 
                   <div className="robot-card__battery">
@@ -202,7 +211,12 @@ export default function ConnectionPanel() {
  * Joystick Control Component
  */
 function JoystickControl({ robotId }) {
-  const { sendManualControl, stopRobot, resetOdometry, setPose } = useRobotStore();
+  const { sendManualControl, stopRobot, resetOdometry, setPose, recalibrateGyro, setBrake } = useRobotStore();
+  const robots = useRobotStore((s) => s.robots);
+  const robot = robots[robotId];
+  const imuCalibrated = robot?.telemetry?.imuCalibrated ?? false;
+  const imuAvailable = robot?.telemetry?.imuAvailable ?? false;
+  const [brakeOn, setBrakeOn] = useState(false);
 
   const maxLin = 0.3;
   const maxAng = 1.5;
@@ -290,6 +304,49 @@ function JoystickControl({ robotId }) {
           onClick={() => resetOdometry(robotId)}
         >
           🔄 {vi.robot.controls.resetOdom}
+        </button>
+
+        {/* IMU Status + Recalibrate */}
+        {imuAvailable && (
+          <div style={{ marginTop: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                IMU: <span style={{ color: imuCalibrated ? 'var(--accent-success)' : 'var(--accent-warning)', fontWeight: '600' }}>
+                  {imuCalibrated ? '✓ Đã Calibrate' : '⚠ Chưa Calibrate'}
+                </span>
+              </span>
+            </div>
+            <button
+              className="btn btn--ghost btn--sm btn--full"
+              style={{ fontSize: '11px', borderColor: 'var(--accent-warning)', color: 'var(--accent-warning)' }}
+              onClick={() => {
+                if (window.confirm('Robot phải đứng YÊN hoàn toàn trước khi calibrate gyro. Tiếp tục?')) {
+                  recalibrateGyro(robotId);
+                }
+              }}
+            >
+              🧭 Recalibrate Gyro
+            </button>
+          </div>
+        )}
+
+        {/* Emergency Brake Toggle */}
+        <button
+          className={`btn btn--sm btn--full`}
+          style={{
+            marginTop: '8px',
+            fontSize: '11px',
+            background: brakeOn ? 'var(--accent-danger)' : 'transparent',
+            borderColor: 'var(--accent-danger)',
+            color: brakeOn ? '#fff' : 'var(--accent-danger)',
+          }}
+          onClick={() => {
+            const next = !brakeOn;
+            setBrakeOn(next);
+            setBrake(robotId, next);
+          }}
+        >
+          {brakeOn ? '🔴 Brake ON — Nhấn để Mở' : '⛔ Khóa Phanh (Brake)'}
         </button>
       </div>
     </div>

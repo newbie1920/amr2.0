@@ -268,15 +268,80 @@ function pointToLineDistance(point, lineStart, lineEnd) {
 }
 
 /**
- * Smooth path: RDP + thêm điểm nội suy cho chuyển hướng mượt
+ * Chaikin's Corner Cutting Algorithm
+ * Giúp mài tròn các góc vuông thành đường cong mượt mà, không lấn dải phân cách
+ * @param {Array<{x, y}>} points
+ * @param {number} iterations - Số lần cắt góc (Độ mượt)
+ * @returns {Array<{x, y}>}
+ */
+function chaikinSmooth(points, iterations = 3) {
+  if (points.length <= 2) return points;
+  let currentPath = points;
+  
+  for (let iter = 0; iter < iterations; iter++) {
+    let newPath = [];
+    newPath.push(currentPath[0]); // Giữ nguyên điểm xuất phát
+    
+    for (let i = 0; i < currentPath.length - 1; i++) {
+        const p0 = currentPath[i];
+        const p1 = currentPath[i + 1];
+        
+        // Cắt khúc ở tỷ lệ 20% - 80% để gọt êm hơn (Chaikin biến thể ủ cong dần)
+        newPath.push({
+          x: 0.8 * p0.x + 0.2 * p1.x,
+          y: 0.8 * p0.y + 0.2 * p1.y
+        });
+        
+        newPath.push({
+          x: 0.2 * p0.x + 0.8 * p1.x,
+          y: 0.2 * p0.y + 0.8 * p1.y
+        });
+    }
+    newPath.push(currentPath[currentPath.length - 1]); // Giữ nguyên điểm cuối
+    currentPath = newPath;
+  }
+  
+  // Lọc bớt các điểm trùng lặp cực gần nhau (dưới 1cm) để tối ưu hóa bộ nhớ ESP32
+  let optimizedPath = [currentPath[0]];
+  for (let i = 1; i < currentPath.length; i++) {
+     const lastPt = optimizedPath[optimizedPath.length - 1];
+     const pt = currentPath[i];
+     const d = Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y);
+     if (d > 0.01) { 
+        optimizedPath.push(pt);
+     }
+  }
+  
+  return optimizedPath;
+}
+
+/**
+ * Smooth path: RDP + Chaikin (corner cutting) spline
  */
 function smoothPath(path) {
   if (path.length <= 2) return path;
 
-  // Bước 1: RDP simplify
+  // Bước 1: RDP simplify (Lọc điểm nhiễu A*, tạo các đoạn hẻm khuyều 90 độ)
   const simplified = rdpSimplify(path, 0.15);
 
-  return simplified;
+  // Bước 2: Curve Spline nội suy uốn cong dải điểm (Làm tròn góc gắt)
+  const splined = chaikinSmooth(simplified, 3);
+
+  // Lưu ý: ESP32 chỉ chứa được MAX_WAYPOINTS (Vd: 64 điểm).
+  // Vì vậy nếu đường splined quá lớn, ta sẽ trích xuất (downsample).
+  if (splined.length > 60) {
+     const downsampled = [];
+     const step = Math.ceil(splined.length / 60);
+     for (let i = 0; i < splined.length; i += step) {
+         downsampled.push(splined[i]);
+     }
+     if (downsampled[downsampled.length - 1] !== splined[splined.length - 1]) {
+         downsampled.push(splined[splined.length - 1]);
+     }
+     return downsampled;
+  }
+
+  return splined;
 }
 
 // ============================================================
@@ -315,14 +380,34 @@ function findNearestFreeCell(grid, col, row) {
 export function isLineOfSightClear(x1, y1, x2, y2, grid = null) {
   if (!grid) grid = createOccupancyGrid();
 
-  const steps = Math.ceil(Math.hypot(x2 - x1, y2 - y1) / (GRID_CELL_SIZE * 0.5));
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    const x = x1 + t * (x2 - x1);
-    const y = y1 + t * (y2 - y1);
-    const { col, row } = meterToGrid(x, y);
-    if (col < 0 || col >= GRID_COLS || row < 0 || row >= GRID_ROWS) return false;
-    if (grid[row][col] === 1) return false;
+  const start = meterToGrid(x1, y1);
+  const end = meterToGrid(x2, y2);
+
+  let x0 = start.col;
+  let y0 = start.row;
+  const x1_idx = end.col;
+  const y1_idx = end.row;
+
+  const dx = Math.abs(x1_idx - x0);
+  const dy = Math.abs(y1_idx - y0);
+  const sx = x0 < x1_idx ? 1 : -1;
+  const sy = y0 < y1_idx ? 1 : -1;
+  let err = dx - dy;
+
+  while (true) {
+    if (x0 < 0 || x0 >= GRID_COLS || y0 < 0 || y0 >= GRID_ROWS) return false;
+    if (grid[y0][x0] === 1) return false;
+
+    if (x0 === x1_idx && y0 === y1_idx) break;
+    const e2 = 2 * err;
+    if (e2 > -dy) {
+      err -= dy;
+      x0 += sx;
+    }
+    if (e2 < dx) {
+      err += dx;
+      y0 += sy;
+    }
   }
   return true;
 }
