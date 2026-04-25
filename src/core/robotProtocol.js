@@ -51,6 +51,12 @@ export class RobotConnection {
       nav: 'IDLE',           // Navigator state (IDLE/TURN/DRIVE/REV/F_TURN/DONE/ERROR)
       navWp: 0,              // Current waypoint index
       navTotal: 0,           // Total waypoints
+      // INA3221 Power Monitor
+      battV: 0,              // Điện áp pin (V)
+      battA: 0,              // Dòng pin (A)
+      motorV: 0,             // Điện áp motor (V)
+      motorA: 0,             // Dòng motor (A)
+      obs: false,            // Obstacle detected
     };
 
     // Callbacks
@@ -276,6 +282,12 @@ export class RobotConnection {
           nav: data.nav ?? this.telemetry.nav,
           navWp: data.nav_wp ?? this.telemetry.navWp,
           navTotal: data.nav_total ?? this.telemetry.navTotal,
+          // INA3221 Power
+          battV: data.power?.battV ?? this.telemetry.battV,
+          battA: data.power?.battA ?? this.telemetry.battA,
+          motorV: data.power?.motorV ?? this.telemetry.motorV,
+          motorA: data.power?.motorA ?? this.telemetry.motorA,
+          obs: data.obs ?? this.telemetry.obs,
         };
 
         if (this.onTelemetry) this.onTelemetry(this.telemetry);

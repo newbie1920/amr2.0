@@ -161,6 +161,26 @@ export default function ConnectionPanel() {
                   <div style={{ fontSize: '10px', color: batteryColor, marginTop: '4px', textAlign: 'right' }}>
                     🔋 {robot.telemetry.battery}%
                   </div>
+
+                  {/* INA3221 Power Monitor */}
+                  {robot.telemetry.battV > 0 && (
+                    <div style={{
+                      marginTop: '6px',
+                      padding: '6px 8px',
+                      background: 'rgba(255,255,255,0.03)',
+                      borderRadius: '6px',
+                      fontSize: '10px',
+                      color: 'var(--text-muted)',
+                      display: 'grid',
+                      gridTemplateColumns: '1fr 1fr',
+                      gap: '3px 12px',
+                    }}>
+                      <span>🔋 Pin: <b style={{ color: 'var(--text-primary)' }}>{robot.telemetry.battV.toFixed(1)}V</b></span>
+                      <span>⚡ {robot.telemetry.battA.toFixed(2)}A</span>
+                      <span>⚙️ Motor: <b style={{ color: 'var(--text-primary)' }}>{robot.telemetry.motorV.toFixed(1)}V</b></span>
+                      <span>⚡ {robot.telemetry.motorA.toFixed(2)}A</span>
+                    </div>
+                  )}
                 </>
               )}
 

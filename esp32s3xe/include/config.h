@@ -89,8 +89,8 @@
 
 #define BATT_SCALE_FACTOR 2.0f     // Tỉ lệ phân áp
 #define BATT_OFFSET       0.0f
-#define BATT_MIN_V        6.6f     // Pin cạn (2S LiPo)
-#define BATT_MAX_V        8.4f     // Pin đầy
+#define BATT_MIN_V        9.9f     // Pin cạn (3S LiPo: 3.3V × 3)
+#define BATT_MAX_V        12.6f    // Pin đầy (3S LiPo: 4.2V × 3)
 
 // ============================================================
 //   WIFI
