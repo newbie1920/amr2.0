@@ -6,6 +6,7 @@
 
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
+import useMapStore from '../../stores/mapStore.js';
 import { exportMapToROS2 } from '../../core/mapExporter.js';
 
 // ============================================================
@@ -89,12 +90,12 @@ function MapPreview({ mapData, size = 80 }) {
 // ============================================================
 
 export default function MapManager({ onClose }) {
-  const savedMaps = useRobotStore((s) => s.savedMaps);
-  const deleteSavedMap = useRobotStore((s) => s.deleteSavedMap);
-  const renameSavedMap = useRobotStore((s) => s.renameSavedMap);
-  const loadSavedMap = useRobotStore((s) => s.loadSavedMap);
-  const exportSavedMap = useRobotStore((s) => s.exportSavedMap);
-  const importMapFromJSON = useRobotStore((s) => s.importMapFromJSON);
+  const savedMaps = useMapStore((s) => s.savedMaps);
+  const deleteSavedMap = useMapStore((s) => s.deleteSavedMap);
+  const renameSavedMap = useMapStore((s) => s.renameSavedMap);
+  const loadSavedMap = useMapStore((s) => s.loadSavedMap);
+  const exportSavedMap = useMapStore((s) => s.exportSavedMap);
+  const importMapFromJSON = useMapStore((s) => s.importMapFromJSON);
   const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
   const robots = useRobotStore((s) => s.robots);
 

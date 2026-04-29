@@ -13,7 +13,7 @@
  */
 
 import { useState, useCallback } from 'react';
-import useRobotStore from '../../stores/robotStore.js';
+import useDWAStore from '../../stores/dwaStore.js';
 import './DWATuningPanel.css';
 
 // ── Parameter Definitions ──────────────────────────────────────
@@ -92,14 +92,14 @@ const PRESET_LABELS = {
 // ── Component ──────────────────────────────────────────────────
 
 function DWATuningPanel() {
-  const dwaConfig = useRobotStore((s) => s.dwaConfig);
-  const dwaActivePreset = useRobotStore((s) => s.dwaActivePreset);
-  const dwaCustomPresets = useRobotStore((s) => s.dwaCustomPresets);
-  const setDWAConfig = useRobotStore((s) => s.setDWAConfig);
-  const resetDWAConfig = useRobotStore((s) => s.resetDWAConfig);
-  const loadDWAPreset = useRobotStore((s) => s.loadDWAPreset);
-  const saveDWAPreset = useRobotStore((s) => s.saveDWAPreset);
-  const deleteDWAPreset = useRobotStore((s) => s.deleteDWAPreset);
+  const dwaConfig = useDWAStore((s) => s.dwaConfig);
+  const dwaActivePreset = useDWAStore((s) => s.dwaActivePreset);
+  const dwaCustomPresets = useDWAStore((s) => s.dwaCustomPresets);
+  const setDWAConfig = useDWAStore((s) => s.setDWAConfig);
+  const resetDWAConfig = useDWAStore((s) => s.resetDWAConfig);
+  const loadDWAPreset = useDWAStore((s) => s.loadDWAPreset);
+  const saveDWAPreset = useDWAStore((s) => s.saveDWAPreset);
+  const deleteDWAPreset = useDWAStore((s) => s.deleteDWAPreset);
 
   const [collapsed, setCollapsed] = useState(true);
   const [openGroups, setOpenGroups] = useState({ speed: true }); // First group open by default

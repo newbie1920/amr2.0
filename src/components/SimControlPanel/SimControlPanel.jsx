@@ -11,6 +11,7 @@
 
 import React, { useState, useCallback } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
+import useSimStore from '../../stores/simStore.js';
 
 // ============================================================
 //   STYLES (inline để giữ tập trung)
@@ -77,15 +78,15 @@ const speedBtnStyle = (active) => ({
 export default function SimControlPanel() {
   const addSimRobot = useRobotStore((s) => s.addSimRobot);
   const removeSimRobot = useRobotStore((s) => s.removeSimRobot);
-  const simEngines = useRobotStore((s) => s.simEngines);
-  const simInfo = useRobotStore((s) => s.simInfo);
-  const simMode = useRobotStore((s) => s.simMode);
+  const simEngines = useSimStore((s) => s.simEngines);
+  const simInfo = useSimStore((s) => s.simInfo);
+  const simMode = useSimStore((s) => s.simMode);
   const robots = useRobotStore((s) => s.robots);
-  const toggleSimPause = useRobotStore((s) => s.toggleSimPause);
-  const setSimSpeed = useRobotStore((s) => s.setSimSpeed);
-  const resetSimRobot = useRobotStore((s) => s.resetSimRobot);
-  const addSimObstacle = useRobotStore((s) => s.addSimObstacle);
-  const removeSimObstacle = useRobotStore((s) => s.removeSimObstacle);
+  const toggleSimPause = useSimStore((s) => s.toggleSimPause);
+  const setSimSpeed = useSimStore((s) => s.setSimSpeed);
+  const resetSimRobot = useSimStore((s) => s.resetSimRobot);
+  const addSimObstacle = useSimStore((s) => s.addSimObstacle);
+  const removeSimObstacle = useSimStore((s) => s.removeSimObstacle);
 
   const [spawnName, setSpawnName] = useState('SimBot');
   const [showObstacleEditor, setShowObstacleEditor] = useState(false);
