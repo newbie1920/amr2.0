@@ -18,6 +18,7 @@
 import { SimWorld } from './simWorld.js';
 import { SimLidar } from './simLidar.js';
 import { ROBOT_RADIUS } from '../warehouse.js';
+import { normalizeAngle } from '../mathUtils.js';
 
 // ============================================================
 //   CONFIG
@@ -192,11 +193,11 @@ export class SimEngine {
     if (!this.world.checkCollision(newX, newY, ROBOT_RADIUS)) {
       this.pose.x = newX;
       this.pose.y = newY;
-      this.pose.theta = this._normalizeAngle(newTheta);
+      this.pose.theta = normalizeAngle(newTheta);
     } else {
       // Va chạm → dừng lại nhưng vẫn cho xoay
       this.vel.v = 0;
-      this.pose.theta = this._normalizeAngle(newTheta);
+      this.pose.theta = normalizeAngle(newTheta);
       if (this.onCollision) this.onCollision();
     }
 
@@ -231,11 +232,7 @@ export class SimEngine {
     return current + Math.sign(diff) * maxStep;
   }
 
-  _normalizeAngle(a) {
-    while (a > Math.PI) a -= 2 * Math.PI;
-    while (a < -Math.PI) a += 2 * Math.PI;
-    return a;
-  }
+
 
   // ──────────────────────────────────────────────────────────
   //   TELEMETRY OUTPUT (giống ESP32 format)

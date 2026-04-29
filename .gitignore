@@ -22,4 +22,32 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# GitNexus index
 .gitnexus
+
+# Environment variables (CRITICAL: contains API keys)
+.env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Obsidian personal config
+.obsidian/
+
+# AI agent configs
+.claude/
+.antigravityrules
+AGENTS.md
+
+# Dev-time artifacts
+implementation_plan.md
+
+# ESP32 build artifacts
+esp32s3xe/compile_commands.json
+esp32s3xe/.cache/
+esp32s3xe/.pio/

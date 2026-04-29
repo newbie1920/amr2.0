@@ -12,6 +12,8 @@
  * enabling live tuning from the DWATuningPanel UI.
  */
 
+import { normalizeAngle } from './mathUtils.js';
+
 export const DWA_DEFAULTS = {
   maxSpeedTrans: 0.35,
   minSpeedTrans: 0.0,
@@ -263,8 +265,4 @@ function sampleAngular(min, max, index, total) {
   return min + (max - min) * t;
 }
 
-function normalizeAngle(a) {
-  while (a > Math.PI) a -= 2 * Math.PI;
-  while (a < -Math.PI) a += 2 * Math.PI;
-  return a;
-}
+

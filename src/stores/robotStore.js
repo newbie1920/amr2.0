@@ -12,6 +12,7 @@ import { VelocityMux, VEL_SOURCE } from '../core/velocityMux.js';
 import { navWorkerApi } from '../core/navWorkerSetup.js';
 import { SimEngine } from '../core/sim/simEngine.js';
 import { DWA_DEFAULTS, DWA_PRESETS } from '../core/dwaPlanner.js';
+import { normalizeAngle } from '../core/mathUtils.js';
 
 function saveRobotsToStorage(robots) {
   const data = Object.values(robots).map((r) => ({
@@ -88,11 +89,7 @@ const APP_NAV = {
   waypointReachTolerance: 0.22,
 };
 
-function normalizeAngle(a) {
-  while (a > Math.PI) a -= 2 * Math.PI;
-  while (a < -Math.PI) a += 2 * Math.PI;
-  return a;
-}
+
 
 function createAppNavigationSession(path, finalHeading = null) {
   const goal = path[path.length - 1];

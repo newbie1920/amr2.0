@@ -21,6 +21,8 @@
  *   - Skip scan matching nếu robot di chuyển < threshold
  */
 
+import { normalizeAngle } from './mathUtils.js';
+
 // ============================================================
 //   SCAN MATCHING CONFIG
 // ============================================================
@@ -93,7 +95,7 @@ export class ScanMatcher {
 
     // Kiểm tra minimum travel distance
     const travelDist = Math.hypot(odomX - this.lastMatchedX, odomY - this.lastMatchedY);
-    const travelHeading = Math.abs(_normalizeAngle(odomTheta - this.lastMatchedTheta));
+    const travelHeading = Math.abs(normalizeAngle(odomTheta - this.lastMatchedTheta));
     
     if (travelDist < cfg.minTravelDist && travelHeading < cfg.minTravelHeading) {
       return { x: odomX, y: odomY, theta: odomTheta, score: 0, corrected: false };
@@ -133,7 +135,7 @@ export class ScanMatcher {
     // Safety: giới hạn correction
     let corrX = fineResult.x - odomX;
     let corrY = fineResult.y - odomY;
-    let corrTheta = _normalizeAngle(fineResult.theta - odomTheta);
+    let corrTheta = normalizeAngle(fineResult.theta - odomTheta);
 
     const corrDist = Math.hypot(corrX, corrY);
     if (corrDist > cfg.maxCorrectionDist) {
@@ -147,7 +149,7 @@ export class ScanMatcher {
 
     const finalX = odomX + corrX;
     const finalY = odomY + corrY;
-    const finalTheta = _normalizeAngle(odomTheta + corrTheta);
+    const finalTheta = normalizeAngle(odomTheta + corrTheta);
     const score = fineResult.score;
 
     // Accept match?
@@ -348,10 +350,6 @@ function _scanToLocal(scanPoints, minPoints) {
   return local;
 }
 
-function _normalizeAngle(a) {
-  while (a > Math.PI) a -= 2 * Math.PI;
-  while (a < -Math.PI) a += 2 * Math.PI;
-  return a;
-}
+
 
 export default ScanMatcher;

@@ -719,29 +719,5 @@ function _base64ToFloat32(base64) {
   return new Float32Array(bytes.buffer);
 }
 
-export class LidarScan {
-  constructor() {
-    this.points = [];
-    this.timestamp = Date.now();
-  }
-
-  static fromBinary(buffer) {
-    const view = new DataView(buffer);
-    const scan = new LidarScan();
-    const count = view.getUint16(0, true);
-    let offset = 2;
-    for (let i = 0; i < count; i++) {
-      const angle = view.getUint16(offset, true) / 100.0;
-      offset += 2;
-      const distance = view.getUint16(offset, true) / 1000.0;
-      offset += 2;
-      if (distance > 0 && distance < 10) {
-        scan.points.push({ angle, distance });
-      }
-    }
-    scan.timestamp = Date.now();
-    return scan;
-  }
-}
 
 export default OccupancyGrid;
