@@ -59,6 +59,113 @@ class NavWorkerAPI {
     return matcher.matchScan(grid, mapX, mapY, mapTheta, lidarPts);
   }
 
+  /**
+   * processSlamTick — Entire SLAM pipeline in Worker thread
+   * 
+   * Replaces the inline SLAM logic that was running on main thread.
+   * Main thread sends raw data → Worker does all computation → returns results.
+   * 
+   * @param {string}  robotId    - Robot identifier
+   * @param {object}  gridData   - Serialized OccupancyGrid
+   * @param {object}  odomPose   - { x, y, theta } from encoder/IMU (odom frame)
+   * @param {object}  tfState    - Current map→odom transform { dx, dy, dTheta }
+   * @param {Array}   lidarPts   - Raw lidar points [{a, d}, ...]
+   * @param {boolean} isMapping  - Whether to update the grid (vs localization-only)
+   * @param {boolean} doMatch    - Whether to run scan matching this tick
+   * @returns {{ newTf, matchScore, corrected, gridCells }}
+   */
+  processSlamTick(robotId, gridData, odomPose, tfState, lidarPts, isMapping, doMatch) {
+    const grid = new WorkerGrid(gridData);
+    const tf = tfState || { dx: 0, dy: 0, dTheta: 0 };
+
+    // Apply current TF to get map-frame pose
+    const mapX = odomPose.x + tf.dx;
+    const mapY = odomPose.y + tf.dy;
+    const mapTheta = odomPose.theta + tf.dTheta;
+
+    let newTf = { ...tf };
+    let matchScore = 0;
+    let corrected = false;
+
+    // 1) Scan Matching (if requested)
+    if (doMatch && lidarPts.length > 0) {
+      if (!this.scanMatchers.has(robotId)) {
+        this.scanMatchers.set(robotId, new ScanMatcher());
+      }
+      const matcher = this.scanMatchers.get(robotId);
+      const result = matcher.matchScan(grid, mapX, mapY, mapTheta, lidarPts);
+      matchScore = result.score || 0;
+      if (result.corrected && result.correction) {
+        newTf = {
+          dx: tf.dx + result.correction.dx,
+          dy: tf.dy + result.correction.dy,
+          dTheta: tf.dTheta + result.correction.dTheta,
+        };
+        corrected = true;
+      }
+    }
+
+    // 2) Update grid cells (if mapping mode)
+    //    We compute the corrected map pose for grid update
+    let gridCells = null;
+    if (isMapping && lidarPts.length > 0) {
+      const correctedX = odomPose.x + newTf.dx;
+      const correctedY = odomPose.y + newTf.dy;
+      const correctedTheta = odomPose.theta + newTf.dTheta;
+
+      // Update grid using the WorkerGrid's update method
+      // Since WorkerGrid is a lightweight proxy, we compute the cells to update
+      // and return them so the main thread can apply them to the real grid
+      gridCells = this._computeGridUpdates(grid, correctedX, correctedY, correctedTheta, lidarPts);
+    }
+
+    return { newTf, matchScore, corrected, gridCells };
+  }
+
+  /**
+   * Compute which grid cells to update from a scan (ray-casting)
+   * Returns sparse update list so main thread can apply to real OccupancyGrid
+   */
+  _computeGridUpdates(grid, robotX, robotY, robotTheta, lidarPts) {
+    const updates = []; // { gx, gy, hit: boolean }
+    const { resolution, originX, originY, width, height } = grid;
+
+    const rgx = Math.floor((robotX - originX) / resolution);
+    const rgy = Math.floor((robotY - originY) / resolution);
+
+    for (const pt of lidarPts) {
+      const angle = robotTheta + (pt.a * Math.PI) / 180;
+      const dist = pt.d;
+      if (dist <= 0.05 || dist > 12) continue;
+
+      // Hit cell
+      const hitX = robotX + Math.cos(angle) * dist;
+      const hitY = robotY + Math.sin(angle) * dist;
+      const hgx = Math.floor((hitX - originX) / resolution);
+      const hgy = Math.floor((hitY - originY) / resolution);
+
+      // Bresenham ray: mark free cells along the ray
+      const steps = Math.max(Math.abs(hgx - rgx), Math.abs(hgy - rgy));
+      if (steps === 0) continue;
+
+      for (let i = 0; i < steps; i++) {
+        const t = i / steps;
+        const cx = Math.floor(rgx + (hgx - rgx) * t);
+        const cy = Math.floor(rgy + (hgy - rgy) * t);
+        if (cx >= 0 && cx < width && cy >= 0 && cy < height) {
+          updates.push({ gx: cx, gy: cy, hit: false });
+        }
+      }
+
+      // Mark hit cell as occupied
+      if (hgx >= 0 && hgx < width && hgy >= 0 && hgy < height) {
+        updates.push({ gx: hgx, gy: hgy, hit: true });
+      }
+    }
+
+    return updates;
+  }
+
   // PATHFINDING: Tìm đường A* trên grid
   findPath(gridData, startX, startY, goalX, goalY, allowUnknown = false, useCostmap = true) {
     const grid = new WorkerGrid(gridData);

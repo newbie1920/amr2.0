@@ -1606,3 +1606,14 @@ const useRobotStore = create((set, get) => ({
 }));
 
 export default useRobotStore;
+
+// ============================================================
+//   RE-EXPORTS — Domain Stores (Phase 3 migration bridge)
+//   Components can import these directly for cleaner code:
+//     import useDWAStore from '../stores/dwaStore';
+//     import useMapStore from '../stores/mapStore';
+//     import useSimStore from '../stores/simStore';
+// ============================================================
+export { default as useDWAStore } from './dwaStore.js';
+export { default as useMapStore } from './mapStore.js';
+export { default as useSimStore } from './simStore.js';
