@@ -1,6 +1,11 @@
 /**
  * AMR 2.0 — Autonomous Navigator
  * Backstepping Trajectory Tracking implementation based on Lyapunov stability
+ * 
+ * Recovery Behaviors (Nav2-style):
+ *   - RECOVERY_SPIN: Xoay ~180° để quét lại môi trường
+ *   - RECOVERY_BACKUP: Lùi ~30cm để thoát khỏi ngõ cụt
+ *   - RECOVERY_WAIT: Chờ 3 giây cho vật cản di chuyển
  */
 
 #ifndef NAVIGATOR_H
@@ -29,14 +34,27 @@
 #define MAX_WAYPOINTS         64
 #define NAV_WP_TIMEOUT_MS     15000
 
+// ── Recovery Config (Nav2-inspired) ──
+#define NAV_PROGRESS_CHECK_MS   10000   // 10s không tiến triển → trigger recovery
+#define NAV_PROGRESS_DIST       0.05f   // Tối thiểu 5cm tiến triển
+#define NAV_RECOVERY_SPIN_MS    3000    // Xoay 3 giây (~180°)
+#define NAV_RECOVERY_BACKUP_MS  2000    // Lùi 2 giây (~30cm)
+#define NAV_RECOVERY_WAIT_MS    3000    // Chờ 3 giây
+#define NAV_RECOVERY_SPIN_W     1.0f    // Tốc độ xoay (rad/s)
+#define NAV_RECOVERY_BACKUP_V  -0.08f   // Tốc độ lùi (m/s)
+#define NAV_MAX_RECOVERY_ATTEMPTS 3     // Tối đa 3 lần recovery
+
 // ============================================================
 //   NAVIGATOR STATES
 // ============================================================
 enum NavState {
   NAV_IDLE = 0,
-  NAV_TRACKING,       // Áp dụng Backstepping bám Virtual Target
-  NAV_FINAL_TURN,     // Xoay về góc chỉ định tại điểm đến
-  NAV_PAUSED,         // Dừng khẩn cấp / Nhường đường
+  NAV_TRACKING,         // Áp dụng Backstepping bám Virtual Target
+  NAV_FINAL_TURN,       // Xoay về góc chỉ định tại điểm đến
+  NAV_PAUSED,           // Dừng khẩn cấp / Nhường đường
+  NAV_RECOVERY_SPIN,    // Recovery: xoay tại chỗ
+  NAV_RECOVERY_BACKUP,  // Recovery: lùi lại
+  NAV_RECOVERY_WAIT,    // Recovery: chờ vật cản đi
   NAV_DONE,
   NAV_ERROR
 };
@@ -79,6 +97,13 @@ public:
   unsigned long navStartTime = 0;
   unsigned long lastWpReachTime = 0;
 
+  // ── Recovery state ──
+  int  recoveryAttempts = 0;
+  unsigned long recoveryStartTime = 0;
+  float progressCheckX = 0;
+  float progressCheckY = 0;
+  unsigned long lastProgressCheckTime = 0;
+
   void loadPath(Waypoint* wps, int count, float endHeading = NAN) {
     if (count > MAX_WAYPOINTS) count = MAX_WAYPOINTS;
     waypointCount = count;
@@ -93,10 +118,12 @@ public:
     cmdLinear = 0;
     cmdAngular = 0;
     navStartTime = millis();
+    recoveryAttempts = 0;
     
     if (count > 0) {
       state = NAV_TRACKING;
       lastWpReachTime = millis();
+      lastProgressCheckTime = millis();
       // Khởi tạo ở tọa độ (0,0) tạm thời, sẽ override ở update tick đầu tiên
       ref_x = 0;
       ref_y = 0; 
@@ -109,6 +136,7 @@ public:
     currentWpIdx = 0;
     cmdLinear = 0;
     cmdAngular = 0;
+    recoveryAttempts = 0;
     Serial.println("[NAV] ABORTED");
   }
 
@@ -126,20 +154,103 @@ public:
       state = prePauseState;
       navStartTime = millis(); 
       lastWpReachTime = millis();
+      lastProgressCheckTime = millis();
     }
   }
   
   void update(float robotX, float robotY, float robotTheta) {
-    if (state == NAV_IDLE || state == NAV_DONE || state == NAV_ERROR || state == NAV_PAUSED) {
-      if (state == NAV_PAUSED) {
-        lastWpReachTime = millis(); // Prevent timeout while paused
-      }
+    if (state == NAV_IDLE || state == NAV_DONE || state == NAV_ERROR) {
       cmdLinear = 0;
       cmdAngular = 0;
       return;
     }
+
+    if (state == NAV_PAUSED) {
+      lastWpReachTime = millis(); // Prevent timeout while paused
+      lastProgressCheckTime = millis();
+      cmdLinear = 0;
+      cmdAngular = 0;
+      return;
+    }
+
+    // ── RECOVERY BEHAVIORS ──────────────────────────────────
+    if (state == NAV_RECOVERY_SPIN) {
+      unsigned long elapsed = millis() - recoveryStartTime;
+      if (elapsed < NAV_RECOVERY_SPIN_MS) {
+        cmdLinear = 0;
+        cmdAngular = NAV_RECOVERY_SPIN_W;
+      } else {
+        // Spin done → try backup
+        Serial.println("[NAV] Recovery SPIN done → BACKUP");
+        state = NAV_RECOVERY_BACKUP;
+        recoveryStartTime = millis();
+      }
+      return;
+    }
+
+    if (state == NAV_RECOVERY_BACKUP) {
+      unsigned long elapsed = millis() - recoveryStartTime;
+      if (elapsed < NAV_RECOVERY_BACKUP_MS) {
+        cmdLinear = NAV_RECOVERY_BACKUP_V;
+        cmdAngular = 0;
+      } else {
+        // Backup done → wait
+        Serial.println("[NAV] Recovery BACKUP done → WAIT");
+        state = NAV_RECOVERY_WAIT;
+        recoveryStartTime = millis();
+        cmdLinear = 0;
+        cmdAngular = 0;
+      }
+      return;
+    }
+
+    if (state == NAV_RECOVERY_WAIT) {
+      cmdLinear = 0;
+      cmdAngular = 0;
+      unsigned long elapsed = millis() - recoveryStartTime;
+      if (elapsed >= NAV_RECOVERY_WAIT_MS) {
+        // Wait done → resume tracking
+        Serial.printf("[NAV] Recovery WAIT done (attempt %d/%d) → RESUME TRACKING\n", 
+                      recoveryAttempts, NAV_MAX_RECOVERY_ATTEMPTS);
+        state = NAV_TRACKING;
+        lastWpReachTime = millis();
+        lastProgressCheckTime = millis();
+        progressCheckX = robotX;
+        progressCheckY = robotY;
+        // Re-sync virtual robot to current position
+        ref_x = robotX;
+        ref_y = robotY;
+      }
+      return;
+    }
+
+    // ── PROGRESS CHECK (stuck detection) ──────────────────
+    if (state == NAV_TRACKING && millis() - lastProgressCheckTime > NAV_PROGRESS_CHECK_MS) {
+      float moved = sqrtf((robotX - progressCheckX) * (robotX - progressCheckX) + 
+                          (robotY - progressCheckY) * (robotY - progressCheckY));
+      if (moved < NAV_PROGRESS_DIST) {
+        // Robot stuck! Trigger recovery
+        recoveryAttempts++;
+        if (recoveryAttempts > NAV_MAX_RECOVERY_ATTEMPTS) {
+          Serial.printf("[NAV] Max recovery attempts (%d) exceeded → ERROR\n", NAV_MAX_RECOVERY_ATTEMPTS);
+          state = NAV_ERROR;
+          cmdLinear = 0;
+          cmdAngular = 0;
+          return;
+        }
+        Serial.printf("[NAV] Stuck! (moved %.2fcm in %dms) → RECOVERY_SPIN (attempt %d)\n", 
+                      moved * 100, NAV_PROGRESS_CHECK_MS, recoveryAttempts);
+        state = NAV_RECOVERY_SPIN;
+        recoveryStartTime = millis();
+        return;
+      }
+      // Not stuck → reset progress check
+      progressCheckX = robotX;
+      progressCheckY = robotY;
+      lastProgressCheckTime = millis();
+    }
     
-    // Timeout an toàn
+    // ── Waypoint timeout safety ──
     if (millis() - lastWpReachTime > NAV_WP_TIMEOUT_MS) {
       Serial.printf("[NAV] TIMEOUT at WP%d!\n", currentWpIdx);
       state = NAV_ERROR;
@@ -153,6 +264,8 @@ public:
       if (ref_x == 0 && ref_y == 0 && currentWpIdx == 0) {
           ref_x = robotX;
           ref_y = robotY;
+          progressCheckX = robotX;
+          progressCheckY = robotY;
       }
 
       Waypoint& wp = waypoints[currentWpIdx];
@@ -254,18 +367,27 @@ public:
   
   const char* getStateName() {
     switch (state) {
-      case NAV_IDLE:       return "IDLE";
-      case NAV_TRACKING:   return "TRACK";
-      case NAV_FINAL_TURN: return "F_TURN";
-      case NAV_PAUSED:     return "PAUSED";
-      case NAV_DONE:       return "DONE";
-      case NAV_ERROR:      return "ERROR";
-      default:             return "???";
+      case NAV_IDLE:            return "IDLE";
+      case NAV_TRACKING:        return "TRACK";
+      case NAV_FINAL_TURN:      return "F_TURN";
+      case NAV_PAUSED:          return "PAUSED";
+      case NAV_RECOVERY_SPIN:   return "REC_SPIN";
+      case NAV_RECOVERY_BACKUP: return "REC_BACK";
+      case NAV_RECOVERY_WAIT:   return "REC_WAIT";
+      case NAV_DONE:            return "DONE";
+      case NAV_ERROR:           return "ERROR";
+      default:                  return "???";
     }
   }
   
   bool isNavigating() {
-    return state == NAV_TRACKING || state == NAV_FINAL_TURN;
+    return state == NAV_TRACKING || state == NAV_FINAL_TURN || 
+           state == NAV_RECOVERY_SPIN || state == NAV_RECOVERY_BACKUP || 
+           state == NAV_RECOVERY_WAIT;
+  }
+
+  bool isRecovering() {
+    return state == NAV_RECOVERY_SPIN || state == NAV_RECOVERY_BACKUP || state == NAV_RECOVERY_WAIT;
   }
 
 private:

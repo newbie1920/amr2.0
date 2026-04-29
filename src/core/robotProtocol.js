@@ -1,7 +1,14 @@
 /**
  * AMR 2.0 — WebSocket Robot Protocol
  * Giao thức truyền thông giữa App ↔ ESP32-S3
+ * 
+ * Phase: MessagePack Binary Protocol
+ * - Outbound (Browser → ESP32): encode bằng MessagePack binary
+ * - Inbound (ESP32 → Browser): auto-detect JSON text / MsgPack binary / Grid binary
+ * - Backward-compatible: text frames = JSON, binary frames = MsgPack hoặc Grid
  */
+
+import { encode, decode } from '@msgpack/msgpack';
 
 // ============================================================
 //   ROBOT CONNECTION CLASS
@@ -57,6 +64,9 @@ export class RobotConnection {
       motorV: 0,             // Điện áp motor (V)
       motorA: 0,             // Dòng motor (A)
       obs: false,            // Obstacle detected
+      architecture: 'hybrid',
+      gridStreamEnabled: true,
+      onboardNavEnabled: true,
     };
 
     // Callbacks
@@ -65,6 +75,7 @@ export class RobotConnection {
     this.onDisconnect = null;       // () => {}
     this.onError = null;            // (error) => {}
     this.onNavAck = null;           // (data) => {} — ESP32 xác nhận đã nhận path
+    this.onLidarGrid = null;       // (grid) => {} — Occupancy grid from LIDAR
   }
 
   // ============================================================
@@ -81,6 +92,8 @@ export class RobotConnection {
 
     try {
       this.ws = new WebSocket(url);
+      // Nhận binary frames dạng ArrayBuffer (không phải Blob)
+      this.ws.binaryType = 'arraybuffer';
 
       this.ws.onopen = () => {
         console.log(`[Robot ${this.name}] ✅ Đã kết nối!`);
@@ -113,7 +126,12 @@ export class RobotConnection {
       };
 
       this.ws.onmessage = (event) => {
-        this._handleMessage(event.data);
+        if (event.data instanceof ArrayBuffer) {
+          this._dispatchBinaryMessage(event.data);
+        } else {
+          // Text frame — JSON (legacy hoặc fallback)
+          this._handleJsonMessage(event.data);
+        }
       };
     } catch (err) {
       console.error(`[Robot ${this.name}] Không thể tạo kết nối:`, err);
@@ -134,7 +152,7 @@ export class RobotConnection {
   }
 
   // ============================================================
-  //   SEND COMMANDS
+  //   SEND COMMANDS (MessagePack Binary)
   // ============================================================
 
   /**
@@ -223,24 +241,99 @@ export class RobotConnection {
     this._send({ cmd: 'brake', val: enabled });
   }
 
+  setArchitectureProfile(profile = 'hybrid') {
+    this._send({ cmd: 'set_arch_mode', profile });
+  }
+
   // ============================================================
-  //   INTERNAL
+  //   INTERNAL — SEND
   // ============================================================
 
+  /**
+   * Gửi data qua WebSocket.
+   * Ưu tiên MessagePack binary, fallback sang JSON text nếu encode lỗi.
+   */
   _send(data) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
     try {
-      this.ws.send(JSON.stringify(data));
+      const packed = encode(data);
+      this.ws.send(packed);
       return true;
     } catch (err) {
-      console.error(`[Robot ${this.name}] Lỗi gửi:`, err);
-      return false;
+      // Fallback: JSON text nếu MsgPack encode lỗi
+      try {
+        this.ws.send(JSON.stringify(data));
+        return true;
+      } catch (e2) {
+        console.error(`[Robot ${this.name}] Lỗi gửi:`, e2);
+        return false;
+      }
     }
   }
 
-  _handleMessage(raw) {
+  // ============================================================
+  //   INTERNAL — RECEIVE
+  // ============================================================
+
+  /**
+   * Dispatch binary message dựa trên byte đầu tiên:
+   * - 0x01 = Occupancy Grid (custom binary format)
+   * - 0x02 = MessagePack telemetry (có type marker từ ESP32 mới)
+   * - Khác = MessagePack thuần (không có type marker)
+   */
+  _dispatchBinaryMessage(buffer) {
+    if (buffer.byteLength === 0) return;
+
+    const firstByte = new Uint8Array(buffer)[0];
+
+    if (firstByte === 0x01) {
+      // Occupancy Grid — custom binary protocol (legacy)
+      this._handleGridMessage(buffer);
+    } else if (firstByte === 0x02) {
+      // MessagePack telemetry với type marker — skip byte đầu
+      this._handleMsgPackMessage(buffer.slice(1));
+    } else {
+      // MessagePack thuần (không có marker) hoặc legacy MsgPack
+      this._handleMsgPackMessage(buffer);
+    }
+  }
+
+  /**
+   * Decode MessagePack binary → JS object → xử lý
+   */
+  _handleMsgPackMessage(buffer) {
+    try {
+      const data = decode(new Uint8Array(buffer));
+
+      // PONG response
+      if (data.type === 'pong') {
+        this.latency = Date.now() - data.ts;
+        this.lastPong = Date.now();
+        return;
+      }
+
+      // NAV_ACK
+      if (data.type === 'nav_ack') {
+        console.log(`[Robot ${this.name}] NAV_ACK: ${data.wp_count} waypoints, finalH=${data.finalH}°`);
+        if (this.onNavAck) this.onNavAck(data);
+        return;
+      }
+
+      // Telemetry
+      if (data.telem) {
+        this._processTelemetryData(data);
+      }
+    } catch (err) {
+      console.error(`[Robot ${this.name}] MsgPack decode error:`, err);
+    }
+  }
+
+  /**
+   * Handle JSON text messages (legacy / fallback)
+   */
+  _handleJsonMessage(raw) {
     try {
       const data = JSON.parse(raw);
 
@@ -260,42 +353,80 @@ export class RobotConnection {
 
       // Telemetry
       if (data.telem) {
-        this.telemetry = {
-          x: data.x ?? this.telemetry.x,
-          y: data.y ?? this.telemetry.y,
-          heading: data.h ?? this.telemetry.heading,
-          headingRad: (data.h ?? 0) * Math.PI / 180,
-          distance: data.d ?? this.telemetry.distance,
-          linearVel: data.vx ?? this.telemetry.linearVel,
-          angularVel: data.wz ?? this.telemetry.angularVel,
-          battery: data.batt ?? this.telemetry.battery,
-          imuAvailable: data.imu ?? this.telemetry.imuAvailable,
-          imuCalibrated: data.imu_cal ?? this.telemetry.imuCalibrated,
-          encoderLeft: data.enc?.l ?? this.telemetry.encoderLeft,
-          encoderRight: data.enc?.r ?? this.telemetry.encoderRight,
-          targetVelL: data.vL_t ?? this.telemetry.targetVelL,
-          targetVelR: data.vR_t ?? this.telemetry.targetVelR,
-          measuredVelL: data.vL_r ?? this.telemetry.measuredVelL,
-          measuredVelR: data.vR_r ?? this.telemetry.measuredVelR,
-          pwmLeft: data.pwmL ?? this.telemetry.pwmLeft,
-          pwmRight: data.pwmR ?? this.telemetry.pwmRight,
-          nav: data.nav ?? this.telemetry.nav,
-          navWp: data.nav_wp ?? this.telemetry.navWp,
-          navTotal: data.nav_total ?? this.telemetry.navTotal,
-          // INA3221 Power
-          battV: data.power?.battV ?? this.telemetry.battV,
-          battA: data.power?.battA ?? this.telemetry.battA,
-          motorV: data.power?.motorV ?? this.telemetry.motorV,
-          motorA: data.power?.motorA ?? this.telemetry.motorA,
-          obs: data.obs ?? this.telemetry.obs,
-        };
-
-        if (this.onTelemetry) this.onTelemetry(this.telemetry);
+        this._processTelemetryData(data);
       }
     } catch (err) {
       // Bỏ qua message không parse được
     }
   }
+
+  /**
+   * Occupancy Grid — custom binary message (byte[0] = 0x01)
+   * Giữ nguyên logic cũ.
+   */
+  _handleGridMessage(buffer) {
+    try {
+      import('../core/lidarMapper.js').then(module => {
+        const OccupancyGrid = module.default;
+        const grid = OccupancyGrid.fromBinary(buffer);
+        
+        if (this.onLidarGrid) {
+          this.onLidarGrid(grid);
+        }
+      }).catch(err => {
+        console.error(`[Robot ${this.name}] Error importing lidarMapper:`, err);
+      });
+    } catch (err) {
+      console.error(`[Robot ${this.name}] Error parsing binary message:`, err);
+    }
+  }
+
+  /**
+   * Xử lý telemetry data (shared giữa JSON và MsgPack paths)
+   * DRY: Cả 2 luồng decode đều gọi hàm này.
+   */
+  _processTelemetryData(data) {
+    this.telemetry = {
+      x: data.x ?? this.telemetry.x,
+      y: data.y ?? this.telemetry.y,
+      heading: data.h ?? this.telemetry.heading,
+      headingRad: (data.h ?? 0) * Math.PI / 180,
+      distance: data.d ?? this.telemetry.distance,
+      linearVel: data.vx ?? this.telemetry.linearVel,
+      angularVel: data.wz ?? this.telemetry.angularVel,
+      battery: data.batt ?? this.telemetry.battery,
+      imuAvailable: data.imu ?? this.telemetry.imuAvailable,
+      imuCalibrated: data.imu_cal ?? this.telemetry.imuCalibrated,
+      encoderLeft: data.enc?.l ?? this.telemetry.encoderLeft,
+      encoderRight: data.enc?.r ?? this.telemetry.encoderRight,
+      targetVelL: data.vL_t ?? this.telemetry.targetVelL,
+      targetVelR: data.vR_t ?? this.telemetry.targetVelR,
+      measuredVelL: data.vL_r ?? this.telemetry.measuredVelL,
+      measuredVelR: data.vR_r ?? this.telemetry.measuredVelR,
+      pwmLeft: data.pwmL ?? this.telemetry.pwmLeft,
+      pwmRight: data.pwmR ?? this.telemetry.pwmRight,
+      nav: data.nav ?? this.telemetry.nav,
+      navWp: data.nav_wp ?? this.telemetry.navWp,
+      navTotal: data.nav_total ?? this.telemetry.navTotal,
+      architecture: data.arch ?? this.telemetry.architecture,
+      gridStreamEnabled: data.grid_stream ?? this.telemetry.gridStreamEnabled,
+      onboardNavEnabled: data.onboard_nav ?? this.telemetry.onboardNavEnabled,
+      // INA3221 Power
+      battV: data.power?.battV ?? this.telemetry.battV,
+      battA: data.power?.battA ?? this.telemetry.battA,
+      motorV: data.power?.motorV ?? this.telemetry.motorV,
+      motorA: data.power?.motorA ?? this.telemetry.motorA,
+      obs: data.obs ?? this.telemetry.obs,
+      // Lidar scan data (raw pass-through for mapping)
+      lidar: data.lidar || [],
+    };
+
+    if (this.onTelemetry) this.onTelemetry(this.telemetry);
+  }
+
+  // ============================================================
+  //   PING / PONG / RECONNECT
+  // ============================================================
 
   _startPing() {
     this._stopPing();

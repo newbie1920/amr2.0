@@ -14,6 +14,35 @@ const useTaskStore = create(
       taskIdCounter: 1,
 
       /**
+       * Lấy lịch sử nhiệm vụ (completed, failed, canceled)
+       */
+      getTaskHistory: () => {
+        return get().tasks.filter(t => ['completed', 'failed', 'canceled'].includes(t.status));
+      },
+
+      /**
+       * Tạm dừng nhiệm vụ (vd: Kẹt vật cản, người dùng bấm dừng)
+       */
+      pauseTask: (taskId, reason = 'Tạm dừng') => {
+        set((state) => ({
+          tasks: state.tasks.map(t =>
+            t.id === taskId ? { ...t, status: 'paused', error: reason } : t
+          ),
+        }));
+      },
+
+      /**
+       * Hủy nhiệm vụ (vd: Người dùng bấm hủy khi lỗi)
+       */
+      cancelTask: (taskId, reason = 'Đã hủy') => {
+        set((state) => ({
+          tasks: state.tasks.map(t =>
+            t.id === taskId ? { ...t, status: 'canceled', error: reason, completedAt: Date.now() } : t
+          ),
+        }));
+      },
+
+      /**
        * Xử lý lỗi/hoàn thành Task và Sync DB
        */
       processTaskCompletion: async (taskId, navState, errorMsg = '') => {

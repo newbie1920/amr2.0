@@ -47,7 +47,7 @@ export default function TelemetryChart() {
         </div>
       </div>
       <div style={{ height: '220px', width: '100%', fontSize: '11px' }}>
-        <ResponsiveContainer width="100%" height="100%">
+        <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
           <LineChart data={data} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
             <XAxis dataKey="name" stroke="var(--text-muted)" tick={{fontSize: 9}} tickMargin={5} />

@@ -19,6 +19,7 @@
 #include "config.h"
 #include "navigator.h"
 #include "wheel_pid.h"
+#include "lidar_mapper.h"
 #include <Adafruit_NeoPixel.h>
 
 Adafruit_NeoPixel rgbLed(1, RGB_BUILTIN_PIN, NEO_GRB + NEO_KHZ800);
@@ -72,10 +73,16 @@ float filteredVBatt = 12.0f;
 // ── Lidar A1M8 ──────────────────────────────────────────────
 HardwareSerial lidarSerial(1);
 RPLidar lidar;
+OccupancyGridMapper gridMapper;  // LIDAR-based occupancy grid
 uint16_t lidarDists[360] = {0}; // Lưu khoảng cách (mm) theo từng độ
 bool lidarRunning = false;
 bool obstacleDetected = false;
 unsigned long timeObstacleLastDetected = 0;
+unsigned long lastGridUpdateTime = 0;
+static const unsigned long GRID_UPDATE_INTERVAL = 200; // Cập nhật grid mỗi 200ms
+bool streamOccupancyGrid = true;
+bool allowOnboardNavigation = true;
+const char* architectureProfile = "hybrid";
 // ────────────────────────────────────────────────────────────
 
 // Timing
@@ -174,7 +181,7 @@ void mpu6050_calibrate(float rawZ) {
 #define INA3221_ADDR 0x40
 
 int16_t ina3221_readReg(uint8_t reg) {
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return 0; // Skip if I2C busy
   Wire.beginTransmission(INA3221_ADDR);
   Wire.write(reg);
   uint8_t err = Wire.endTransmission();
@@ -383,6 +390,7 @@ void controlTask(void *pvParameters) {
     setMotor(MOTOR_RIGHT_IN3, MOTOR_RIGHT_IN4, 1, pwmRight);
 
     // Obstacle Avoidance Auto-Pause Logic
+    // Không pause khi đang recovery (robot cần xoay/lùi tự do)
     if (obstacleDetected && millis() - timeObstacleLastDetected < 500) {
         if (navigator.isNavigating() && navigator.state == NAV_TRACKING) {
             navigator.pause();
@@ -422,12 +430,26 @@ void lidarTask(void *pvParameters) {
         // Lưu khoảng cách vào mảng 360 độ (làm tròn độ)
         int deg = (int)round(angle) % 360;
         lidarDists[deg] = (uint16_t)distance;
+        
+        // Thêm vào occupancy grid mapper (tính bằng mét)
+        if (streamOccupancyGrid) {
+          gridMapper.add_point(angle, distance / 1000.0f);
+        }
 
         // Xử lý E-STOP: Kiểm tra góc phía trước [-30 đến 30 độ tương ứng 330->359 và 0->30]
         if ((deg <= 30 || deg >= 330) && distance > 50 && distance < 450) {
             obstacleDetected = true;
             timeObstacleLastDetected = millis();
         }
+      }
+      
+      // Cập nhật grid mapper khi có đủ điểm (sau mỗi vòng quét ~1 giây)
+      if (streamOccupancyGrid &&
+          millis() - lastGridUpdateTime > GRID_UPDATE_INTERVAL &&
+          gridMapper.point_count > 180) {
+        gridMapper.update_pose(robotX, robotY, robotTheta);
+        gridMapper.update_grid();
+        lastGridUpdateTime = millis();
       }
     } else {
       // Mất kết nối hoặc quay quá chậm, restart
@@ -438,6 +460,65 @@ void lidarTask(void *pvParameters) {
       analogWrite(LIDAR_PWM_PIN, 150); 
     }
   }
+}
+
+// ============================================================
+//   SEND OCCUPANCY GRID via WebSocket
+// ============================================================
+void send_occupancy_grid() {
+  /**
+   * Gửi occupancy grid dưới dạng binary message
+   * Format: [type:1][width:1][height:1][resolution:4][data:1600]
+   * Total: 1607 bytes
+   */
+  static uint8_t gridBuffer[1620];
+  int idx = 0;
+  
+  // Message type (1 = occupancy grid)
+  gridBuffer[idx++] = 0x01;
+  
+  // Grid dimensions
+  gridBuffer[idx++] = GRID_SIZE;     // 40
+  gridBuffer[idx++] = GRID_SIZE;     // 40
+  
+  // Resolution (float, little-endian)
+  float gridRes = GRID_RESOLUTION;
+  memcpy(&gridBuffer[idx], &gridRes, 4);
+  idx += 4;
+  
+  // Robot pose (for visualization)
+  float rx = robotX, ry = robotY, rh = robotTheta;
+  memcpy(&gridBuffer[idx], &rx, 4);
+  idx += 4;
+  memcpy(&gridBuffer[idx], &ry, 4);
+  idx += 4;
+  memcpy(&gridBuffer[idx], &rh, 4);
+  idx += 4;
+  
+  // Occupancy grid (40x40 = 1600 bytes)
+  int payloadLen = 0;
+  gridMapper.serialize_grid(&gridBuffer[idx], payloadLen);
+  idx += payloadLen;
+  
+  // Broadcast to all WebSocket clients
+  webSocket.broadcastBIN(gridBuffer, idx);
+}
+
+void setArchitectureProfile(const char* profile) {
+  if (strcmp(profile, "pc_slam") == 0) {
+    architectureProfile = "pc_slam";
+    streamOccupancyGrid = false;
+    allowOnboardNavigation = false;
+    gridMapper.reset();
+    navigator.abort();
+    Serial.println("[ARCH] Switched to PC_SLAM profile");
+    return;
+  }
+
+  architectureProfile = "hybrid";
+  streamOccupancyGrid = true;
+  allowOnboardNavigation = true;
+  Serial.println("[ARCH] Switched to HYBRID profile");
 }
 
 // ============================================================
@@ -555,17 +636,23 @@ void setup() {
 
   webSocket.begin();
   webSocket.onEvent([](uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
-    if (type != WStype_TEXT) return;
+    // Dual-mode: Accept both JSON (TEXT) and MessagePack (BIN)
     JsonDocument doc;
-    deserializeJson(doc, payload);
+    if (type == WStype_TEXT) {
+      deserializeJson(doc, payload, length);
+    } else if (type == WStype_BIN) {
+      deserializeMsgPack(doc, payload, length);
+    } else {
+      return;
+    }
 
     if (doc["type"] == "ping") {
       JsonDocument pong;
       pong["type"] = "pong";
       pong["ts"] = doc["ts"];
-      static char outBuf[128];
-      serializeJson(pong, outBuf, sizeof(outBuf));
-      webSocket.sendTXT(num, outBuf);
+      static uint8_t outBuf[64];
+      size_t len = serializeMsgPack(pong, outBuf, sizeof(outBuf));
+      webSocket.sendBIN(num, outBuf, len);
       return;
     }
 
@@ -587,6 +674,10 @@ void setup() {
     }
 
     if (doc["cmd"] == "navigate") {
+      if (!allowOnboardNavigation) {
+        Serial.println("[ARCH] Ignored onboard navigate in PC_SLAM profile");
+        return;
+      }
       JsonArray pathArr = doc["path"].as<JsonArray>();
       int count = pathArr.size();
       if (count > 0 && count <= MAX_WAYPOINTS) {
@@ -614,22 +705,33 @@ void setup() {
         ack["type"] = "nav_ack";
         ack["wp_count"] = count;
         ack["finalH"] = isnan(endH) ? -1 : (int)(endH * 180.0f / PI);
-        static char outBuf[128];
-        serializeJson(ack, outBuf, sizeof(outBuf));
-        webSocket.sendTXT(num, outBuf);
+        static uint8_t outBuf[64];
+        size_t ackLen = serializeMsgPack(ack, outBuf, sizeof(outBuf));
+        webSocket.sendBIN(num, outBuf, ackLen);
       }
     }
     
     if (doc["cmd"] == "nav_stop") {
-      navigator.abort();
+      if (allowOnboardNavigation) {
+        navigator.abort();
+      }
     }
 
     if (doc["cmd"] == "pause") {
-      navigator.pause();
+      if (allowOnboardNavigation) {
+        navigator.pause();
+      }
     }
 
     if (doc["cmd"] == "resume") {
-      navigator.resume();
+      if (allowOnboardNavigation) {
+        navigator.resume();
+      }
+    }
+
+    if (doc["cmd"] == "set_arch_mode") {
+      const char* profile = doc["profile"] | "hybrid";
+      setArchitectureProfile(profile);
     }
 
     if (doc["cmd"] == "recal_gyro") {
@@ -655,7 +757,7 @@ void setup() {
   server.begin();
 
   xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 10, NULL, 1);
-  xTaskCreatePinnedToCore(lidarTask, "LidarTask", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(lidarTask, "LidarTask", 8192, NULL, 1, NULL, 0);
 
   Serial.println("================================================");
   Serial.println("  AMR 2.0 FIRMWARE - ESP32-S3 N16R8             ");
@@ -757,6 +859,11 @@ void loop() {
     telem["nav"] = navigator.getStateName();
     telem["nav_wp"] = navigator.currentWpIdx;
     telem["nav_total"] = navigator.waypointCount;
+    telem["nav_rec"] = navigator.recoveryAttempts;
+    telem["nav_recovering"] = navigator.isRecovering();
+    telem["arch"] = architectureProfile;
+    telem["grid_stream"] = streamOccupancyGrid;
+    telem["onboard_nav"] = allowOnboardNavigation;
     telem["eX"] = navigator.error_x;
     telem["eY"] = navigator.error_y;
     telem["eYaw"] = navigator.error_yaw;
@@ -790,11 +897,21 @@ void loop() {
       }
     }
 
-    static char telemBuf[2048]; // Tăng buffer size để chứa Lidar Data
-    size_t len = serializeJson(telem, telemBuf, sizeof(telemBuf));
-    webSocket.broadcastTXT(telemBuf, len);
+    // MessagePack binary telemetry — byte[0] = 0x02 type marker
+    static uint8_t telemBuf[3072];
+    telemBuf[0] = 0x02; // Type marker: MsgPack telemetry (vs 0x01 = occupancy grid)
+    size_t len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
+    if (len > sizeof(telemBuf) - 1) len = sizeof(telemBuf) - 1; // Safety clamp
+    webSocket.broadcastBIN(telemBuf, len + 1);
     
-    Serial.printf("[AMR2] V:%.1f,%.1f IMU:%s Bat:%d%% X:%.2f Y:%.2f H:%.1f OBS:%s\n",
+    // Gửi occupancy grid mỗi 500ms (tránh quá tải network)
+    static unsigned long lastGridSendTime = 0;
+    if (streamOccupancyGrid && millis() - lastGridSendTime > 500) {
+      lastGridSendTime = millis();
+      send_occupancy_grid();
+    }
+    
+    printf("[AMR2] V:%.1f,%.1f IMU:%s Bat:%d%% X:%.2f Y:%.2f H:%.1f OBS:%s\n",
                   vL_meas, vR_meas,
                   imuAvailable ? "OK" : "--", battPct,
                   robotX, robotY, robotTheta * 180.0f / PI,

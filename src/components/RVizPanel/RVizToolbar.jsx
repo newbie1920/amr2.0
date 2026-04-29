@@ -1,0 +1,128 @@
+/**
+ * RVizTDTU — Toolbar Component
+ * 
+ * Tool buttons (giống RViz):
+ *   - Move (pan) — default
+ *   - 2D Pose Estimate
+ *   - 2D Nav Goal
+ *   - Measure
+ * 
+ * Layer toggles (bật/tắt visualization layers)
+ */
+
+import React from 'react';
+
+// ============================================================
+//   STYLES
+// ============================================================
+
+const toolbarStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '2px',
+  padding: '6px 4px',
+  background: 'rgba(15, 25, 35, 0.95)',
+  borderRight: '1px solid rgba(139, 92, 246, 0.2)',
+  minWidth: '36px',
+};
+
+const toolBtnStyle = (active) => ({
+  width: '28px',
+  height: '28px',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: active ? 'rgba(139, 92, 246, 0.25)' : 'transparent',
+  border: active ? '1px solid rgba(139, 92, 246, 0.5)' : '1px solid transparent',
+  borderRadius: '4px',
+  cursor: 'pointer',
+  fontSize: '14px',
+  color: active ? '#a78bfa' : '#64748b',
+  transition: 'all 0.12s ease',
+});
+
+const dividerStyle = {
+  height: '1px',
+  background: 'rgba(255,255,255,0.06)',
+  margin: '4px 0',
+};
+
+const layerToggleStyle = (enabled) => ({
+  width: '28px',
+  height: '20px',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background: enabled ? 'rgba(34, 197, 94, 0.15)' : 'transparent',
+  border: 'none',
+  borderRadius: '3px',
+  cursor: 'pointer',
+  fontSize: '10px',
+  color: enabled ? '#4ade80' : '#475569',
+  transition: 'all 0.12s ease',
+});
+
+const tooltipWrapStyle = {
+  position: 'relative',
+};
+
+// ============================================================
+//   TOOL DEFINITIONS
+// ============================================================
+
+const TOOLS = [
+  { id: 'move', icon: '✋', label: 'Move / Pan' },
+  { id: 'pose', icon: '📍', label: '2D Pose Estimate' },
+  { id: 'goal', icon: '🎯', label: '2D Nav Goal' },
+  { id: 'measure', icon: '📏', label: 'Measure Distance' },
+];
+
+const LAYERS = [
+  { id: 'grid', icon: '#', label: 'Grid' },
+  { id: 'map', icon: '🗺', label: 'Occupancy Map' },
+  { id: 'costmap', icon: '🌡', label: 'Costmap' },
+  { id: 'walls', icon: '🧱', label: 'World Segments' },
+  { id: 'laser', icon: '🔴', label: 'Laser Scan' },
+  { id: 'path', icon: '➡', label: 'Nav Path' },
+  { id: 'robot', icon: '🤖', label: 'Robot Pose' },
+  { id: 'tf', icon: '🔗', label: 'TF Frames' },
+  { id: 'frontier', icon: '🔵', label: 'Frontiers' },
+];
+
+// ============================================================
+//   COMPONENT
+// ============================================================
+
+export default function RVizToolbar({ activeTool, onToolChange, layers, onToggleLayer }) {
+  return (
+    <div style={toolbarStyle}>
+      {/* Tools */}
+      {TOOLS.map(tool => (
+        <div key={tool.id} style={tooltipWrapStyle} title={tool.label}>
+          <button
+            style={toolBtnStyle(activeTool === tool.id)}
+            onClick={() => onToolChange(tool.id)}
+          >
+            {tool.icon}
+          </button>
+        </div>
+      ))}
+
+      <div style={dividerStyle} />
+
+      {/* Layer Toggles */}
+      {LAYERS.map(layer => (
+        <div key={layer.id} style={tooltipWrapStyle} title={layer.label}>
+          <button
+            style={layerToggleStyle(layers[layer.id] !== false)}
+            onClick={() => onToggleLayer(layer.id)}
+          >
+            {layer.icon}
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export { TOOLS, LAYERS };

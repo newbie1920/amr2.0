@@ -25,3 +25,8 @@ Sử dụng cảm biến INA3221 (Địa chỉ I2C: 0x40) để giám sát công
 - Auto-Validation: Luôn tự kiểm tra lỗi sau khi sửa code.
 - Surgical Operations: Giới hạn tìm kiếm và sửa code cục bộ.
 - Chuẩn báo cáo: MauDATN_2021.
+
+### 4. Kiến trúc Điều hướng (Navigation) & Nav2
+- **DWA Local Planner**: Không chạy trên ESP32 mà chạy trên **Main Thread của Trình duyệt Web**. Lấy dữ liệu global path (từ A*), mô phỏng quỹ đạo tránh vật cản (DWA), và liên tục gửi lệnh tốc độ `cmd_vel` (`v`, `w`) tần số cao (~10Hz) xuống ESP32 thông qua WebSocket (`VelocityMux`).
+- **Path Smoothing**: Đầu ra của thuật toán A* gốc bị ziczac. Đã áp dụng `Gradient Descent Smoothing` kết hợp giới hạn `Ramer-Douglas-Peucker (RDP)` để mượt mà đường đi, giảm tải waypoint cho ESP32.
+- **ESP32**: Chỉ chịu trách nhiệm chạy PID bám vận tốc `cmd_vel` hoặc bám đường thẳng cơ bản, nhường phần lớn AI và tính toán đường đi phức tạp cho phía Web-app (TDTU Thesis).

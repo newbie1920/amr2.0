@@ -7,7 +7,7 @@ import { useState, useEffect } from 'react';
 import useTaskStore from '../../stores/taskStore.js';
 import useRobotStore from '../../stores/robotStore.js';
 import { SHELVES, GATES, findSlotById } from '../../core/warehouse.js';
-import { findPath } from '../../core/pathfinder.js';
+import { navWorkerApi } from '../../core/navWorkerSetup.js';
 import vi from '../../i18n/vi.js';
 import { supabase } from '../../utils/supabaseClient.js';
 
@@ -86,6 +86,8 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
 }
 
 export default function TaskManager({ onPathGenerated }) {
+  const [activeTab, setActiveTab] = useState('active'); // 'active' | 'history'
+  const [selectedTaskId, setSelectedTaskId] = useState(null); // Modal
   const [taskType, setTaskType] = useState('import');
   const [showForm, setShowForm] = useState(false);
   
@@ -103,7 +105,7 @@ export default function TaskManager({ onPathGenerated }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedGateId, setSelectedGateId] = useState('');
 
-  const { createTask, tasks } = useTaskStore();
+  const { createTask, tasks, updateTask, cancelTask } = useTaskStore();
   const robots = useRobotStore((s) => s.robots);
   const connectedRobots = Object.values(robots).filter(r => r.status === 'connected');
 
@@ -214,7 +216,9 @@ export default function TaskManager({ onPathGenerated }) {
 
       if (slotInfo) {
         // Bước 1: Tìm đường A* từ xe → ô kệ
-        const result = findPath(
+        const gridData = useRobotStore.getState().grid.serialize();
+        const result = await navWorkerApi.findPath(
+          gridData,
           robot.telemetry.x, robot.telemetry.y,
           slotInfo.slot.approach.x, slotInfo.slot.approach.y
         );
@@ -263,9 +267,11 @@ export default function TaskManager({ onPathGenerated }) {
   }, []);
 
 
-  const activeTasks = tasks.filter(t => t.status === 'in_progress' || t.status === 'assigned');
-  const pendingTasks = tasks.filter(t => t.status === 'pending');
-  const completedTasks = tasks.filter(t => t.status === 'completed').slice(-5);
+  const activeTasksList = tasks.filter(t => !['completed', 'canceled'].includes(t.status));
+  const activeTasks = activeTasksList.filter(t => t.status === 'in_progress' || t.status === 'assigned' || t.status === 'paused' || t.status === 'failed');
+  const pendingTasks = activeTasksList.filter(t => t.status === 'pending');
+  const historyTasks = tasks.filter(t => ['completed', 'canceled'].includes(t.status)).reverse(); // Mới nhất lên đầu
+  const selectedTask = tasks.find(t => t.id === selectedTaskId);
   
   const filteredInventory = inventory.filter(i => 
     i.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
@@ -277,8 +283,18 @@ export default function TaskManager({ onPathGenerated }) {
       <div className="panel__header">
         <span className="panel__title">📋 Quản Lý Nhiệm Vụ (WMS)</span>
       </div>
-
+      
       <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+        <button className={`btn btn--sm ${activeTab === 'active' ? 'btn--primary' : 'btn--ghost'}`} onClick={() => setActiveTab('active')} style={{ flex: 1 }}>
+          ⚡ Hiện tại ({activeTasksList.length})
+        </button>
+        <button className={`btn btn--sm ${activeTab === 'history' ? 'btn--primary' : 'btn--ghost'}`} onClick={() => setActiveTab('history')} style={{ flex: 1 }}>
+          📜 Lịch sử ({historyTasks.length})
+        </button>
+      </div>
+
+      {activeTab === 'active' && (
+        <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
         <button
           className={`btn btn--full ${taskType === 'import' ? 'btn--primary' : 'btn--ghost'}`}
           onClick={() => { setTaskType('import'); setShowForm(true); setImportType('new'); setUserSelectedSlotId(''); setSelectedSku(''); setSelectedGateId(''); }}
@@ -292,6 +308,7 @@ export default function TaskManager({ onPathGenerated }) {
           🚚 Xuất Hàng
         </button>
       </div>
+      )}
 
       {showForm && (
         <div className="connection-form">
@@ -433,24 +450,22 @@ export default function TaskManager({ onPathGenerated }) {
         </div>
       )}
 
-      <div className="panel__divider" />
-
-      {/* Nhiệm vụ đang chạy */}
-      {activeTasks.length > 0 && (
+      {/* Nhiệm vụ đang chạy hoặc lỗi */}
+      {activeTab === 'active' && activeTasks.length > 0 && (
         <>
           <div className="panel__header">
             <span className="panel__title" style={{ fontSize: '11px' }}>
-              🔄 {vi.task.status.inProgress} ({activeTasks.length})
+              🔄 Đang xử lý / Lỗi ({activeTasks.length})
             </span>
           </div>
           {activeTasks.map(task => (
-            <TaskCard key={task.id} task={task} />
+            <TaskCard key={task.id} task={task} onClick={() => setSelectedTaskId(task.id)} />
           ))}
         </>
       )}
 
       {/* Nhiệm vụ chờ */}
-      {pendingTasks.length > 0 && (
+      {activeTab === 'active' && pendingTasks.length > 0 && (
         <>
           <div className="panel__header">
             <span className="panel__title" style={{ fontSize: '11px' }}>
@@ -458,21 +473,21 @@ export default function TaskManager({ onPathGenerated }) {
             </span>
           </div>
           {pendingTasks.map(task => (
-            <TaskCard key={task.id} task={task} />
+            <TaskCard key={task.id} task={task} onClick={() => setSelectedTaskId(task.id)} />
           ))}
         </>
       )}
 
-      {/* Nhiệm vụ hoàn thành */}
-      {completedTasks.length > 0 && (
+      {/* Lịch sử */}
+      {activeTab === 'history' && historyTasks.length > 0 && (
         <>
           <div className="panel__header">
             <span className="panel__title" style={{ fontSize: '11px' }}>
-              ✅ {vi.task.status.completed} ({completedTasks.length})
+              📜 Lịch sử nhiệm vụ
             </span>
           </div>
-          {completedTasks.map(task => (
-            <TaskCard key={task.id} task={task} />
+          {historyTasks.map(task => (
+            <TaskCard key={task.id} task={task} onClick={() => setSelectedTaskId(task.id)} />
           ))}
         </>
       )}
@@ -483,6 +498,20 @@ export default function TaskManager({ onPathGenerated }) {
           Nhấn "Nhập Hàng" hoặc "Xuất Hàng" để bắt đầu.
         </div>
       )}
+
+      {activeTab === 'history' && historyTasks.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-muted)', fontSize: '12px' }}>
+          Chưa có lịch sử nhiệm vụ.
+        </div>
+      )}
+
+      {selectedTask && (
+        <TaskDetailsModal 
+          task={selectedTask} 
+          onClose={() => setSelectedTaskId(null)} 
+          onPathGenerated={onPathGenerated}
+        />
+      )}
     </div>
   );
 }
@@ -490,7 +519,7 @@ export default function TaskManager({ onPathGenerated }) {
 /**
  * Task Card
  */
-function TaskCard({ task }) {
+function TaskCard({ task, onClick }) {
   const { navStopRobot } = useRobotStore();
   const robots = useRobotStore((s) => s.robots);
   const robot = task.assignedRobotId ? robots[task.assignedRobotId] : null;
@@ -505,6 +534,8 @@ function TaskCard({ task }) {
 
   const statusBorder = task.status === 'completed' ? 'card--success' :
                        task.status === 'failed' ? 'card--danger' :
+                       task.status === 'paused' ? 'card--warning' :
+                       task.status === 'canceled' ? 'card--danger' :
                        task.status === 'in_progress' ? '' : '';
 
   // Navigator waypoint progress (from robot telemetry)
@@ -514,7 +545,7 @@ function TaskCard({ task }) {
   const wpProgress = navTotal > 0 ? Math.round((navWp / navTotal) * 100) : 0;
 
   return (
-    <div className={`card task-card ${statusBorder}`}>
+    <div className={`card task-card ${statusBorder}`} onClick={onClick} style={{ cursor: 'pointer' }}>
       <div className="task-card__header">
         <span className={`task-card__type task-card__type--${task.type}`}>
           {task.type === 'import' ? '📦 Nhập' : '🚚 Xuất'}
@@ -573,16 +604,152 @@ function TaskCard({ task }) {
         </div>
       )}
 
+      {/* Task Error Reason */}
+      {(task.status === 'failed' || task.status === 'paused' || task.status === 'canceled') && task.error && (
+        <div style={{ marginTop: '8px', fontSize: '10px', color: 'var(--accent-danger)', background: 'rgba(239, 68, 68, 0.1)', padding: '6px', borderRadius: '4px' }}>
+          ⚠️ {task.error}
+        </div>
+      )}
+
       {/* Nav Stop button — chỉ hiện khi xe đang tự lái */}
-      {task.status === 'in_progress' && task.assignedRobotId && robot?.status === 'connected' && navState !== 'IDLE' && navState !== 'DONE' && navState !== 'ERROR' && (
+      {task.status === 'in_progress' && task.assignedRobotId && robot?.status === 'connected' && navState !== 'IDLE' && navState !== 'DONE' && navState !== 'ERROR' && navState !== 'PAUSED' && (
         <button
           className="btn btn--danger btn--sm btn--full"
           style={{ marginTop: '8px', fontSize: '11px' }}
-          onClick={() => navStopRobot(task.assignedRobotId)}
+          onClick={(e) => { e.stopPropagation(); navStopRobot(task.assignedRobotId); }}
         >
           ⛔ Dừng Tự Lái
         </button>
       )}
+    </div>
+  );
+}
+
+/**
+ * Task Details Modal
+ */
+function TaskDetailsModal({ task, onClose, onPathGenerated }) {
+  const { cancelTask, updateTask } = useTaskStore();
+  const { navigateRobot, resumeRobot } = useRobotStore();
+  const robots = useRobotStore(s => s.robots);
+  const robot = task.assignedRobotId ? robots[task.assignedRobotId] : null;
+
+  const handleResume = async () => {
+    if (!robot || robot.status !== 'connected') return alert('Robot không kết nối!');
+    
+    if (task.status === 'paused') {
+      // Nếu chỉ tạm dừng (pause mềm), gửi lệnh tiếp tục
+      resumeRobot(robot.id);
+      updateTask(task.id, { status: 'in_progress', error: null });
+    } else if (task.status === 'failed') {
+      // Nếu lỗi timeout (ESP32 đã xóa path), cần vẽ lại đường đi từ vị trí hiện tại
+      const slotInfo = findSlotById(task.slotId);
+      if (!slotInfo) return alert('Không tìm thấy tọa độ đích!');
+      
+      const targetX = task.type === 'import' ? slotInfo.slot.approach.x : slotInfo.slot.approach.x; // Simplified
+      const targetY = task.type === 'import' ? slotInfo.slot.approach.y : slotInfo.slot.approach.y;
+
+      const gridData = useRobotStore.getState().grid.serialize();
+      const result = await navWorkerApi.findPath(gridData, robot.telemetry.x, robot.telemetry.y, targetX, targetY);
+      if (result.success) {
+        if (onPathGenerated) onPathGenerated(result.path);
+        navigateRobot(robot.id, result.path, slotInfo.slot.heading || 90);
+        updateTask(task.id, { status: 'in_progress', error: null });
+      } else {
+        alert('Không tìm được đường đi mới từ vị trí hiện tại!');
+      }
+    }
+    onClose();
+  };
+
+  const handleCancel = () => {
+    if (window.confirm('Bạn có chắc chắn muốn hủy nhiệm vụ này? Robot sẽ dừng lại.')) {
+      if (task.status === 'in_progress' || task.status === 'paused' || task.status === 'failed') {
+        cancelTask(task.id, 'Người dùng chủ động hủy');
+        if (robot) {
+          useRobotStore.getState().navStopRobot(robot.id);
+        }
+      }
+      onClose();
+    }
+  };
+
+  return (
+    <div style={{
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      background: 'rgba(0,0,0,0.6)', zIndex: 1000,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: '20px'
+    }}>
+      <div style={{
+        background: 'var(--bg-darker)', borderRadius: 'var(--radius-lg)',
+        width: '100%', maxWidth: '400px', border: '1px solid var(--border)',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.5)', overflow: 'hidden'
+      }}>
+        <div style={{ padding: '16px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div style={{ fontWeight: 'bold' }}>Chi tiết nhiệm vụ #{task.id}</div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '18px' }}>✕</button>
+        </div>
+
+        <div style={{ padding: '16px', fontSize: '13px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Loại nhiệm vụ:</span>
+            <span style={{ fontWeight: '500' }}>{task.type === 'import' ? '📦 Nhập kho' : '🚚 Xuất kho'}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Vị trí / Ô kệ:</span>
+            <span>{task.slotId}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Hàng hóa:</span>
+            <span>{task.orderInfo?.name} (SKU: {task.orderInfo?.sku})</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Số lượng:</span>
+            <span>{task.orderInfo?.qty}</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Robot đảm nhận:</span>
+            <span>{robot ? robot.name : 'Chưa phân công'}</span>
+          </div>
+          
+          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span style={{ color: 'var(--text-muted)' }}>Tạo lúc:</span>
+            <span>{new Date(task.createdAt).toLocaleTimeString()}</span>
+          </div>
+
+          {task.completedAt && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: 'var(--text-muted)' }}>Kết thúc lúc:</span>
+              <span>{new Date(task.completedAt).toLocaleTimeString()}</span>
+            </div>
+          )}
+
+          {(task.status === 'failed' || task.status === 'paused' || task.status === 'canceled') && task.error && (
+            <div style={{ background: 'rgba(239, 68, 68, 0.15)', padding: '10px', borderRadius: '6px', color: 'var(--accent-danger)', marginTop: '8px', border: '1px solid rgba(239, 68, 68, 0.3)' }}>
+              <strong>Lý do dừng:</strong> {task.error}
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: '16px', borderTop: '1px solid var(--border)', display: 'flex', gap: '10px' }}>
+          {(task.status === 'failed' || task.status === 'paused') && (
+            <button className="btn btn--primary" style={{ flex: 1 }} onClick={handleResume}>
+              ▶ Tiếp Tục
+            </button>
+          )}
+          
+          {(task.status === 'in_progress' || task.status === 'failed' || task.status === 'paused') && (
+            <button className="btn btn--danger" style={{ flex: 1 }} onClick={handleCancel}>
+              ⏹ Hủy Nhiệm Vụ
+            </button>
+          )}
+          
+          <button className="btn btn--ghost" style={{ flex: 1 }} onClick={onClose}>
+            Đóng
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

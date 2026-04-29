@@ -16,6 +16,7 @@ export default function ConnectionPanel() {
 
   const { addRobot, removeRobot, connectRobot, disconnectRobot, selectRobot, selectedRobotId } = useRobotStore();
   const robots = useRobotStore((s) => s.robots);
+  const explorationInfo = useRobotStore((s) => s.explorationInfo) || {};
   const robotList = Object.values(robots);
 
   const handleAdd = () => {
@@ -99,6 +100,7 @@ export default function ConnectionPanel() {
           const isConnected = robot.status === 'connected';
           const batteryColor = robot.telemetry.battery > 50 ? 'var(--accent-success)' :
                                robot.telemetry.battery > 20 ? 'var(--accent-warning)' : 'var(--accent-danger)';
+          const expInfo = explorationInfo[robot.id];
 
           return (
             <div
@@ -147,6 +149,22 @@ export default function ConnectionPanel() {
                         {robot.telemetry.nav === 'PAUSED' ? '⚠️ YIELDING (Nhường đường)' : robot.telemetry.nav}
                       </span>
                     </div>
+                    {robot.telemetry.architecture === 'pc_slam' && (
+                      <div className="robot-card__info-item" style={{ gridColumn: 'span 2' }}>
+                        <span>SLAM Score:</span>
+                        <span className="robot-card__info-value" style={{ color: (robot.telemetry.matchScore || 0) > 300 ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
+                          {robot.telemetry.matchScore ? Math.round(robot.telemetry.matchScore) : 'N/A'}
+                        </span>
+                      </div>
+                    )}
+                    {expInfo && expInfo.phase && expInfo.phase !== 'IDLE' && (
+                      <div className="robot-card__info-item" style={{ gridColumn: 'span 2' }}>
+                        <span>Khám phá:</span>
+                        <span className="robot-card__info-value" style={{ color: 'var(--accent-warning)' }}>
+                          {expInfo.phase} (Recov: {expInfo.recoveryCount})
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   <div className="robot-card__battery">
@@ -160,6 +178,29 @@ export default function ConnectionPanel() {
                   </div>
                   <div style={{ fontSize: '10px', color: batteryColor, marginTop: '4px', textAlign: 'right' }}>
                     🔋 {robot.telemetry.battery}%
+                  </div>
+
+                  <div style={{
+                    marginTop: '6px',
+                    padding: '6px 8px',
+                    background: 'rgba(255,255,255,0.03)',
+                    borderRadius: '6px',
+                    fontSize: '10px',
+                    color: 'var(--text-muted)',
+                    display: 'grid',
+                    gridTemplateColumns: '1fr',
+                    gap: '3px',
+                  }}>
+                    <span>
+                      Brain: <b style={{ color: 'var(--text-primary)' }}>{robot.telemetry.architecture === 'pc_slam' ? 'PC-first SLAM' : 'Hybrid'}</b>
+                    </span>
+                    <span>
+                      Streams: grid <b style={{ color: robot.telemetry.gridStreamEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
+                        {robot.telemetry.gridStreamEnabled ? 'ON' : 'OFF'}
+                      </b>, nav <b style={{ color: robot.telemetry.onboardNavEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
+                        {robot.telemetry.onboardNavEnabled ? 'ESP32' : 'PC'}
+                      </b>
+                    </span>
                   </div>
 
                   {/* INA3221 Power Monitor */}

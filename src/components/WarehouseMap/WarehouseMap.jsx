@@ -3,7 +3,7 @@
  * Bản đồ kho xưởng 3D sử dụng React Three Fiber
  */
 
-import React, { useMemo, useState, useRef } from 'react';
+import React, { useMemo, useState, useRef, useEffect, useCallback } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, Text, Box, Cylinder, Sphere, Edges, Line, Cone } from '@react-three/drei';
 import * as THREE from 'three';
@@ -12,7 +12,89 @@ import {
   SHELVES, GATES, CHARGING_STATIONS
 } from '../../core/warehouse.js';
 import useRobotStore from '../../stores/robotStore.js';
+import { getExplorationPhase, getExplorationInfo } from '../../core/exploration.js';
 import vi from '../../i18n/vi.js';
+import MapManager from '../MapManager/MapManager.jsx';
+
+// ============================================================
+//   OCCUPANCY GRID 3D MESH (Textured Plane)
+// ============================================================
+
+/**
+ * OccupancyGridMesh — Render Occupancy Grid dưới dạng textured plane trong Three.js
+ * Cập nhật texture realtime khi grid thay đổi
+ */
+function OccupancyGridMesh({ grid, cx, cz }) {
+  const meshRef = useRef();
+  const textureRef = useRef(null);
+  const geoRef = useRef(null);
+
+  // Tạo offscreen canvas đồng bộ để canvasTexture nhận được ngay từ lần render đầu tiên
+  const canvas = useMemo(() => {
+    const c = document.createElement('canvas');
+    c.width = grid?.width || 80;
+    c.height = grid?.height || 80;
+    return c;
+  }, []);
+
+  // Cập nhật texture mỗi khi grid thay đổi
+  useFrame(() => {
+    if (!grid || !canvas) return;
+    if (!grid.isDirty()) return;
+
+    const ctx = canvas.getContext('2d');
+
+    // Resize canvas nếu grid size thay đổi (auto-expand)
+    if (canvas.width !== grid.width || canvas.height !== grid.height) {
+      canvas.width = grid.width;
+      canvas.height = grid.height;
+    }
+
+    // Render grid sang ImageData
+    const imgData = grid.renderToImageData();
+    ctx.putImageData(imgData, 0, 0);
+
+    // Cập nhật Three.js texture
+    if (textureRef.current) {
+      textureRef.current.needsUpdate = true;
+    }
+
+    // Update geometry size nếu grid đã expand
+    if (meshRef.current) {
+      const posX = grid.originX + grid.worldWidth / 2 - cx;
+      const posZ = -(grid.originY + grid.worldHeight / 2 - cz);
+      meshRef.current.position.set(posX, 0.05, posZ);
+    }
+
+    grid.clearDirty();
+  });
+
+  if (!grid) return null;
+
+  // Dynamic position: grid center in Three.js coords
+  const posX = grid.originX + grid.worldWidth / 2 - cx;
+  const posZ = -(grid.originY + grid.worldHeight / 2 - cz);
+
+  return (
+    <mesh
+      ref={meshRef}
+      position={[posX, 0.05, posZ]}
+      rotation={[-Math.PI / 2, 0, 0]}
+    >
+      <planeGeometry ref={geoRef} args={[grid.worldWidth, grid.worldHeight]} />
+      <meshBasicMaterial transparent depthWrite={false}>
+        <canvasTexture
+          ref={textureRef}
+          attach="map"
+          image={canvas}
+          minFilter={THREE.NearestFilter}
+          magFilter={THREE.NearestFilter}
+        />
+      </meshBasicMaterial>
+    </mesh>
+  );
+}
+import { OccupancyGridVisualizer, LaserScanOverlay, RobotTrail, ObstacleContours, GridCellsOverlay } from '../LidarGridVisualizer/LidarGridVisualizer.jsx';
 
 // ============================================================
 //   COLORS (3D Theme)
@@ -26,7 +108,7 @@ const C_ROBOT = '#10b981';
 
 // ── Components ──────────────────────────────────────────────
 
-function RobotModel({ position, rotation, battery, label, lidar, hasObs }) {
+function RobotModel({ position, rotation, battery, label, hasObs }) {
   const isHealthy = battery > 20;
   const color = isHealthy ? C_ROBOT : '#ef4444';
 
@@ -53,31 +135,10 @@ function RobotModel({ position, rotation, battery, label, lidar, hasObs }) {
         <meshStandardMaterial color="#1e293b" />
       </mesh>
       {/* Front Arrow */}
-      {/* Robot depth is 0.8, so front is at z = 0.4 */}
       <mesh position={[0, 0.15, 0.4]} rotation={[Math.PI / 2, 0, 0]}>
         <coneGeometry args={[0.15, 0.2, 16]} />
         <meshStandardMaterial color="#22c55e" />
       </mesh>
-
-      {/* Lidar Point Cloud (Red dots) */}
-      {lidar && lidar.length > 0 && (
-        <group position={[0, 0.4, 0]}>
-          {lidar.map((pt, i) => {
-            // Front is +Z. Lidar angle 0 = front => +Z.
-            // Lidar spins clockwise.
-            const rad = -(pt.a * Math.PI) / 180.0;
-            const dist_m = pt.d / 1000.0;
-            const lx = Math.sin(rad) * dist_m;
-            const lz = Math.cos(rad) * dist_m;
-            return (
-              <mesh key={i} position={[lx, 0, lz]}>
-                <boxGeometry args={[0.04, 0.04, 0.04]} />
-                <meshBasicMaterial color="#ef4444" />
-              </mesh>
-            );
-          })}
-        </group>
-      )}
 
       {/* Label */}
       <Text
@@ -86,10 +147,52 @@ function RobotModel({ position, rotation, battery, label, lidar, hasObs }) {
         color="white"
         anchorX="center"
         anchorY="middle"
-        rotation={[...rotation].map(r => -r)} // Look somewhat to camera or just fix it? Better use Billboard for text usually, but simple text is ok.
+        rotation={[...rotation].map(r => -r)}
       >
         {label} ({battery}%) {hasObs ? "⚠️" : ""}
       </Text>
+    </group>
+  );
+}
+
+/**
+ * WorldLidarPoints — Render lidar points in WORLD coordinates
+ * 
+ * simLidar outputs {a: localAngleDeg, d: distanceMM}
+ * where a is angle relative to robot front (0° = forward).
+ * 
+ * Strategy: compute hit position in 2D world first, then convert to 3D.
+ *   worldAngle = robotTheta + localAngle (in 2D math convention: 0=+X, CCW)
+ *   hitX_2D = robotX_2D + cos(worldAngle) * dist
+ *   hitY_2D = robotY_2D + sin(worldAngle) * dist
+ *   
+ *   3D_X = hitX_2D - warehouseCX
+ *   3D_Z = -(hitY_2D - warehouseCZ)
+ */
+function WorldLidarPoints({ robotX2D, robotY2D, robotTheta, lidar, warehouseCX, warehouseCZ }) {
+  if (!lidar || lidar.length === 0) return null;
+
+  return (
+    <group position={[0, 0.4, 0]}>
+      {lidar.map((pt, i) => {
+        // Local angle in radians
+        const localRad = (pt.a * Math.PI) / 180.0;
+        // World angle in 2D (same convention as simLidar: theta + local)
+        const worldAngle = robotTheta + localRad;
+        const dist_m = pt.d / 1000.0;
+        // Hit position in 2D world coordinates
+        const hitX = robotX2D + Math.cos(worldAngle) * dist_m;
+        const hitY = robotY2D + Math.sin(worldAngle) * dist_m;
+        // Convert 2D → 3D
+        const wx = hitX - warehouseCX;
+        const wz = -(hitY - warehouseCZ);
+        return (
+          <mesh key={i} position={[wx, 0, wz]}>
+            <boxGeometry args={[0.04, 0.04, 0.04]} />
+            <meshBasicMaterial color="#ef4444" />
+          </mesh>
+        );
+      })}
     </group>
   );
 }
@@ -173,18 +276,17 @@ function RealisticShelf({ shelf, cx, cz }) {
   );
 }
 
-function WarehouseScene({ robots, activePath }) {
+function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRobotId, mappingActive, layers }) {
   // Center the warehouse in the world
   const cx = WAREHOUSE_WIDTH / 2;
   const cz = WAREHOUSE_HEIGHT / 2; // y in 2D is z in 3D
 
   // Mapping from 2D coordinate system to 3D.
-  // 2D (x,y) -> 3D (X - cx, 0, Z - cz)
-  // We flip Z logically if needed, but standard top-down 2D mapping keeps x=x, z=-y typically.
-  // Assuming Bottom-Left is (0,0) in 2D. In 3D Top-Down, +X is right, -Z is up.
-  // Let's do: X = x - cx,  Z = -(y - cz)
   const map2To3X = (x) => x - cx;
   const map2To3Z = (y) => -(y - cz);
+
+  // Get the active occupancy grid for selected robot
+  const activeGrid = selectedRobotId ? occupancyGrid[selectedRobotId] : null;
 
   return (
     <group>
@@ -202,13 +304,53 @@ function WarehouseScene({ robots, activePath }) {
         <meshStandardMaterial color={C_FLOOR} />
       </mesh>
 
-      {/* Shelves */}
-      {SHELVES.map((shelf, idx) => (
+      {/* LIDAR Occupancy Grid Visualization (Chỉ ở chế độ LIDAR) */}
+      {mapType === 'lidar' && Object.entries(robots).map(([robotId, robot]) => {
+        const grid = occupancyGrid?.[robotId];
+        const isThisMapping = !!mappingActive?.[robotId];
+        const telem = robot.telemetry || {};
+        return (
+          <group key={`lidar-${robotId}`}>
+            {/* Occupancy Grid Floor */}
+            {grid && layers.grid && (
+              <OccupancyGridVisualizer grid={grid} opacity={0.7} warehouseCX={cx} warehouseCZ={cz} />
+            )}
+            {/* Obstacle Contours */}
+            {grid && layers.contours && (
+              <ObstacleContours grid={grid} warehouseCX={cx} warehouseCZ={cz} />
+            )}
+            {/* Real-time Laser Scan */}
+            {layers.laser && telem.lidar && telem.lidar.length > 0 && (
+              <LaserScanOverlay
+                robotX={telem.x ?? 0}
+                robotY={telem.y ?? 0}
+                robotHeading={telem.heading ?? 0}
+                lidarPoints={telem.lidar}
+                warehouseCX={cx}
+                warehouseCZ={cz}
+              />
+            )}
+            {/* Robot Trail */}
+            {layers.trail && (
+              <RobotTrail
+                robotX={telem.x ?? 0}
+                robotY={telem.y ?? 0}
+                warehouseCX={cx}
+                warehouseCZ={cz}
+                isMapping={isThisMapping}
+              />
+            )}
+          </group>
+        );
+      })}
+
+      {/* Shelves - Chỉ hiện ở chế độ 3D có sẵn */}
+      {mapType === '3d' && SHELVES.map((shelf, idx) => (
         <RealisticShelf key={idx} shelf={shelf} cx={cx} cz={cz} />
       ))}
 
-      {/* Gates */}
-      {Object.values(GATES).map((gate, idx) => {
+      {/* Gates - Chỉ hiện ở chế độ 3D có sẵn */}
+      {mapType === '3d' && Object.values(GATES).map((gate, idx) => {
         const x = map2To3X(gate.x);
         const z = map2To3Z(gate.y);
         
@@ -249,8 +391,8 @@ function WarehouseScene({ robots, activePath }) {
         );
       })}
 
-      {/* Charging Stations */}
-      {CHARGING_STATIONS.map((charger, idx) => {
+      {/* Charging Stations - Chỉ hiện ở chế độ 3D có sẵn */}
+      {mapType === '3d' && CHARGING_STATIONS.map((charger, idx) => {
         const x = map2To3X(charger.x);
         const z = map2To3Z(charger.y);
         
@@ -296,6 +438,11 @@ function WarehouseScene({ robots, activePath }) {
         );
       })}
 
+      {/* Occupancy Grid (Lidar Map) */}
+      {mapType === 'lidar' && activeGrid && (
+        <OccupancyGridMesh grid={activeGrid} cx={cx} cz={cz} />
+      )}
+
       {/* Active Path Line */}
       {activePath && activePath.length > 1 && (
         <group>
@@ -317,21 +464,32 @@ function WarehouseScene({ robots, activePath }) {
         if (robot.status !== 'connected') return null;
         const x = map2To3X(robot.telemetry.x);
         const z = map2To3Z(robot.telemetry.y);
-        // Heading rad needs to be mapped to 3D Y-axis rotation
-        // 2D: 0 rad is +x (right), pi/2 is +y (up)
-        // 3D: 0 rot is +z (down screen usually), so need offset
-        const rotY = robot.telemetry.headingRad; // Adjust based on your firmware orientation
+        // 2D theta to 3D rotY conversion:
+        // 2D: theta=0 → +X (right), theta=PI/2 → +Y (up)  
+        // 3D: rotY=0 → +Z, rotY=PI/2 → +X
+        // Mapping: rotY = -(theta - PI/2) = PI/2 - theta
+        const theta2D = robot.telemetry.headingRad ?? 0;
+        const rotY = Math.PI / 2 - theta2D;
         
         return (
-          <RobotModel
-            key={robot.id}
-            position={[x, 0, z]}
-            rotation={[0, rotY, 0]}
-            battery={robot.telemetry.battery}
-            label={robot.name}
-            lidar={robot.telemetry.lidar || []}
-            hasObs={robot.telemetry.obs || false}
-          />
+          <React.Fragment key={robot.id}>
+            <RobotModel
+              position={[x, 0, z]}
+              rotation={[0, rotY, 0]}
+              battery={robot.telemetry.battery}
+              label={robot.name}
+              hasObs={robot.telemetry.obs || false}
+            />
+            {/* Lidar points in world coordinates — pass 2D coords + theta */}
+            <WorldLidarPoints
+              robotX2D={robot.telemetry.x}
+              robotY2D={robot.telemetry.y}
+              robotTheta={theta2D}
+              lidar={robot.telemetry.lidar || []}
+              warehouseCX={cx}
+              warehouseCZ={cz}
+            />
+          </React.Fragment>
         );
       })}
     </group>
@@ -381,40 +539,275 @@ function CameraDirector({ viewMode }) {
 
 export default function WarehouseMap({ activePath }) {
   const robots = useRobotStore((s) => s.robots);
+  const occupancyGrid = useRobotStore((s) => s.occupancyGrid);
+  const mappingActive = useRobotStore((s) => s.mappingActive);
+  const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
+  const startMapping = useRobotStore((s) => s.startMapping);
+  const stopMapping = useRobotStore((s) => s.stopMapping);
+  const saveMap = useRobotStore((s) => s.saveMap);
+  const loadMap = useRobotStore((s) => s.loadMap);
   const [viewMode, setViewMode] = useState('iso'); // 'free', 'top', 'iso'
+  const [mapType, setMapType] = useState('3d'); // '3d', 'lidar'
+  const [showMapManager, setShowMapManager] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [layers, setLayers] = useState({ grid: true, laser: true, trail: true, contours: true });
+  const fileInputRef = useRef(null);
+  const toggleLayer = (key) => setLayers(prev => ({ ...prev, [key]: !prev[key] }));
+
+  // Lấy robot đầu tiên nếu chưa chọn
+  const activeRobotId = selectedRobotId || Object.keys(robots)[0] || null;
+  const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
+  const activeGrid = activeRobotId ? occupancyGrid[activeRobotId] : null;
+
+  // Handler cho nút Bắt đầu/Dừng quét
+  const handleToggleMapping = useCallback(() => {
+    if (!activeRobotId) return;
+    if (isMapping) {
+      stopMapping(activeRobotId);
+    } else {
+      startMapping(activeRobotId);
+    }
+  }, [activeRobotId, isMapping, startMapping, stopMapping]);
+
+  // Handler cho nút Lưu Map
+  const handleSaveMap = useCallback(() => {
+    if (!activeRobotId) return;
+    saveMap(activeRobotId);
+  }, [activeRobotId, saveMap]);
+
+  // Handler cho Load Map
+  const handleLoadMap = useCallback((e) => {
+    const file = e.target.files[0];
+    if (!file || !activeRobotId) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const json = JSON.parse(evt.target.result);
+        loadMap(activeRobotId, json);
+      } catch (err) {
+        console.error('Lỗi đọc file map:', err);
+      }
+    };
+    reader.readAsText(file);
+    // Reset input
+    e.target.value = '';
+  }, [activeRobotId, loadMap]);
 
   return (
     <div className="warehouse-map" style={{ width: '100%', height: '100%', background: C_FLOOR, position: 'relative' }}>
       
-      {/* ── CAMERA CONTROLS UI ── */}
-      <div style={{ position: 'absolute', top: 16, left: 16, zIndex: 10, display: 'flex', gap: '8px', background: 'rgba(15, 25, 35, 0.8)', padding: '6px', borderRadius: '8px', backdropFilter: 'blur(10px)' }}>
-        <button 
-          className={`btn btn--sm ${viewMode === 'top' ? 'btn--primary' : 'btn--ghost'}`}
-          onClick={() => setViewMode('top')}
-        >
-          🛰️ 2D Kế hoạch
-        </button>
-        <button 
-          className={`btn btn--sm ${viewMode === 'iso' ? 'btn--primary' : 'btn--ghost'}`}
-          onClick={() => setViewMode('iso')}
-        >
-          🧩 3D Tổng quan
-        </button>
-        <button 
-          className={`btn btn--sm ${viewMode === 'free' ? 'btn--primary' : 'btn--ghost'}`}
-          onClick={() => setViewMode('free')}
-        >
-          👀 3D Tự do
-        </button>
+      {/* ── CAMERA & MAP CONTROLS UI ── */}
+      <div style={{ position: 'absolute', top: 16, left: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(15, 25, 35, 0.8)', padding: '10px', borderRadius: '8px', backdropFilter: 'blur(10px)' }}>
+        
+        {/* Nút Ẩn/Hiện Bảng Điều Khiển */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: showControls ? '0px' : '-8px' }}>
+          <button 
+            className="btn btn--sm btn--ghost" 
+            style={{ padding: '2px 8px', fontSize: '10px', color: '#94a3b8', background: 'rgba(255,255,255,0.05)' }}
+            onClick={() => setShowControls(!showControls)}
+          >
+            {showControls ? '▲ Ẩn bớt' : '▼ Bảng Điều Khiển'}
+          </button>
+        </div>
+
+        {showControls && (
+          <>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button 
+                className={`btn btn--sm ${viewMode === 'top' ? 'btn--primary' : 'btn--ghost'}`}
+                onClick={() => setViewMode('top')}
+              >
+                🛰️ 2D Kế hoạch
+              </button>
+              <button 
+                className={`btn btn--sm ${viewMode === 'iso' ? 'btn--primary' : 'btn--ghost'}`}
+                onClick={() => setViewMode('iso')}
+              >
+                🧩 3D Tổng quan
+              </button>
+              <button 
+                className={`btn btn--sm ${viewMode === 'free' ? 'btn--primary' : 'btn--ghost'}`}
+                onClick={() => setViewMode('free')}
+              >
+                👀 3D Tự do
+              </button>
+            </div>
+            
+            <div style={{ display: 'flex', gap: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px' }}>
+               <button 
+                className={`btn btn--sm ${mapType === '3d' ? 'btn--success' : 'btn--ghost'}`}
+                onClick={() => setMapType('3d')}
+                style={{ flex: 1 }}
+              >
+                🏢 Map Mô Phỏng (Có sẵn)
+              </button>
+              <button 
+                className={`btn btn--sm ${mapType === 'lidar' ? 'btn--success' : 'btn--ghost'}`}
+                onClick={() => setMapType('lidar')}
+                style={{ flex: 1 }}
+              >
+                🔴 Map Lidar (Point Cloud)
+              </button>
+            </div>
+
+            {/* MAPPING CONTROLS (Chỉ hiện khi ở chế độ Lidar) */}
+            {mapType === 'lidar' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px', marginTop: '4px' }}>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button 
+                    className={`btn btn--sm ${isMapping ? 'btn--danger' : 'btn--primary'}`}
+                    style={{ flex: 1, fontSize: '11px' }}
+                    onClick={handleToggleMapping}
+                    disabled={!activeRobotId}
+                  >
+                    {isMapping ? '⏹ Dừng quét + Lưu map' : '🚀 Bắt đầu quét (Tự lái)'}
+                  </button>
+                </div>
+
+                {/* Exploration Phase Status */}
+                {isMapping && (
+                  <div style={{ 
+                    fontSize: '10px', padding: '4px 8px', borderRadius: '4px',
+                    background: 'rgba(34,197,94,0.15)', color: '#4ade80', 
+                    textAlign: 'center', fontWeight: 600,
+                  }}>
+                    {(() => {
+                      const phase = getExplorationPhase();
+                      const info = getExplorationInfo();
+                      if (phase === 'init_spin') return '🔄 Đang xoay 360° quét xung quanh...';
+                      if (phase === 'find_frontier') return '🔍 Đang tìm frontier...';
+                      if (phase === 'navigate') return `🚗 Đang lái đến frontier (${info.clusterCount} vùng)...`;
+                      if (phase === 'arrived_scan') return '📡 Đến nơi, quét thêm...';
+                      if (phase === 'recovery_spin') return '🔄 Recovery: Xoay tìm vùng mới...';
+                      if (phase === 'recovery_backup') return '↩️ Recovery: Lùi lại...';
+                      if (phase === 'complete') return '✅ Map đã quét xong!';
+                      return '⏳ Đang khởi động...';
+                    })()}
+                  </div>
+                )}
+                
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button 
+                    className="btn btn--sm btn--ghost"
+                    style={{ flex: 1, fontSize: '11px', background: 'rgba(59,130,246,0.15)', color: '#93c5fd', border: '1px solid rgba(59,130,246,0.3)' }}
+                    onClick={() => setShowMapManager(true)}
+                  >
+                    🗺️ Quản lý Bản đồ
+                  </button>
+                </div>
+
+                {/* Layer Toggle — RViz-style */}
+                <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '6px', marginTop: '2px' }}>
+                  <div style={{ fontSize: '9px', color: '#64748b', marginBottom: '4px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Layers
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px' }}>
+                    {[
+                      { key: 'grid', icon: '🟩', label: 'Grid' },
+                      { key: 'laser', icon: '📡', label: 'Laser' },
+                      { key: 'trail', icon: '🛤️', label: 'Trail' },
+                      { key: 'contours', icon: '🔶', label: 'Tường' },
+                    ].map(l => (
+                      <button
+                        key={l.key}
+                        onClick={() => toggleLayer(l.key)}
+                        style={{
+                          background: layers[l.key] ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.03)',
+                          border: layers[l.key] ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
+                          borderRadius: '5px',
+                          padding: '3px 6px',
+                          fontSize: '10px',
+                          color: layers[l.key] ? '#93c5fd' : '#475569',
+                          cursor: 'pointer',
+                          transition: 'all 0.15s',
+                        }}
+                      >
+                        {l.icon} {l.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Mapping Stats HUD */}
+                {activeGrid && (() => {
+                  const totalCells = activeGrid.width * activeGrid.height;
+                  let knownCells = 0;
+                  let occupiedCells = 0;
+                  for (let i = 0; i < activeGrid.logOdds.length; i++) {
+                    const lo = activeGrid.logOdds[i];
+                    if (lo > 0.5) { knownCells++; occupiedCells++; }
+                    else if (lo < -0.5) { knownCells++; }
+                  }
+                  const coverage = ((knownCells / totalCells) * 100).toFixed(1);
+                  const robot = activeRobotId && robots[activeRobotId];
+                  const rx = robot?.telemetry?.x ?? 0;
+                  const ry = robot?.telemetry?.y ?? 0;
+                  const rh = robot?.telemetry?.heading ?? 0;
+
+                  return (
+                    <div style={{
+                      background: 'rgba(0,0,0,0.3)',
+                      borderRadius: '6px',
+                      padding: '6px 8px',
+                      fontSize: '10px',
+                      color: '#94a3b8',
+                      lineHeight: 1.5,
+                      fontFamily: 'monospace',
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Scans</span>
+                        <strong style={{ color: '#10b981' }}>{activeGrid.scanCount}</strong>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Coverage</span>
+                        <strong style={{ color: '#3b82f6' }}>{coverage}%</strong>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Walls</span>
+                        <strong style={{ color: '#ef4444' }}>{occupiedCells} cells</strong>
+                      </div>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Grid</span>
+                        <span>{activeGrid.width}×{activeGrid.height} ({activeGrid.resolution}m)</span>
+                      </div>
+                      <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', marginTop: '3px', paddingTop: '3px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>Pos</span>
+                          <span style={{ color: '#e2e8f0' }}>({rx.toFixed(2)}, {ry.toFixed(2)})</span>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>Heading</span>
+                          <span style={{ color: '#e2e8f0' }}>{rh.toFixed(1)}°</span>
+                        </div>
+                      </div>
+                      {isMapping && (
+                        <div style={{ 
+                          color: '#ef4444', fontWeight: 'bold', textAlign: 'center', 
+                          marginTop: '4px', animation: 'pulse 1.5s ease-in-out infinite',
+                        }}>
+                          🔴 ĐANG QUÉT...
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+          </>
+        )}
       </div>
 
-      <Canvas shadows camera={{ position: [10, 10, 10], fov: 50 }}>
+      {showMapManager && (
+        <MapManager onClose={() => setShowMapManager(false)} />
+      )}
+
+      <Canvas shadows={{ type: THREE.PCFShadowMap }} camera={{ position: [10, 10, 10], fov: 50 }}>
         <color attach="background" args={[C_FLOOR]} />
         <ambientLight intensity={0.4} />
         <directionalLight position={[10, 15, 10]} intensity={1} castShadow />
         <pointLight position={[0, 5, 0]} intensity={0.5} />
         
-        <WarehouseScene robots={robots} activePath={activePath} />
+        <WarehouseScene robots={robots} activePath={activePath} mapType={mapType} occupancyGrid={occupancyGrid} selectedRobotId={activeRobotId} mappingActive={mappingActive} layers={layers} />
         
         <CameraDirector viewMode={viewMode} />
       </Canvas>
