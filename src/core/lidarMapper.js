@@ -17,11 +17,11 @@
 
 const L_PRIOR = 0;
 const L_OCC = 0.85;
-const L_FREE = -0.40;
+const L_FREE = -0.85; // Tăng sức mạnh xóa bóng ma (từ -0.4 lên -0.85)
 const L_MIN = -5.0;
-const L_MAX = 5.0;
+const L_MAX = 3.0; // Giảm giới hạn nhớ vật cản tĩnh để vật cản động biến mất nhanh hơn (từ 5.0 xuống 3.0)
 const MAX_LIDAR_RANGE_M = 3.0;
-const MIN_LIDAR_RANGE_M = 0.12;  // Lọc noise thân robot (articubot: 0.3m)
+const MIN_LIDAR_RANGE_M = 0.12;  // Lọc noise thân robot
 
 /** Số cells cách biên khi bắt đầu auto-expand */
 const EXPAND_MARGIN = 8;

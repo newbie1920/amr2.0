@@ -118,27 +118,28 @@ function RobotModel({ position, rotation, battery, label, hasObs }) {
     <group position={position} rotation={rotation}>
       {/* Body */}
       <mesh castShadow position={[0, 0.15, 0]}>
-        <boxGeometry args={[0.6, 0.3, 0.8]} />
+        {/* Khung xe 30x30cm, cao 20cm */}
+        <boxGeometry args={[0.3, 0.2, 0.3]} />
         <meshStandardMaterial color={color} metalness={0.6} roughness={0.2} />
         <Edges scale={1.05} threshold={15} color="#000" />
       </mesh>
       {/* Lidar/Sensor on top (front of robot) */}
-      <mesh position={[0, 0.35, -0.1]}>
-        <cylinderGeometry args={[0.1, 0.1, 0.1, 16]} />
+      <mesh position={[0, 0.28, -0.05]}>
+        <cylinderGeometry args={[0.06, 0.06, 0.06, 16]} />
         <meshStandardMaterial color="#ef4444" emissive={hasObs ? "#ef4444" : "#000"} emissiveIntensity={hasObs ? 1 : 0} />
       </mesh>
       {/* Wheels (along X axis — differential drive) */}
-      <mesh position={[-0.35, 0.1, 0]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.1, 0.1, 0.4, 16]} />
+      <mesh position={[-0.17, 0.08, 0]} rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.08, 0.08, 0.04, 16]} />
         <meshStandardMaterial color="#1e293b" />
       </mesh>
-      <mesh position={[0.35, 0.1, 0]} rotation={[0, 0, Math.PI / 2]}>
-        <cylinderGeometry args={[0.1, 0.1, 0.4, 16]} />
+      <mesh position={[0.17, 0.08, 0]} rotation={[0, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.08, 0.08, 0.04, 16]} />
         <meshStandardMaterial color="#1e293b" />
       </mesh>
       {/* Front Arrow (points to -Z in local space = forward direction) */}
-      <mesh position={[0, 0.15, -0.4]} rotation={[-Math.PI / 2, 0, 0]}>
-        <coneGeometry args={[0.15, 0.2, 16]} />
+      <mesh position={[0, 0.15, -0.16]} rotation={[-Math.PI / 2, 0, 0]}>
+        <coneGeometry args={[0.06, 0.08, 16]} />
         <meshStandardMaterial color="#22c55e" />
       </mesh>
 

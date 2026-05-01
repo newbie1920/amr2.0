@@ -17,8 +17,12 @@ export const GRID_COLS = Math.floor(WAREHOUSE_WIDTH / GRID_CELL_SIZE);   // 40
 export const GRID_ROWS = Math.floor(WAREHOUSE_HEIGHT / GRID_CELL_SIZE);  // 40
 
 /** Khoảng cách an toàn robot đối với obstacle (mét) */
-export const ROBOT_RADIUS = 0.15;
+export const ROBOT_RADIUS = 0.22; // Bán kính ngoại tiếp của hình vuông 30x30cm (~21.2cm) + margin nhẹ
 export const SAFETY_MARGIN = 0.1;
+
+/** Kích thước khung xe hình chữ nhật (mét) — dùng cho footprint collision check */
+export const ROBOT_HALF_WIDTH = 0.15;   // Nửa chiều rộng = 30cm / 2
+export const ROBOT_HALF_LENGTH = 0.15;  // Nửa chiều dài  = 30cm / 2
 
 // ============================================================
 //   VỊ TRÍ CÁC ĐỐI TƯỢNG TRONG KHO

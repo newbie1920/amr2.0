@@ -189,8 +189,8 @@ export class SimEngine {
     const newX = this.pose.x + this.vel.v * Math.cos(this.pose.theta) * dt;
     const newY = this.pose.y + this.vel.v * Math.sin(this.pose.theta) * dt;
 
-    // 3. Collision check
-    const isCollided = this.world.checkCollision(newX, newY, ROBOT_RADIUS);
+    // 3. Collision check (BUG #2 FIX: rectangular footprint with heading)
+    const isCollided = this.world.checkCollision(newX, newY, ROBOT_RADIUS, newTheta);
     if (!isCollided) {
       if (this.vel.v !== 0 && Math.random() < 0.1) {
         console.log(`[SimEngine] MOVING: v=${this.vel.v.toFixed(3)}, newX=${newX.toFixed(3)}, newY=${newY.toFixed(3)}`);

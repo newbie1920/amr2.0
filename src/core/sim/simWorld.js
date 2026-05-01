@@ -10,6 +10,7 @@
 
 import {
   WAREHOUSE_WIDTH, WAREHOUSE_HEIGHT,
+  ROBOT_HALF_WIDTH, ROBOT_HALF_LENGTH,
   SHELVES, GATES, CHARGING_STATIONS,
   ROBOT_RADIUS,
 } from '../warehouse.js';
@@ -208,22 +209,50 @@ export class SimWorld {
   // ──────────────────────────────────────────────────────────
 
   /**
-   * Kiểm tra robot (hình tròn) có va chạm với bất kỳ segment nào không
-   * @param {number} x - Tâm robot
-   * @param {number} y - Tâm robot
-   * @param {number} radius - Bán kính robot
-   * @returns {boolean}
+   * BUG #2 FIX: Rectangular footprint collision check.
+   * Tests 4 corners + 4 edge midpoints of the robot body at given heading.
+   * Falls back to circle check if theta is not provided.
+   * 
+   * @param {number} x - Robot center X
+   * @param {number} y - Robot center Y
+   * @param {number} radius - Robot radius (for fallback circle check)
+   * @param {number} [theta=0] - Robot heading (radians)
+   * @returns {boolean} true if collision detected
    */
-  checkCollision(x, y, radius = ROBOT_RADIUS) {
-    for (const seg of this.segments) {
-      const dist = this._pointToSegmentDist(x, y, seg.x1, seg.y1, seg.x2, seg.y2);
-      if (dist < radius) return true;
+  checkCollision(x, y, radius = ROBOT_RADIUS, theta = 0) {
+    const hw = ROBOT_HALF_WIDTH;
+    const hl = ROBOT_HALF_LENGTH;
+    const cosT = Math.cos(theta);
+    const sinT = Math.sin(theta);
+
+    // 8 key points: 4 corners + 4 edge midpoints
+    const checkPoints = [
+      { lx: -hw, ly:  hl },  // front-left
+      { lx:  hw, ly:  hl },  // front-right
+      { lx:  hw, ly: -hl },  // rear-right
+      { lx: -hw, ly: -hl },  // rear-left
+      { lx:  0,  ly:  hl },  // front-center
+      { lx:  0,  ly: -hl },  // rear-center
+      { lx: -hw, ly:  0  },  // left-center
+      { lx:  hw, ly:  0  },  // right-center
+    ];
+
+    for (const pt of checkPoints) {
+      const wx = x + pt.lx * cosT - pt.ly * sinT;
+      const wy = y + pt.lx * sinT + pt.ly * cosT;
+
+      // Check against all wall/obstacle segments
+      for (const seg of this.segments) {
+        const dist = this._pointToSegmentDist(wx, wy, seg.x1, seg.y1, seg.x2, seg.y2);
+        if (dist < 0.02) return true; // 2cm tolerance (point is ON the footprint edge)
+      }
+
+      // Check warehouse boundaries
+      if (wx < 0 || wx > WAREHOUSE_WIDTH || wy < 0 || wy > WAREHOUSE_HEIGHT) {
+        return true;
+      }
     }
-    // Kiểm tra biên kho
-    if (x - radius < 0 || x + radius > WAREHOUSE_WIDTH ||
-        y - radius < 0 || y + radius > WAREHOUSE_HEIGHT) {
-      return true;
-    }
+
     return false;
   }
 
