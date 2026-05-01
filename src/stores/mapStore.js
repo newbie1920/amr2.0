@@ -9,7 +9,7 @@
 import { create } from 'zustand';
 import { OccupancyGrid } from '../core/lidarMapper.js';
 import { ScanMatcher } from '../core/scanMatcher.js';
-import { startExploration, stopExploration, getExplorationInfo } from '../core/exploration.js';
+import { startExploration, stopExploration, getExplorationInfo, _setMapStoreGetter } from '../core/exploration.js';
 import { navWorkerApi } from '../core/navWorkerSetup.js';
 
 const MAP_STORAGE_KEY = 'amr_saved_maps';
@@ -371,5 +371,8 @@ const useMapStore = create((set, get) => ({
     }
   },
 }));
+
+// Register mapStore getter with exploration module
+_setMapStoreGetter(() => useMapStore.getState());
 
 export default useMapStore;

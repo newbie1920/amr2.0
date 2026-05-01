@@ -18,6 +18,13 @@
 import { VEL_SOURCE } from './velocityMux.js';
 import { navWorkerApi } from './navWorkerSetup.js';
 
+// MapStore reference — set by mapStore.js to avoid circular import
+let _mapStoreGetter = null;
+export function _setMapStoreGetter(fn) { _mapStoreGetter = fn; }
+function _getMapStore() {
+  return _mapStoreGetter ? _mapStoreGetter() : {};
+}
+
 let workerBusy = false;
 
 /**
@@ -46,7 +53,7 @@ function _sendVel(robotId, getStore, linear, angular) {
 //   CONFIG
 // ============================================================
 
-const TICK_INTERVAL_MS = 2000;
+const TICK_INTERVAL_MS = 500; // Phải < CMD_TIMEOUT_MS (1000ms) của ESP32 để keep-alive
 const MIN_FRONTIER_SIZE = 3;
 const SPIN_SPEED = 0.8;
 const INIT_SPIN_MS = 5000;
@@ -145,13 +152,17 @@ function _setPhase(p) {
 }
 
 function _tick(robotId, getStore) {
-  if (!active || workerBusy) return;
+  if (!active) return;
+  // workerBusy chỉ block các phase cần worker (FIND_FRONTIER, NAVIGATE)
 
-  const state = getStore();
-  const robot = state.robots[robotId];
-  const grid = state.mapperInstances?.[robotId];
+  const robotState = getStore();
+  const robot = robotState.robots[robotId];
+  // Grid nằm ở mapStore, KHÔNG phải robotStore!
+  const mapState = _getMapStore();
+  const grid = mapState.mapperInstances?.[robotId];
 
-  if (!robot?.connection?.connected || !grid) return;
+  if (!robot?.connection?.connected) return;
+  // Grid có thể chưa có dữ liệu ở INIT_SPIN, cho phép chạy spin mà không cần grid
 
   const telem = robot.telemetry || {};
   const rx = telem.x ?? 0;
@@ -161,6 +172,8 @@ function _tick(robotId, getStore) {
   switch (phase) {
     // ── INIT SPIN: Xoay 360° tại chỗ lần đầu ──
     case Phase.INIT_SPIN:
+      // Re-send velocity mỗi tick để chống ESP32 CMD_TIMEOUT (1s)
+      _sendVel(robotId, getStore, 0, SPIN_SPEED);
       if (elapsed >= INIT_SPIN_MS) {
         _sendVel(robotId, getStore, 0, 0);
         console.log('[Explore] Init spin xong, tìm frontier...');
@@ -170,6 +183,7 @@ function _tick(robotId, getStore) {
 
     // ── FIND FRONTIER ──
     case Phase.FIND_FRONTIER: {
+      if (workerBusy || !grid) break; // Cần grid và worker rảnh
       // Inflate obstacles trước khi tìm đường (dynamic radius based on resolution)
       const inflCells = Math.ceil(0.55 / grid.resolution); // articubot: 0.55m
       grid.inflateObstacles(inflCells);
@@ -232,6 +246,7 @@ function _tick(robotId, getStore) {
 
     // ── NAVIGATE: Đang di chuyển đến frontier (bằng DWA) ──
     case Phase.NAVIGATE: {
+      if (!grid) break;
       // Kiểm tra stuck
       const moved = Math.hypot(rx - lastRobotPos.x, ry - lastRobotPos.y);
       if (moved > 0.05) {
@@ -245,6 +260,7 @@ function _tick(robotId, getStore) {
       }
 
       // ── DWA LOCAL PLANNER ──
+      if (workerBusy) break; // Chờ worker rảnh
       if (currentTarget && currentTarget.path && grid) {
         const pose = { x: rx, y: ry, theta: telem.heading * Math.PI / 180.0 };
         const vel = { v: telem.linearVel || 0, w: telem.angularVel || 0 };
@@ -281,6 +297,8 @@ function _tick(robotId, getStore) {
 
     // ── ARRIVED SCAN: Quét thêm tại vị trí mới ──
     case Phase.ARRIVED_SCAN:
+      // Re-send spin velocity mỗi tick để chống timeout
+      _sendVel(robotId, getStore, 0, SPIN_SPEED * 0.7);
       if (elapsed >= SCAN_SPIN_MS) {
         _sendVel(robotId, getStore, 0, 0);
         _setPhase(Phase.FIND_FRONTIER);
@@ -289,6 +307,8 @@ function _tick(robotId, getStore) {
 
     // ── RECOVERY: Xoay tìm vùng mới ──
     case Phase.RECOVERY_SPIN:
+      // Re-send spin velocity mỗi tick
+      _sendVel(robotId, getStore, 0, SPIN_SPEED);
       if (elapsed >= INIT_SPIN_MS) {
         _sendVel(robotId, getStore, 0, 0);
         noFrontierCount = 0;
@@ -298,8 +318,9 @@ function _tick(robotId, getStore) {
 
     // ── RECOVERY: Lùi lại ──
     case Phase.RECOVERY_BACKUP:
+      // Re-send backup velocity mỗi tick
       if (elapsed < 1500) {
-        _sendVel(robotId, getStore, -0.08, 0);
+        _sendVel(robotId, getStore, -0.10, 0);
       } else {
         _sendVel(robotId, getStore, 0, 0);
         _setPhase(Phase.FIND_FRONTIER);

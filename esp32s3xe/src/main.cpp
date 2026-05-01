@@ -214,7 +214,7 @@ void lidarTask(void *pvParameters) {
       analogWrite(LIDAR_PWM_PIN, 0); 
       vTaskDelay(pdMS_TO_TICKS(100));
       lidar.begin(lidarSerial);
-      analogWrite(LIDAR_PWM_PIN, 150); 
+      analogWrite(LIDAR_PWM_PIN, 255); // Tăng tốc độ quay Lidar lên tối đa
     }
   }
 }
@@ -240,7 +240,7 @@ void setup() {
   pinMode(LIDAR_PWM_PIN, OUTPUT);
   lidar.begin(lidarSerial);
   lidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
-  analogWrite(LIDAR_PWM_PIN, 150); 
+  analogWrite(LIDAR_PWM_PIN, 255); // Tăng tốc độ quay Lidar lên tối đa
 
   leftPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_LEFT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);
   rightPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_RIGHT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);

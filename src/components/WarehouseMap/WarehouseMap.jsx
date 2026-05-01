@@ -570,10 +570,11 @@ export default function WarehouseMap({ activePath }) {
   // Handler cho nút Bắt đầu/Dừng quét
   const handleToggleMapping = useCallback(() => {
     if (!activeRobotId) return;
+    const getRobotStore = () => useRobotStore.getState();
     if (isMapping) {
-      stopMapping(activeRobotId);
+      stopMapping(activeRobotId, getRobotStore);
     } else {
-      startMapping(activeRobotId);
+      startMapping(activeRobotId, getRobotStore);
     }
   }, [activeRobotId, isMapping, startMapping, stopMapping]);
 
