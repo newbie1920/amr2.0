@@ -190,12 +190,19 @@ export class SimEngine {
     const newY = this.pose.y + this.vel.v * Math.sin(this.pose.theta) * dt;
 
     // 3. Collision check
-    if (!this.world.checkCollision(newX, newY, ROBOT_RADIUS)) {
+    const isCollided = this.world.checkCollision(newX, newY, ROBOT_RADIUS);
+    if (!isCollided) {
+      if (this.vel.v !== 0 && Math.random() < 0.1) {
+        console.log(`[SimEngine] MOVING: v=${this.vel.v.toFixed(3)}, newX=${newX.toFixed(3)}, newY=${newY.toFixed(3)}`);
+      }
       this.pose.x = newX;
       this.pose.y = newY;
       this.pose.theta = normalizeAngle(newTheta);
     } else {
       // Va chạm → dừng lại nhưng vẫn cho xoay
+      if (this.vel.v !== 0 || this.vel.w !== 0) {
+        console.warn(`[SimEngine] Collision at x=${newX.toFixed(3)}, y=${newY.toFixed(3)}! Stopping v.`);
+      }
       this.vel.v = 0;
       this.pose.theta = normalizeAngle(newTheta);
       if (this.onCollision) this.onCollision();

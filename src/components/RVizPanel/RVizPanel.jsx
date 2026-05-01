@@ -15,10 +15,11 @@
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
+import useNavStore from '../../stores/navStore.js';
+import useMapStore from '../../stores/mapStore.js';
 import { useRVizViewport } from './useRVizViewport.js';
 import RVizToolbar from './RVizToolbar.jsx';
 import TopicInspector from './TopicInspector.jsx';
-import { navWorkerApi } from '../../core/navWorkerSetup.js';
 import {
   drawGrid,
   drawOccupancyMap,
@@ -33,6 +34,12 @@ import {
   drawMeasureLine,
   drawGoalMarker,
   drawNavStatus,
+  drawRobotFootprint,
+  drawLocalCostmapWindow,
+  drawDWATrajectory,
+  drawAnimatedPath,
+  drawGoalPoseArrow,
+  drawRobotTrail,
 } from './rvizLayers.js';
 
 // ============================================================
@@ -120,28 +127,44 @@ export default function RVizPanel({ activePath }) {
   const [measurePoints, setMeasurePoints] = useState({ p1: null, p2: null });
   const [goalMarker, setGoalMarker] = useState(null); // {x, y} world coords
   const [navPath, setNavPath] = useState(null); // planned path [{x,y}, ...]
+  const [isNavLoading, setIsNavLoading] = useState(false); // pathfinding in progress
 
-  // Layer visibility
+  // Layer visibility — costmap ON by default for Nav2 experience
   const [layers, setLayers] = useState({
-    grid: true, map: true, costmap: false, walls: true,
+    grid: true, map: true, costmap: true, walls: true,
     laser: true, path: true, robot: true, tf: false, frontier: true,
+    footprint: true, localCostmap: true, dwaPreview: true, trail: true,
   });
 
   const toggleLayer = useCallback((id) => {
     setLayers(prev => ({ ...prev, [id]: !prev[id] }));
   }, []);
 
+  // Auto-clear measure points when switching away from measure tool
+  useEffect(() => {
+    if (activeTool !== 'measure') {
+      setMeasurePoints({ p1: null, p2: null });
+    }
+  }, [activeTool]);
+
   // Store data
+  // Core robot data from robotStore
   const robots = useRobotStore((s) => s.robots);
-  const occupancyGrid = useRobotStore((s) => s.occupancyGrid);
-  const mapperInstances = useRobotStore((s) => s.mapperInstances);
-  const mapToOdom = useRobotStore((s) => s.mapToOdom);
+  const occupancyGrid = useMapStore((s) => s.occupancyGrid);
+  const mapperInstances = useMapStore((s) => s.mapperInstances);
+  const mapToOdom = useMapStore((s) => s.mapToOdom);
   const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
   const simWorldSegments = useRobotStore((s) => s.simWorldSegments);
   const simInfo = useRobotStore((s) => s.simInfo);
-  const appNavigationSessions = useRobotStore((s) => s.appNavigationSessions);
-  const startAppNavigation = useRobotStore((s) => s.startAppNavigation);
-  const stopAppNavigation = useRobotStore((s) => s.stopAppNavigation);
+  // Navigation from navStore
+  const appNavigationSessions = useNavStore((s) => s.appNavigationSessions);
+  const navigateToGoal = useNavStore((s) => s.navigateToGoal);
+  const stopAppNavigation = useNavStore((s) => s.stopAppNavigation);
+  const dwaTrajectories = useNavStore((s) => s.dwaTrajectories);
+
+  // Robot trail tracking
+  const robotTrailRef = useRef([]);
+  const MAX_TRAIL_POINTS = 200;
 
   // Find active robot
   const robotList = Object.values(robots);
@@ -209,9 +232,11 @@ export default function RVizPanel({ activePath }) {
     const sy = e.clientY - rect.top;
     setCursorWorld(viewport.screenToWorld(sx, sy));
 
-    // Delegate to viewport pan handler
-    viewport.handlers.onMouseMove(e);
-  }, [viewport]);
+    // Only delegate panning when in move tool
+    if (activeTool === 'move') {
+      viewport.handlers.onMouseMove(e);
+    }
+  }, [viewport, activeTool]);
 
   const handleCanvasClick = useCallback((e) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -227,58 +252,30 @@ export default function RVizPanel({ activePath }) {
 
       // Set goal marker immediately for visual feedback
       setGoalMarker({ x: world.x, y: world.y });
+      setIsNavLoading(true);
       console.log(`[RVizTDTU] 🎯 Nav Goal: (${world.x.toFixed(2)}, ${world.y.toFixed(2)})`);
 
-      // Get grid (mapper instance or occupancy grid)
-      const grid = mapperInstances[activeRobotId] || (occupancyGrid[activeRobotId] ? occupancyGrid[activeRobotId] : null);
-
-      if (!grid) {
-        console.warn('[RVizTDTU] No map available — sending direct waypoint');
-        // Fallback: send single waypoint directly
-        const path = [{ x: telem.x ?? 0, y: telem.y ?? 0 }, { x: world.x, y: world.y }];
-        setNavPath(path);
-        startAppNavigation(activeRobotId, path);
-        return;
-      }
-
-      // Run A* pathfinder on the grid (via Web Worker if available)
-      const startX = telem.x ?? 0;
-      const startY = telem.y ?? 0;
-
-      if (navWorkerApi) {
-        // Async: use Web Worker for non-blocking pathfinding
-        navWorkerApi.findPath(grid.serialize(), startX, startY, world.x, world.y, false, true)
-          .then((result) => {
-            if (result.success && result.path.length > 1) {
-              console.log(`[RVizTDTU] ✅ Path found: ${result.path.length} waypoints`);
-              setNavPath(result.path);
-              startAppNavigation(activeRobotId, result.path);
-            } else {
-              console.warn('[RVizTDTU] ❌ No path found to goal');
-              setGoalMarker(null);
-              setNavPath(null);
-            }
-          })
-          .catch((err) => {
-            console.error('[RVizTDTU] Path error:', err);
-            setGoalMarker(null);
-            setNavPath(null);
-          });
-      } else {
-        // Sync fallback: import and run directly
-        import('../../core/lidarPathfinder.js').then(({ findPathOnGrid }) => {
-          const result = findPathOnGrid(grid, startX, startY, world.x, world.y);
-          if (result.success && result.path.length > 1) {
-            console.log(`[RVizTDTU] ✅ Path found: ${result.path.length} waypoints`);
+      // Delegate pathfinding + navigation to navStore (Point-to-Go)
+      navigateToGoal(activeRobotId, world.x, world.y)
+        .then((result) => {
+          setIsNavLoading(false);
+          if (result.success) {
             setNavPath(result.path);
-            startAppNavigation(activeRobotId, result.path);
           } else {
-            console.warn('[RVizTDTU] ❌ No path found to goal');
+            console.warn(`[RVizTDTU] ❌ ${result.error}`);
             setGoalMarker(null);
             setNavPath(null);
           }
+        })
+        .catch((err) => {
+          setIsNavLoading(false);
+          console.error('[RVizTDTU] Nav error:', err);
+          setGoalMarker(null);
+          setNavPath(null);
         });
-      }
+
+      // Auto-revert to move tool after placing goal
+      setActiveTool('move');
     } else if (activeTool === 'pose') {
       if (activeRobotId) {
         const robot = robots[activeRobotId];
@@ -293,10 +290,23 @@ export default function RVizPanel({ activePath }) {
       } else if (!measurePoints.p2) {
         setMeasurePoints(prev => ({ ...prev, p2: world }));
       } else {
+        // Third click resets
         setMeasurePoints({ p1: world, p2: null });
       }
     }
-  }, [activeTool, measurePoints, viewport, activeRobotId, telem, mapperInstances, occupancyGrid, robots, startAppNavigation]);
+  }, [activeTool, measurePoints, viewport, activeRobotId, telem, robots, navigateToGoal]);
+
+  // Right-click to clear measurements & goal
+  const handleContextMenu = useCallback((e) => {
+    e.preventDefault();
+    if (measurePoints.p1) {
+      setMeasurePoints({ p1: null, p2: null });
+    }
+    if (goalMarker && !navSession?.active) {
+      setGoalMarker(null);
+      setNavPath(null);
+    }
+  }, [measurePoints, goalMarker, navSession]);
 
   // ── Render Loop ───────────────────────────────────────────
 
@@ -332,18 +342,57 @@ export default function RVizPanel({ activePath }) {
 
       // Navigation path (from click-to-navigate or active nav session)
       const displayPath = navSession?.path || navPath || activePath;
-      if (layers.path && displayPath) drawPath(ctx, w, h, vp, displayPath);
 
       // Robot-specific layers
       if (telem.x !== undefined) {
         const headingRad = (telem.heading ?? 0) * Math.PI / 180;
+
+        // Trail tracking — record robot position
+        if (navSession?.active && layers.trail) {
+          const lastPt = robotTrailRef.current[robotTrailRef.current.length - 1];
+          if (!lastPt || Math.hypot(telem.x - lastPt.x, telem.y - lastPt.y) > 0.03) {
+            robotTrailRef.current.push({ x: telem.x, y: telem.y });
+            if (robotTrailRef.current.length > MAX_TRAIL_POINTS) {
+              robotTrailRef.current = robotTrailRef.current.slice(-MAX_TRAIL_POINTS);
+            }
+          }
+        } else if (!navSession?.active && robotTrailRef.current.length > 0) {
+          // Clear trail when nav session ends (keep for 3 seconds)
+          setTimeout(() => { robotTrailRef.current = []; }, 3000);
+        }
+
+        // Robot trail (breadcrumb)
+        if (layers.trail) drawRobotTrail(ctx, vp, robotTrailRef.current);
+
+        // Local costmap window
+        if (layers.localCostmap && navSession?.active) drawLocalCostmapWindow(ctx, vp, telem.x, telem.y);
+
+        // Animated path (replaces basic drawPath when navigating)
+        if (layers.path && displayPath && navSession?.active) {
+          drawAnimatedPath(ctx, w, h, vp, displayPath, telem.x, telem.y);
+        } else if (layers.path && displayPath) {
+          drawPath(ctx, w, h, vp, displayPath);
+        }
+
+        // DWA trajectory preview
+        const dwaTrajectory = activeRobotId ? dwaTrajectories[activeRobotId] : null;
+        if (layers.dwaPreview && dwaTrajectory) drawDWATrajectory(ctx, vp, dwaTrajectory);
+
         if (layers.laser) drawLaserScan(ctx, w, h, vp, telem.x, telem.y, headingRad, telem.lidar);
-        if (layers.robot) drawRobotPose(ctx, w, h, vp, telem.x, telem.y, headingRad);
+        if (layers.footprint) drawRobotFootprint(ctx, vp, telem.x, telem.y);
+        if (layers.robot) {
+          const odomTheta = telem.odomTheta !== undefined ? telem.odomTheta : null;
+          drawRobotPose(ctx, w, h, vp, telem.x, telem.y, headingRad, 0.12, telem.linearVel || 0, odomTheta);
+        }
         if (layers.tf) drawTFFrames(ctx, w, h, vp, { x: telem.x, y: telem.y, theta: headingRad }, tf);
       }
 
-      // Goal marker
-      if (goalMarker) drawGoalMarker(ctx, vp, goalMarker);
+      // Goal marker — use enhanced version during nav
+      if (goalMarker && navSession?.active && telem.x !== undefined) {
+        drawGoalPoseArrow(ctx, vp, goalMarker, telem.x, telem.y);
+      } else if (goalMarker) {
+        drawGoalMarker(ctx, vp, goalMarker);
+      }
 
       // Nav status overlay
       if (navSession?.active) drawNavStatus(ctx, w, h, navSession);
@@ -360,7 +409,7 @@ export default function RVizPanel({ activePath }) {
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  }, [canvasSize, viewport, layers, grid, telem, activePath, simWorldSegments, tf, measurePoints, cursorWorld, goalMarker, navPath, navSession]);
+  }, [canvasSize, viewport, layers, grid, telem, activePath, simWorldSegments, tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId]);
 
   // ── JSX ───────────────────────────────────────────────────
 
@@ -403,6 +452,44 @@ export default function RVizPanel({ activePath }) {
           onToggleLayer={toggleLayer}
         />
         <div ref={containerRef} style={canvasStyle}>
+          {activeTool === 'goal' && (
+            <div style={{
+              position: 'absolute',
+              top: '16px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              background: 'rgba(139, 92, 246, 0.9)',
+              color: '#fff',
+              padding: '8px 16px',
+              borderRadius: '20px',
+              fontWeight: 'bold',
+              pointerEvents: 'none',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+              zIndex: 10,
+              border: '1px solid rgba(255,255,255,0.2)'
+            }}>
+              👆 Hãy nhấp chuột vào vị trí trên bản đồ để Robot di chuyển tới
+            </div>
+          )}
+          {isNavLoading && (
+            <div style={{
+              position: 'absolute',
+              top: '16px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              background: 'rgba(59, 130, 246, 0.9)',
+              color: '#fff',
+              padding: '8px 16px',
+              borderRadius: '20px',
+              fontWeight: 'bold',
+              pointerEvents: 'none',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+              zIndex: 10,
+              animation: 'pulse 1.5s infinite',
+            }}>
+              ⏳ Đang tính đường đi...
+            </div>
+          )}
           <canvas
             ref={canvasRef}
             style={{
@@ -410,11 +497,12 @@ export default function RVizPanel({ activePath }) {
               height: canvasSize.h,
               cursor: activeTool === 'move' ? 'grab' : 'crosshair',
             }}
-            onMouseDown={viewport.handlers.onMouseDown}
+            onMouseDown={activeTool === 'move' ? viewport.handlers.onMouseDown : undefined}
             onMouseMove={handleCanvasMouseMove}
-            onMouseUp={viewport.handlers.onMouseUp}
-            onMouseLeave={viewport.handlers.onMouseLeave}
+            onMouseUp={activeTool === 'move' ? viewport.handlers.onMouseUp : undefined}
+            onMouseLeave={activeTool === 'move' ? viewport.handlers.onMouseLeave : undefined}
             onClick={handleCanvasClick}
+            onContextMenu={handleContextMenu}
           />
         </div>
       </div>

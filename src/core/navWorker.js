@@ -2,6 +2,7 @@ import * as Comlink from 'comlink';
 import { ScanMatcher } from './scanMatcher.js';
 import findPathOnGrid from './lidarPathfinder.js';
 import { computeVelocityCmd } from './dwaPlanner.js';
+import { ROBOT_RADIUS } from './warehouse.js';
 
 // Dummy Grid object to reconstruct methods on the worker side
 class WorkerGrid {
@@ -176,9 +177,94 @@ class NavWorkerAPI {
   }
 
   // DWA LOCAL PLANNER: Tính toán v, w để lách vật cản
-  computeVelocity(pose, vel, globalPlan, gridData, dwaConfig = null) {
+  computeVelocity(pose, vel, globalPlan, gridData, dwaConfig = null, lidarPts = null) {
+    const t0 = performance.now();
     const grid = new WorkerGrid(gridData);
-    return computeVelocityCmd(pose, vel, globalPlan, grid, dwaConfig);
+
+    // INJECT LOCAL COSTMAP from live LiDAR data
+    if (lidarPts && lidarPts.length > 0 && grid.logOdds) {
+      if (!grid.costmap) {
+        grid.costmap = new Uint8Array(grid.width * grid.height);
+      }
+
+      // ── RADIUS CONSTANTS — Must match warehouse.js ROBOT_RADIUS ──
+      const INSCRIBED_R = ROBOT_RADIUS;   // 0.15m — matches physics collision
+      const INFLATION_R = 0.40;           // Was 0.55 — too wide for corridors
+      const COST_SCALING = 2.5;           // Was 3.0 — smoother gradient
+      const inflCells = Math.ceil(INFLATION_R / grid.resolution);
+      const inscribedCells = Math.ceil(INSCRIBED_R / grid.resolution);
+
+      for (const pt of lidarPts) {
+        const distM = pt.d / 1000.0;
+        if (distM < 0.12 || distM > 3.5) continue;
+
+        const angle = pose.theta + (pt.a * Math.PI) / 180;
+        const hitX = pose.x + Math.cos(angle) * distM;
+        const hitY = pose.y + Math.sin(angle) * distM;
+        const { gx, gy } = grid.worldToGrid(hitX, hitY);
+
+        if (!grid.inBounds(gx, gy)) continue;
+
+        const centerIdx = gy * grid.width + gx;
+        grid.logOdds[centerIdx] = Math.max(grid.logOdds[centerIdx], 5.0);
+        grid.costmap[centerIdx] = 254;
+
+        for (let dy = -inflCells; dy <= inflCells; dy++) {
+          for (let dx = -inflCells; dx <= inflCells; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = gx + dx;
+            const ny = gy + dy;
+            if (!grid.inBounds(nx, ny)) continue;
+
+            const cellDist = Math.hypot(dx, dy);
+            if (cellDist > inflCells) continue;
+
+            const idx = ny * grid.width + nx;
+            let cost;
+
+            if (cellDist <= inscribedCells) {
+              cost = 253;
+            } else {
+              const distMeters = cellDist * grid.resolution;
+              const decayDist = distMeters - INSCRIBED_R;
+              cost = Math.round(252 * Math.exp(-COST_SCALING * decayDist));
+            }
+
+            if (cost > 0 && cost > grid.costmap[idx]) {
+              grid.costmap[idx] = cost;
+            }
+
+            if (cellDist <= inscribedCells && grid.logOdds[idx] < 2.0) {
+              grid.logOdds[idx] = 2.0;
+            }
+          }
+        }
+      }
+
+      // ── SELF-CLEAR: Remove costmap artifacts at robot's current position ──
+      // Without this, nearby LiDAR reflections write lethal costs INTO the
+      // robot's own footprint → DWA sees "phantom obstacle" → all trajectories rejected.
+      const robotG = grid.worldToGrid(pose.x, pose.y);
+      const clearR = Math.ceil((ROBOT_RADIUS + 0.05) / grid.resolution); // Slightly larger than physical radius
+      for (let dy = -clearR; dy <= clearR; dy++) {
+        for (let dx = -clearR; dx <= clearR; dx++) {
+          const nx = robotG.gx + dx;
+          const ny = robotG.gy + dy;
+          if (!grid.inBounds(nx, ny)) continue;
+          const cellDist = Math.hypot(dx, dy) * grid.resolution;
+          if (cellDist <= ROBOT_RADIUS + 0.05) {
+            const idx = ny * grid.width + nx;
+            grid.costmap[idx] = 0;   // Clear costmap
+            // Don't clear logOdds — that's the persistent map
+          }
+        }
+      }
+    }
+
+    const result = computeVelocityCmd(pose, vel, globalPlan, grid, dwaConfig);
+    const t1 = performance.now();
+    console.log(`[Worker] computeVelocity took ${(t1 - t0).toFixed(1)}ms`);
+    return result;
   }
 }
 

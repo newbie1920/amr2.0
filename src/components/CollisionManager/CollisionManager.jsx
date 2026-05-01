@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import useRobotStore from '../../stores/robotStore';
+import useNavStore from '../../stores/navStore';
 
 const SAFE_DISTANCE = 1.0; // Khoảng cách an toàn (mét)
 
@@ -13,7 +14,8 @@ export default function CollisionManager() {
 
   useEffect(() => {
     const checkCollisions = () => {
-      const { robots, pauseRobot, resumeRobot } = useRobotStore.getState();
+      const { robots } = useRobotStore.getState();
+      const { pauseNav, resumeNav } = useNavStore.getState();
       const connected = Object.values(robots).filter(r => r.status === 'connected' && r.telemetry);
       
       const toPause = new Set();
@@ -46,13 +48,13 @@ export default function CollisionManager() {
           
           if (toPause.has(id)) {
               if (!isCurrentlyPaused) {
-                  pauseRobot(id);
+                  pauseNav(id);
                   lastState.current[id] = true;
                   console.warn(`[CollisionManager] ⚠️ Xe ${id} đã bị YIELD (Nhường đường) do xâm phạm Safe Radius.`);
               }
           } else {
               if (isCurrentlyPaused) {
-                  resumeRobot(id);
+                  resumeNav(id);
                   lastState.current[id] = false;
                   console.info(`[CollisionManager] 🟢 Xe ${id} được cấp RESUME (Hết cản trở).`);
               }

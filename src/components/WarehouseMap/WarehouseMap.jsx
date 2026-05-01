@@ -12,6 +12,8 @@ import {
   SHELVES, GATES, CHARGING_STATIONS
 } from '../../core/warehouse.js';
 import useRobotStore from '../../stores/robotStore.js';
+import useMapStore from '../../stores/mapStore.js';
+import useNavStore from '../../stores/navStore.js';
 import { getExplorationPhase, getExplorationInfo } from '../../core/exploration.js';
 import vi from '../../i18n/vi.js';
 import MapManager from '../MapManager/MapManager.jsx';
@@ -120,12 +122,12 @@ function RobotModel({ position, rotation, battery, label, hasObs }) {
         <meshStandardMaterial color={color} metalness={0.6} roughness={0.2} />
         <Edges scale={1.05} threshold={15} color="#000" />
       </mesh>
-      {/* Lidar/Sensor on top */}
-      <mesh position={[0, 0.35, 0.1]}>
+      {/* Lidar/Sensor on top (front of robot) */}
+      <mesh position={[0, 0.35, -0.1]}>
         <cylinderGeometry args={[0.1, 0.1, 0.1, 16]} />
         <meshStandardMaterial color="#ef4444" emissive={hasObs ? "#ef4444" : "#000"} emissiveIntensity={hasObs ? 1 : 0} />
       </mesh>
-      {/* Wheels */}
+      {/* Wheels (along X axis — differential drive) */}
       <mesh position={[-0.35, 0.1, 0]} rotation={[0, 0, Math.PI / 2]}>
         <cylinderGeometry args={[0.1, 0.1, 0.4, 16]} />
         <meshStandardMaterial color="#1e293b" />
@@ -134,8 +136,8 @@ function RobotModel({ position, rotation, battery, label, hasObs }) {
         <cylinderGeometry args={[0.1, 0.1, 0.4, 16]} />
         <meshStandardMaterial color="#1e293b" />
       </mesh>
-      {/* Front Arrow */}
-      <mesh position={[0, 0.15, 0.4]} rotation={[Math.PI / 2, 0, 0]}>
+      {/* Front Arrow (points to -Z in local space = forward direction) */}
+      <mesh position={[0, 0.15, -0.4]} rotation={[-Math.PI / 2, 0, 0]}>
         <coneGeometry args={[0.15, 0.2, 16]} />
         <meshStandardMaterial color="#22c55e" />
       </mesh>
@@ -465,11 +467,16 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         const x = map2To3X(robot.telemetry.x);
         const z = map2To3Z(robot.telemetry.y);
         // 2D theta to 3D rotY conversion:
-        // 2D: theta=0 → +X (right), theta=PI/2 → +Y (up)  
-        // 3D: rotY=0 → +Z, rotY=PI/2 → +X
-        // Mapping: rotY = -(theta - PI/2) = PI/2 - theta
+        // 2D: theta=0 → +X (right), theta=PI/2 → +Y (up)
+        // 3D: X stays +X, Y_2d maps to -Z_3d
+        // Model front is -Z local, so:
+        //   theta=0 → face +X → rotY = PI/2 (rotate -Z to +X)
+        //   theta=PI/2 → face +Y → face -Z → rotY = PI (rotate -Z to -Z, i.e. 0... wait)
+        // Correct formula: rotY = theta + PI/2
+        // When theta=0: rotY=PI/2 → local -Z rotates to +X ✓
+        // When theta=PI/2: rotY=PI → local -Z rotates to -Z (which is +Y_2d) ✓
         const theta2D = robot.telemetry.headingRad ?? 0;
-        const rotY = Math.PI / 2 - theta2D;
+        const rotY = theta2D + Math.PI / 2;
         
         return (
           <React.Fragment key={robot.id}>
@@ -539,13 +546,13 @@ function CameraDirector({ viewMode }) {
 
 export default function WarehouseMap({ activePath }) {
   const robots = useRobotStore((s) => s.robots);
-  const occupancyGrid = useRobotStore((s) => s.occupancyGrid);
-  const mappingActive = useRobotStore((s) => s.mappingActive);
+  const occupancyGrid = useMapStore((s) => s.occupancyGrid);
+  const mappingActive = useMapStore((s) => s.mappingActive);
   const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
-  const startMapping = useRobotStore((s) => s.startMapping);
-  const stopMapping = useRobotStore((s) => s.stopMapping);
-  const saveMap = useRobotStore((s) => s.saveMap);
-  const loadMap = useRobotStore((s) => s.loadMap);
+  const startMapping = useMapStore((s) => s.startMapping);
+  const stopMapping = useMapStore((s) => s.stopMapping);
+  const saveMap = useMapStore((s) => s.saveMap);
+  const loadMap = useMapStore((s) => s.loadMap);
   const [viewMode, setViewMode] = useState('iso'); // 'free', 'top', 'iso'
   const [mapType, setMapType] = useState('3d'); // '3d', 'lidar'
   const [showMapManager, setShowMapManager] = useState(false);

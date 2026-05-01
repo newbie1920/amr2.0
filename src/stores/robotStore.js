@@ -11,8 +11,11 @@ import { startExploration, stopExploration, getExplorationInfo } from '../core/e
 import { VelocityMux, VEL_SOURCE } from '../core/velocityMux.js';
 import { navWorkerApi } from '../core/navWorkerSetup.js';
 import { SimEngine } from '../core/sim/simEngine.js';
-import { DWA_DEFAULTS, DWA_PRESETS } from '../core/dwaPlanner.js';
-import { normalizeAngle } from '../core/mathUtils.js';
+import { DWA_DEFAULTS } from '../core/dwaPlanner.js';
+import useMapStore from './mapStore.js';
+import useDWAStore from './dwaStore.js';
+import useSimStore from './simStore.js';
+import { registerStore, getNavStoreState } from './storeRegistry.js';
 
 function saveRobotsToStorage(robots) {
   const data = Object.values(robots).map((r) => ({
@@ -25,7 +28,7 @@ function saveRobotsToStorage(robots) {
 }
 
 // ============================================================
-//   MAP STORAGE HELPERS (localStorage)
+//   STORAGE HELPERS (localStorage)
 // ============================================================
 
 const MAP_STORAGE_KEY = 'amr_saved_maps';
@@ -74,69 +77,16 @@ function setRobotArchitectureProfile(robot, profile) {
   }
 }
 
-const APP_NAV = {
-  progressDistance: 0.06,
-  progressTimeoutMs: 3500,
-  goalTolerance: 0.18,
-  finalHeadingTolerance: 0.12,
-  rotateGain: 1.6,
-  rotateMaxW: 0.9,
-  recoverySpinMs: 1400,
-  recoveryBackupMs: 1100,
-  backupSpeed: -0.08,
-  spinSpeed: 0.75,
-  maxRecoveryAttempts: 4,
-  waypointReachTolerance: 0.22,
-};
-
-
-
-function createAppNavigationSession(path, finalHeading = null) {
-  const goal = path[path.length - 1];
-  return {
-    active: true,
-    paused: false,
-    status: 'TRACK',
-    recoveryMode: null,
-    recoveryUntil: 0,
-    recoveryAttempts: 0,
-    path,
-    currentWaypointIndex: 0,
-    finalHeadingRad: finalHeading == null ? null : (finalHeading * Math.PI) / 180.0,
-    goal,
-    lastProgressTime: Date.now(),
-    lastProgressPose: null,
-    replanRequested: false,
-  };
-}
-
-function buildAppNavOverlay(session) {
-  if (!session) return null;
-  return {
-    nav: session.status || 'IDLE',
-    nav_wp: session.currentWaypointIndex || 0,
-    nav_total: session.path?.length || 0,
-  };
-}
+// NOTE: useNavStore is accessed via storeRegistry to break circular dependency.
+// navStore registers itself after creation, and robotStore accesses it at runtime.
 
 const useRobotStore = create((set, get) => ({
   // State
   robots: {},           // { robotId: { id, name, ip, port, connection, telemetry, status } }
   lidarScans: {},      // { robotId: [{a, d}] }
-  occupancyGrid: {},   // { robotId: OccupancyGrid instance }
-  mappingActive: {},   // { robotId: boolean }
-  localizationActive: {}, // { robotId: boolean } - AMCL mode
-  mapperInstances: {}, // { robotId: OccupancyGrid } — live mapping instances
-  savedMaps: loadSavedMapsFromStorage(), // Persistent map list
-  replanStatus: {},    // { robotId: 'idle' | 'replanning' | 'sent' }
-  explorationInfo: {}, // { robotId: { phase, noFrontierCount, ... } }
-  isMatching: {},      // { robotId: boolean } — Worker SLAM processing lock
   appNavigationSessions: {}, // { robotId: app-side navigation session }
   navComputationBusy: {}, // { robotId: boolean } — local planner worker lock
   velocityMuxes: {},   // { robotId: VelocityMux } — Twist Mux (articubot-style)
-  // REP 105 TF Frames: map→odom transform (tích lũy correction từ scan matching)
-  // mapPose = odomPose + mapToOdom  (odom smooth, map jumpy nhưng globally correct)
-  mapToOdom: {},       // { robotId: { dx: 0, dy: 0, dTheta: 0 } }
   selectedRobotId: null,
 
   // ── GazeboTDTU SIM MODE ──────────────────────────────────
@@ -163,385 +113,9 @@ const useRobotStore = create((set, get) => ({
     });
   },
 
-  startAppNavigation: (id, path, finalHeading = null) => {
-    const robot = get().robots[id];
-    if (!robot?.connection?.connected || !path || path.length === 0) return false;
-
-    setRobotArchitectureProfile(robot, 'pc_slam');
-    const session = createAppNavigationSession(path, finalHeading);
-    set((state) => ({
-      appNavigationSessions: {
-        ...state.appNavigationSessions,
-        [id]: session,
-      },
-      navComputationBusy: {
-        ...state.navComputationBusy,
-        [id]: false,
-      },
-    }));
-    return true;
-  },
-
-  stopAppNavigation: (id, reason = 'IDLE', restoreArchitecture = true) => {
-    const state = get();
-    const robot = state.robots[id];
-    const mux = state.velocityMuxes[id];
-    if (mux) {
-      mux.release(VEL_SOURCE.NAVIGATION);
-    }
-
-    if (restoreArchitecture && !state.mappingActive[id] && !state.localizationActive?.[id]) {
-      setRobotArchitectureProfile(robot, 'hybrid');
-    }
-
-    set((s) => ({
-      appNavigationSessions: {
-        ...s.appNavigationSessions,
-        [id]: null,
-      },
-      navComputationBusy: {
-        ...s.navComputationBusy,
-        [id]: false,
-      },
-    }));
-
-    return {
-      nav: reason,
-      nav_wp: 0,
-      nav_total: 0,
-    };
-  },
-
-  processNavigationTick: (id, telem, now = Date.now()) => {
-    const state = get();
-    const session = state.appNavigationSessions[id];
-    if (!session?.active) return null;
-
-    const mux = state.velocityMuxes[id];
-    const grid = state.mapperInstances[id] || state.occupancyGrid[id];
-    const pose = {
-      x: telem.x ?? 0,
-      y: telem.y ?? 0,
-      theta: ((telem.heading ?? 0) * Math.PI) / 180.0,
-    };
-    const vel = {
-      v: telem.linearVel ?? 0,
-      w: telem.angularVel ?? 0,
-    };
-
-    const nextSession = { ...session };
-    if (!nextSession.lastProgressPose) {
-      nextSession.lastProgressPose = { x: pose.x, y: pose.y };
-    }
-
-    while (nextSession.currentWaypointIndex < nextSession.path.length - 1) {
-      const wp = nextSession.path[nextSession.currentWaypointIndex];
-      const d = Math.hypot(wp.x - pose.x, wp.y - pose.y);
-      if (d <= APP_NAV.waypointReachTolerance) {
-        nextSession.currentWaypointIndex += 1;
-      } else {
-        break;
-      }
-    }
-
-    const moved = Math.hypot(
-      pose.x - nextSession.lastProgressPose.x,
-      pose.y - nextSession.lastProgressPose.y,
-    );
-    if (moved >= APP_NAV.progressDistance) {
-      nextSession.lastProgressTime = now;
-      nextSession.lastProgressPose = { x: pose.x, y: pose.y };
-    }
-
-    const goal = nextSession.goal;
-    const distToGoal = Math.hypot(goal.x - pose.x, goal.y - pose.y);
-
-    if (nextSession.paused) {
-      if (mux) mux.release(VEL_SOURCE.NAVIGATION);
-      nextSession.status = 'PAUSED';
-      set((s) => ({
-        appNavigationSessions: {
-          ...s.appNavigationSessions,
-          [id]: nextSession,
-        },
-      }));
-      return buildAppNavOverlay(nextSession);
-    }
-
-    if (distToGoal <= APP_NAV.goalTolerance) {
-      if (nextSession.finalHeadingRad != null) {
-        const err = normalizeAngle(nextSession.finalHeadingRad - pose.theta);
-        if (Math.abs(err) > APP_NAV.finalHeadingTolerance) {
-          const cmdW = Math.max(-APP_NAV.rotateMaxW, Math.min(APP_NAV.rotateMaxW, err * APP_NAV.rotateGain));
-          if (mux) mux.send(VEL_SOURCE.NAVIGATION, 0, cmdW);
-          nextSession.status = 'F_TURN';
-          set((s) => ({
-            appNavigationSessions: {
-              ...s.appNavigationSessions,
-              [id]: nextSession,
-            },
-          }));
-          return buildAppNavOverlay(nextSession);
-        }
-      }
-
-      get().stopAppNavigation(id, 'DONE', true);
-      return { nav: 'DONE', nav_wp: nextSession.path.length, nav_total: nextSession.path.length };
-    }
-
-    if (nextSession.recoveryMode) {
-      if (now < nextSession.recoveryUntil) {
-        if (mux) {
-          if (nextSession.recoveryMode === 'RECOVERY_SPIN') {
-            mux.send(VEL_SOURCE.NAVIGATION, 0, APP_NAV.spinSpeed);
-          } else if (nextSession.recoveryMode === 'RECOVERY_BACKUP') {
-            mux.send(VEL_SOURCE.NAVIGATION, APP_NAV.backupSpeed, 0);
-          }
-        }
-        nextSession.status = nextSession.recoveryMode;
-        set((s) => ({
-          appNavigationSessions: {
-            ...s.appNavigationSessions,
-            [id]: nextSession,
-          },
-        }));
-        return buildAppNavOverlay(nextSession);
-      }
-
-      if (nextSession.recoveryMode === 'REPLAN') {
-        if (!grid || !navWorkerApi || state.navComputationBusy[id]) {
-          nextSession.status = 'RECOVERY_REPLAN';
-          set((s) => ({
-            appNavigationSessions: {
-              ...s.appNavigationSessions,
-              [id]: nextSession,
-            },
-          }));
-          return buildAppNavOverlay(nextSession);
-        }
-
-        set((s) => ({
-          navComputationBusy: {
-            ...s.navComputationBusy,
-            [id]: true,
-          },
-        }));
-
-        navWorkerApi.findPath(grid.serialize(), pose.x, pose.y, goal.x, goal.y, false, true)
-          .then((result) => {
-            const fresh = get().appNavigationSessions[id];
-            if (!fresh?.active) return;
-
-            if (result.success && result.path.length > 1) {
-              const updated = {
-                ...fresh,
-                path: result.path,
-                goal: result.path[result.path.length - 1],
-                currentWaypointIndex: 0,
-                recoveryMode: null,
-                status: 'TRACK',
-                lastProgressTime: Date.now(),
-                lastProgressPose: { x: pose.x, y: pose.y },
-              };
-              set((s) => ({
-                appNavigationSessions: {
-                  ...s.appNavigationSessions,
-                  [id]: updated,
-                },
-                navComputationBusy: {
-                  ...s.navComputationBusy,
-                  [id]: false,
-                },
-              }));
-            } else {
-              const retries = fresh.recoveryAttempts + 1;
-              if (retries >= APP_NAV.maxRecoveryAttempts) {
-                get().stopAppNavigation(id, 'ERROR', true);
-                set((s) => ({
-                  navComputationBusy: {
-                    ...s.navComputationBusy,
-                    [id]: false,
-                  },
-                }));
-              } else {
-                const updated = {
-                  ...fresh,
-                  recoveryAttempts: retries,
-                  recoveryMode: 'RECOVERY_SPIN',
-                  recoveryUntil: Date.now() + APP_NAV.recoverySpinMs,
-                  status: 'RECOVERY_SPIN',
-                };
-                set((s) => ({
-                  appNavigationSessions: {
-                    ...s.appNavigationSessions,
-                    [id]: updated,
-                  },
-                  navComputationBusy: {
-                    ...s.navComputationBusy,
-                    [id]: false,
-                  },
-                }));
-              }
-            }
-          })
-          .catch((err) => {
-            console.error('[AppNav] Replan error:', err);
-            get().stopAppNavigation(id, 'ERROR', true);
-            set((s) => ({
-              navComputationBusy: {
-                ...s.navComputationBusy,
-                [id]: false,
-              },
-            }));
-          });
-
-        nextSession.status = 'RECOVERY_REPLAN';
-        set((s) => ({
-          appNavigationSessions: {
-            ...s.appNavigationSessions,
-            [id]: nextSession,
-          },
-        }));
-        return buildAppNavOverlay(nextSession);
-      }
-
-      nextSession.recoveryMode = 'REPLAN';
-      nextSession.status = 'RECOVERY_REPLAN';
-      
-      // Nav2-style: Clear costmap around robot before replanning
-      // (removes phantom obstacles that may be blocking the path)
-      if (grid && typeof grid.clearCostmapAround === 'function') {
-        grid.clearCostmapAround(pose.x, pose.y, 2.0);
-        console.log(`[Recovery] Cleared costmap around robot (2m radius) before replan`);
-      }
-      
-      set((s) => ({
-        appNavigationSessions: {
-          ...s.appNavigationSessions,
-          [id]: nextSession,
-        },
-      }));
-      return buildAppNavOverlay(nextSession);
-    }
-
-    if (now - nextSession.lastProgressTime > APP_NAV.progressTimeoutMs) {
-      nextSession.recoveryAttempts += 1;
-      if (nextSession.recoveryAttempts >= APP_NAV.maxRecoveryAttempts) {
-        get().stopAppNavigation(id, 'ERROR', true);
-        return { nav: 'ERROR', nav_wp: nextSession.currentWaypointIndex, nav_total: nextSession.path.length };
-      }
-
-      nextSession.recoveryMode = nextSession.recoveryAttempts % 2 === 1 ? 'RECOVERY_SPIN' : 'RECOVERY_BACKUP';
-      nextSession.recoveryUntil = now + (nextSession.recoveryMode === 'RECOVERY_SPIN' ? APP_NAV.recoverySpinMs : APP_NAV.recoveryBackupMs);
-      nextSession.status = nextSession.recoveryMode;
-      set((s) => ({
-        appNavigationSessions: {
-          ...s.appNavigationSessions,
-          [id]: nextSession,
-        },
-      }));
-      return buildAppNavOverlay(nextSession);
-    }
-
-    if (!grid || !navWorkerApi) {
-      const target = nextSession.path[Math.min(nextSession.currentWaypointIndex + 1, nextSession.path.length - 1)];
-      const headingErr = normalizeAngle(Math.atan2(target.y - pose.y, target.x - pose.x) - pose.theta);
-      const cmdV = Math.abs(headingErr) > 0.7 ? 0.0 : 0.12;
-      const cmdW = Math.max(-APP_NAV.rotateMaxW, Math.min(APP_NAV.rotateMaxW, headingErr * 1.4));
-      if (mux) mux.send(VEL_SOURCE.NAVIGATION, cmdV, cmdW);
-      nextSession.status = 'TRACK';
-      set((s) => ({
-        appNavigationSessions: {
-          ...s.appNavigationSessions,
-          [id]: nextSession,
-        },
-      }));
-      return buildAppNavOverlay(nextSession);
-    }
-
-    if (!state.navComputationBusy[id]) {
-      set((s) => ({
-        navComputationBusy: {
-          ...s.navComputationBusy,
-          [id]: true,
-        },
-      }));
-
-      navWorkerApi.computeVelocity(pose, vel, nextSession.path, grid.serialize(), get().dwaConfig)
-        .then((cmd) => {
-          const fresh = get().appNavigationSessions[id];
-          const freshMux = get().velocityMuxes[id];
-          if (!fresh?.active || fresh.paused) {
-            set((s) => ({
-              navComputationBusy: {
-                ...s.navComputationBusy,
-                [id]: false,
-              },
-            }));
-            return;
-          }
-
-          if (!cmd?.ok || (cmd.v === 0 && cmd.w === 0)) {
-            const updated = {
-              ...fresh,
-              recoveryAttempts: fresh.recoveryAttempts + 1,
-              recoveryMode: 'REPLAN',
-              recoveryUntil: Date.now(),
-              status: 'RECOVERY_REPLAN',
-            };
-            set((s) => ({
-              appNavigationSessions: {
-                ...s.appNavigationSessions,
-                [id]: updated,
-              },
-              navComputationBusy: {
-                ...s.navComputationBusy,
-                [id]: false,
-              },
-            }));
-            if (freshMux) freshMux.release(VEL_SOURCE.NAVIGATION);
-            return;
-          }
-
-          if (freshMux) {
-            freshMux.send(VEL_SOURCE.NAVIGATION, cmd.v, cmd.w);
-          }
-
-          set((s) => ({
-            appNavigationSessions: {
-              ...s.appNavigationSessions,
-              [id]: {
-                ...fresh,
-                status: 'TRACK',
-              },
-            },
-            navComputationBusy: {
-              ...s.navComputationBusy,
-              [id]: false,
-            },
-          }));
-        })
-        .catch((err) => {
-          console.error('[AppNav] computeVelocity error:', err);
-          get().stopAppNavigation(id, 'ERROR', true);
-          set((s) => ({
-            navComputationBusy: {
-              ...s.navComputationBusy,
-              [id]: false,
-            },
-          }));
-        });
-    }
-
-    nextSession.status = 'TRACK';
-    set((s) => ({
-      appNavigationSessions: {
-        ...s.appNavigationSessions,
-        [id]: nextSession,
-      },
-    }));
-    return buildAppNavOverlay(nextSession);
-  },
+  // ── Navigation actions migrated to navStore.js ──
+  // startAppNavigation, stopAppNavigation, processNavigationTick
+  // Lazy getter to break circular dependency (navStore imports robotStore)
 
   /**
    * Thêm robot mới
@@ -574,107 +148,21 @@ const useRobotStore = create((set, get) => ({
       if (!currentState.transientRobots) currentState.transientRobots = {};
       currentState.transientRobots[id] = telem;
 
-      // === LIDAR MAPPING: Cập nhật Occupancy Grid khi đang quét ===
-      const isMapping = currentState.mappingActive[id];
-      const isLocalizing = currentState.localizationActive?.[id];
-
-      if ((isMapping || isLocalizing) && currentState.mapperInstances[id]) {
-        const grid = currentState.mapperInstances[id];
-        const lidarPts = telem.lidar || [];
-        if (lidarPts.length > 0) {
-          const headingDeg = telem.heading ?? 0;
-
-          // ── REP 105 TF Frames ──────────────────────────────
-          //   map (global, jumpy) → odom (local, smooth) → base_link
-          //
-          //   odomPose = encoder/IMU pose (smooth, drifts over time)
-          //   mapToOdom = accumulated SLAM correction (jumpy but globally correct)
-          //   mapPose = odomPose + mapToOdom → used for grid update
-          // ────────────────────────────────────────────────────
-
-          // 1) odom frame: raw encoder/IMU pose (smooth)
-          const odomX = telem.x ?? 0;
-          const odomY = telem.y ?? 0;
-          const odomTheta = headingDeg * Math.PI / 180;
-
-          // 2) Apply accumulated map→odom transform
-          const tf = currentState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
-          let mapX = odomX + tf.dx;
-          let mapY = odomY + tf.dy;
-          let mapTheta = odomTheta + tf.dTheta;
-
-          // 3) Scan Matching: tìm correction mới (nếu đủ data)
-          if (navWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !currentState.isMatching[id]) {
-            // Lock worker to prevent overlapping calls
-            set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
-
-            // Call Web Worker (Async)
-            navWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
-              const freshState = get();
-              
-              set((s) => ({
-                robots: {
-                  ...s.robots,
-                  [id]: {
-                    ...s.robots[id],
-                    telemetry: {
-                      ...s.robots[id].telemetry,
-                      matchScore: matched.score
-                    }
-                  }
-                }
-              }));
-
-              if (matched.corrected) {
-                // Update map→odom transform (TÍCH LŨY correction)
-                const c = matched.correction;
-                const freshTf = freshState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
-                const newTf = {
-                  dx: freshTf.dx + c.dx,
-                  dy: freshTf.dy + c.dy,
-                  dTheta: freshTf.dTheta + c.dTheta,
-                };
-
-                set((s) => ({
-                  mapToOdom: { ...s.mapToOdom, [id]: newTf },
-                  isMatching: { ...s.isMatching, [id]: false }
-                }));
-
-                // Log per 10 matches (We can just log all successful ones or track matchCount in worker)
-              } else {
-                set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
-              }
-            }).catch(e => {
-              console.error("[SLAM] Worker Error:", e);
-              set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
-            });
-          }
-
-          // 4) Update grid with MAP FRAME pose (globally correct) - CHỈ KHI MAPPING
-          if (isMapping) {
-            grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
-          }
-
-          // Debug log cho scan đầu tiên
-          if (isMapping && grid.scanCount === 1) {
-            console.log(`[Mapping] Scan #1: ${lidarPts.length} pts, odom=(${odomX.toFixed(2)}, ${odomY.toFixed(2)}), map=(${mapX.toFixed(2)}, ${mapY.toFixed(2)}), heading=${headingDeg.toFixed(1)}°`);
-          }
-          // Throttle occupancyGrid state update to 2Hz
-          if (!currentState._lastGridUpdate || now - currentState._lastGridUpdate > 500) {
-            currentState._lastGridUpdate = now;
-            set((state) => ({
-              occupancyGrid: {
-                ...state.occupancyGrid,
-                [id]: grid,
-              },
-            }));
-          }
-        }
+      // === LIDAR MAPPING: Delegate to mapStore ===
+      try {
+        useMapStore.getState().processLidarTick(id, telem, now, () => get());
+      } catch(e) {
+        // mapStore not ready
       }
 
-      const appNavOverlay = currentState.appNavigationSessions?.[id]?.active
-        ? get().processNavigationTick(id, telem, now)
-        : null;
+
+
+      // Delegate nav tick to navStore
+      let appNavOverlay = null;
+      const navState = getNavStoreState();
+      if (navState.appNavigationSessions?.[id]?.active) {
+        appNavOverlay = navState.processNavigationTick(id, telem, now);
+      }
       const effectiveTelem = appNavOverlay ? { ...telem, ...appNavOverlay } : telem;
       if (appNavOverlay) {
         telem.nav = effectiveTelem.nav;
@@ -775,18 +263,9 @@ const useRobotStore = create((set, get) => ({
 
     // Handle LIDAR occupancy grid updates
     connection.onLidarGrid = (grid) => {
-      set((state) => {
-        if (!state.robots[id]) return state;
-        if (state.mappingActive?.[id] || state.localizationActive?.[id]) {
-          return state;
-        }
-        return {
-          occupancyGrid: {
-            ...state.occupancyGrid,
-            [id]: grid,
-          },
-        };
-      });
+      try {
+        useMapStore.getState().updateOccupancyGrid(id, grid);
+      } catch(e) {}
     };
 
     connection.onConnect = () => {
@@ -799,6 +278,8 @@ const useRobotStore = create((set, get) => ({
           },
         }
       });
+      // Tự động load map nếu có
+      useMapStore.getState().autoLoadLatestMap(id);
     };
 
     connection.onDisconnect = () => {
@@ -845,7 +326,7 @@ const useRobotStore = create((set, get) => ({
   removeRobot: (id) => {
     const robot = get().robots[id];
     if (robot) {
-      get().stopAppNavigation(id, 'IDLE', false);
+      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch(e) {}
       robot.connection.disconnect();
       set((state) => {
         const { [id]: removed, ...rest } = state.robots;
@@ -877,7 +358,7 @@ const useRobotStore = create((set, get) => ({
   disconnectRobot: (id) => {
     const robot = get().robots[id];
     if (robot) {
-      get().stopAppNavigation(id, 'IDLE', false);
+      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch(e) {}
       robot.connection.disconnect();
       set((state) => ({
         robots: {
@@ -957,78 +438,12 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
-  /**
-   * Gửi lộ trình tự lái cho robot
-   * @param {string} id - Robot ID
-   * @param {Array<{x,y}>} path - Danh sách waypoint
-   * @param {number|null} finalHeading - Góc cuối tại đích (độ)
-   */
-  navigateRobot: (id, path, finalHeading = null) => {
-    const robot = get().robots[id];
-    const state = get();
-    if (robot && robot.connection.connected) {
-      const hasGrid = !!(state.mapperInstances[id] || state.occupancyGrid[id]);
-      const preferAppNav = robot.telemetry?.architecture === 'pc_slam' || hasGrid;
-      if (preferAppNav) {
-        return get().startAppNavigation(id, path, finalHeading);
-      }
-      robot.connection.navigate(path, finalHeading);
-      return true;
-    }
-    return false;
-  },
+  // ── Nav control delegated to navStore ──
+  navigateRobot: (id, path, fh) => { try { return getNavStoreState().navigateRobot(id, path, fh); } catch(e) { return false; } },
+  navStopRobot: (id) => { try { getNavStoreState().navStopRobot(id); } catch(e) {} },
+  pauseRobot: (id) => { try { getNavStoreState().pauseNav(id); } catch(e) {} },
+  resumeRobot: (id) => { try { getNavStoreState().resumeNav(id); } catch(e) {} },
 
-  /**
-   * Dừng tự lái
-   */
-  navStopRobot: (id) => {
-    const session = get().appNavigationSessions[id];
-    if (session?.active) {
-      get().stopAppNavigation(id, 'IDLE', true);
-    }
-    const robot = get().robots[id];
-    if (robot && robot.connection.connected) {
-      robot.connection.navStop();
-    }
-  },
-
-  pauseRobot: (id) => {
-    const session = get().appNavigationSessions[id];
-    if (session?.active) {
-      set((state) => ({
-        appNavigationSessions: {
-          ...state.appNavigationSessions,
-          [id]: { ...session, paused: true, status: 'PAUSED' },
-        },
-      }));
-    }
-    const robot = get().robots[id];
-    if (robot && robot.connection.connected) {
-      robot.connection.pause();
-    }
-  },
-
-  resumeRobot: (id) => {
-    const session = get().appNavigationSessions[id];
-    if (session?.active) {
-      set((state) => ({
-        appNavigationSessions: {
-          ...state.appNavigationSessions,
-          [id]: {
-            ...session,
-            paused: false,
-            status: 'TRACK',
-            lastProgressTime: Date.now(),
-            recoveryMode: null,
-          },
-        },
-      }));
-    }
-    const robot = get().robots[id];
-    if (robot && robot.connection.connected) {
-      robot.connection.resume();
-    }
-  },
 
   /**
    * Recalibrate con quay hồi chuyển (robot phải đứng yên!)
@@ -1051,194 +466,11 @@ const useRobotStore = create((set, get) => ({
   },
 
   // ============================================================
-  //   LIDAR MAPPING ACTIONS
+  //   LIDAR MAPPING ACTIONS (Delegated to mapStore)
   // ============================================================
-
-  /**
-   * Bắt đầu quét Occupancy Grid cho robot
-   * Tạo OccupancyGrid mới 80x80 (20x20m), centered tại vị trí robot hiện tại
-   */
-  startMapping: (id) => {
-    const robot = get().robots[id];
-    const telem = robot?.telemetry || {};
-    const rx = telem.x ?? 0;
-    const ry = telem.y ?? 0;
-    setRobotArchitectureProfile(robot, 'pc_slam');
-    
-    // Grid centered tại robot → dynamic origin
-    // Resolution 0.1m (articubot: 0.05m, cân bằng accuracy/performance cho browser)
-    // 200x200 * 0.1m = 20x20m coverage (đủ cho kho xưởng)
-    const grid = new OccupancyGrid(200, 200, 0.1, rx, ry);
-    const matcher = new ScanMatcher(); // SLAM scan matching
-    set((state) => ({
-      mappingActive: { ...state.mappingActive, [id]: true },
-      mapperInstances: { ...state.mapperInstances, [id]: grid },
-      occupancyGrid: { ...state.occupancyGrid, [id]: grid },
-      scanMatchers: { ...state.scanMatchers, [id]: matcher },
-      mapToOdom: { ...state.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } }, // Reset TF
-    }));
-    console.log(`[Mapping] Bắt đầu quét map cho robot ${id} tại (${rx.toFixed(2)}, ${ry.toFixed(2)}), grid 200x200 @0.1m + ScanMatcher ON`);
-    
-    // Bắt đầu tự khám phá
-    startExploration(id, () => get());
-    
-    // Update exploration info mỗi giây cho UI
-    const infoTimer = setInterval(() => {
-      if (!get().mappingActive[id]) { clearInterval(infoTimer); return; }
-      set((s) => ({ explorationInfo: { ...s.explorationInfo, [id]: getExplorationInfo() } }));
-    }, 1000);
-  },
-
-  /**
-   * Dừng quét + TỰ ĐỘNG lưu map vào danh sách
-   */
-  stopMapping: (id) => {
-    // Dừng exploration trước
-    stopExploration(id, () => get());
-    
-    const grid = get().mapperInstances[id];
-    const robot = get().robots[id];
-    setRobotArchitectureProfile(robot, 'hybrid');
-    
-    // Auto-save vào savedMaps nếu có data
-    if (grid && grid.scanCount > 0) {
-      const mapEntry = {
-        id: `map_${Date.now()}`,
-        name: `Map ${new Date().toLocaleDateString('vi-VN')} ${new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}`,
-        robotId: id,
-        createdAt: Date.now(),
-        scanCount: grid.scanCount,
-        width: grid.width,
-        height: grid.height,
-        resolution: grid.resolution,
-        data: grid.exportJSON(),
-      };
-      const maps = [...get().savedMaps, mapEntry];
-      set({ mappingActive: { ...get().mappingActive, [id]: false }, savedMaps: maps });
-      saveMapsToStorage(maps);
-      console.log(`[Mapping] Dừng quét + Tự động lưu "${mapEntry.name}" (${grid.scanCount} scans)`);
-    } else {
-      set((state) => ({
-        mappingActive: { ...state.mappingActive, [id]: false },
-      }));
-      console.log(`[Mapping] Dừng quét (không có dữ liệu để lưu)`);
-    }
-  },
-
-  /**
-   * Chế độ AMCL: Chỉ định vị trên bản đồ đã có, không cập nhật grid
-   */
-  startLocalization: (id) => {
-    const robot = get().robots[id];
-    setRobotArchitectureProfile(robot, 'pc_slam');
-    const matcher = new ScanMatcher();
-    set((state) => ({
-      localizationActive: { ...state.localizationActive, [id]: true },
-      mappingActive: { ...state.mappingActive, [id]: false }, // Tắt mapping nếu đang bật
-      scanMatchers: { ...state.scanMatchers, [id]: matcher },
-      mapToOdom: { ...state.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } }, // Reset TF
-    }));
-    console.log(`[Localization] Bắt đầu AMCL mode cho robot ${id}`);
-  },
-
-  stopLocalization: (id) => {
-    const robot = get().robots[id];
-    setRobotArchitectureProfile(robot, 'hybrid');
-    set((state) => ({
-      localizationActive: { ...state.localizationActive, [id]: false },
-    }));
-    console.log(`[Localization] Dừng AMCL mode cho robot ${id}`);
-  },
-
-  /**
-   * Lưu map ra JSON + download file
-   */
-  saveMap: (id) => {
-    const grid = get().mapperInstances[id];
-    if (!grid) {
-      console.warn('[Mapping] Không có map để lưu');
-      return null;
-    }
-
-    const json = grid.exportJSON();
-    const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `amr_map_${id}_${Date.now()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    console.log(`[Mapping] Đã lưu map: ${grid.scanCount} scans, ${grid.width}x${grid.height}`);
-    return json;
-  },
-
-  /**
-   * Load map từ JSON (vào occupancyGrid đang active)
-   */
-  loadMap: (id, jsonData) => {
-    try {
-      const grid = OccupancyGrid.importJSON(jsonData);
-      set((state) => ({
-        mapperInstances: { ...state.mapperInstances, [id]: grid },
-        occupancyGrid: { ...state.occupancyGrid, [id]: grid },
-        mappingActive: { ...state.mappingActive, [id]: false },
-      }));
-      console.log(`[Mapping] Đã load map: ${grid.scanCount} scans`);
-      return true;
-    } catch (err) {
-      console.error('[Mapping] Lỗi load map:', err);
-      return false;
-    }
-  },
-
-  // ============================================================
-  //   MAP MANAGEMENT ACTIONS
-  // ============================================================
-
-  /** Lấy danh sách map đã lưu */
-  getSavedMaps: () => get().savedMaps,
-
-  /** Xóa map theo ID */
-  deleteSavedMap: (mapId) => {
-    const maps = get().savedMaps.filter(m => m.id !== mapId);
-    set({ savedMaps: maps });
-    saveMapsToStorage(maps);
-    console.log(`[MapManager] Đã xóa map ${mapId}`);
-  },
-
-  /** Đổi tên map */
-  renameSavedMap: (mapId, newName) => {
-    const maps = get().savedMaps.map(m =>
-      m.id === mapId ? { ...m, name: newName } : m
-    );
-    set({ savedMaps: maps });
-    saveMapsToStorage(maps);
-  },
-
-  /** Load map từ danh sách đã lưu vào robot */
-  loadSavedMap: (mapId, robotId) => {
-    const mapEntry = get().savedMaps.find(m => m.id === mapId);
-    if (!mapEntry) return false;
-    return get().loadMap(robotId, mapEntry.data);
-  },
-
-  /** Export 1 map đã lưu ra file */
-  exportSavedMap: (mapId) => {
-    const mapEntry = get().savedMaps.find(m => m.id === mapId);
-    if (!mapEntry) return;
-    const blob = new Blob([JSON.stringify(mapEntry.data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${mapEntry.name.replace(/\s+/g, '_')}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  },
+  // Note: These actions are now managed entirely by mapStore.js
+  // We keep stubs for backwards compatibility if needed, 
+  // but components should use useMapStore directly.
 
   /** Import map từ JSON file vào danh sách */
   importMapFromJSON: (jsonData, name = null) => {
@@ -1292,6 +524,9 @@ const useRobotStore = create((set, get) => ({
     const mux = new VelocityMux();
     mux.onVelocityChanged = (linear, angular, source) => {
       // Route velocity vào SimEngine thay vì WebSocket
+      if (linear !== 0 || angular !== 0) {
+        console.log(`[SimMux] v=${linear.toFixed(3)} w=${angular.toFixed(3)} src=${source} running=${engine.running}`);
+      }
       engine.setVelocity(linear, angular);
     };
     const muxTimer = setInterval(() => mux.tick(), 200);
@@ -1303,88 +538,61 @@ const useRobotStore = create((set, get) => ({
       if (!engine.running) return;
       const telem = engine.telemetry;
       if (!telem) return;
+      
+      const now = Date.now();
 
       // Transient update (cho Canvas/3D)
       const currentState = get();
       if (!currentState.transientRobots) currentState.transientRobots = {};
       currentState.transientRobots[id] = telem;
 
-      // === LIDAR MAPPING: Giống robot thật ===
-      const isMapping = currentState.mappingActive[id];
-      const isLocalizing = currentState.localizationActive?.[id];
-      const now = Date.now();
+      // === LIDAR MAPPING: Delegate to mapStore ===
+      try {
+        useMapStore.getState().processLidarTick(id, telem, now, () => get());
+      } catch(e) {}
 
-      if ((isMapping || isLocalizing) && currentState.mapperInstances[id]) {
-        const grid = currentState.mapperInstances[id];
-        const lidarPts = telem.lidar || [];
-        if (lidarPts.length > 0) {
-          const odomX = telem.x ?? 0;
-          const odomY = telem.y ?? 0;
-          const odomTheta = telem.headingRad ?? 0;
-
-          const tf = currentState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
-          let mapX = odomX + tf.dx;
-          let mapY = odomY + tf.dy;
-          let mapTheta = odomTheta + tf.dTheta;
-
-          // Scan Matching
-          if (navWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !currentState.isMatching[id]) {
-            set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
-            navWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
-              const freshState = get();
-              set((s) => ({
-                robots: {
-                  ...s.robots,
-                  [id]: {
-                    ...s.robots[id],
-                    telemetry: {
-                      ...s.robots[id]?.telemetry,
-                      matchScore: matched.score
-                    }
-                  }
-                }
-              }));
-              if (matched.corrected) {
-                const c = matched.correction;
-                const freshTf = freshState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
-                set((s) => ({
-                  mapToOdom: { ...s.mapToOdom, [id]: {
-                    dx: freshTf.dx + c.dx,
-                    dy: freshTf.dy + c.dy,
-                    dTheta: freshTf.dTheta + c.dTheta,
-                  }},
-                  isMatching: { ...s.isMatching, [id]: false }
-                }));
-              } else {
-                set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
-              }
-            }).catch(e => {
-              set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
-            });
-          }
-
-          // Update grid (chỉ khi mapping)
-          if (isMapping) {
-            grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
-          }
-
-          // Throttle occupancyGrid update to 2Hz
-          if (!currentState._lastGridUpdate || now - currentState._lastGridUpdate > 500) {
-            currentState._lastGridUpdate = now;
-            set((s) => ({ occupancyGrid: { ...s.occupancyGrid, [id]: grid } }));
-          }
-        }
+      // Delegate nav tick to navStore
+      let appNavOverlay = null;
+      const navState = getNavStoreState();
+      if (navState.appNavigationSessions?.[id]?.active) {
+        appNavOverlay = navState.processNavigationTick(id, telem, now);
       }
 
-      // App Navigation tick
-      const appNavOverlay = currentState.appNavigationSessions?.[id]?.active
-        ? get().processNavigationTick(id, telem, now)
-        : null;
+      let effectiveTelem = appNavOverlay ? { ...telem, ...appNavOverlay } : telem;
+      if (appNavOverlay) {
+        telem.nav = effectiveTelem.nav;
+        telem.nav_wp = effectiveTelem.nav_wp;
+        telem.nav_total = effectiveTelem.nav_total;
+      } else if (telem.nav && telem.nav !== 'IDLE' && !navState.appNavigationSessions?.[id]?.active) {
+        // Session đã kết thúc nhưng telem vẫn giữ status cũ → reset về IDLE
+        telem.nav = 'IDLE';
+        telem.nav_wp = 0;
+        telem.nav_total = 0;
+        effectiveTelem.nav = 'IDLE';
+      }
+
+      // Sync Navigation Status with Task System (SimBot — mirror of real robot logic)
+      if (effectiveTelem.nav === 'ERROR' || effectiveTelem.nav === 'DONE' || effectiveTelem.nav === 'PAUSED') {
+        import('./taskStore.js').then(module => {
+          const useTaskStore = module.default;
+          const taskState = useTaskStore.getState();
+          const activeTasks = taskState.tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId === id && !t.dbUpdated);
+          
+          if (activeTasks.length > 0) {
+            const taskId = activeTasks[0].id;
+            if (effectiveTelem.nav === 'PAUSED') {
+              taskState.pauseTask(taskId, 'Robot tạm dừng hoặc kẹt vật cản');
+            } else {
+              taskState.processTaskCompletion(taskId, effectiveTelem.nav, 'Robot hoàn thành hoặc lỗi điều hướng');
+            }
+          }
+        });
+      }
 
       // Throttle UI update to ~2Hz
       if (now - lastUIUpdate > 500) {
         lastUIUpdate = now;
-        const effectiveTelem = appNavOverlay ? { ...telem, ...appNavOverlay } : telem;
+        const info = engine.getSimInfo();
         set((s) => {
           if (!s.robots[id]) return s;
           return {
@@ -1394,10 +602,12 @@ const useRobotStore = create((set, get) => ({
             },
             simInfo: {
               ...s.simInfo,
-              [id]: engine.getSimInfo(),
+              [id]: info,
             },
           };
         });
+        // Sync to simStore for SimControlPanel
+        useSimStore.getState().updateSimInfo(id, info);
       }
     }, 100);
 
@@ -1442,6 +652,40 @@ const useRobotStore = create((set, get) => ({
     // Start physics simulation
     engine.start();
 
+    // Tạo bản đồ kho hàng tự động từ world segments (không cần LiDAR quét)
+    const segments = engine.getWorldSegments();
+    const mapLoaded = useMapStore.getState().generateSimMap(id, segments);
+    if (!mapLoaded) {
+      // Fallback: thử load map đã lưu nếu không tạo được từ segments
+      useMapStore.getState().autoLoadLatestMap(id);
+    }
+
+    // CRITICAL: Register engine in simStore so SimControlPanel can control Play/Pause.
+    // Without this, toggleSimPause operates on an empty simStore.simEngines → robot stays PAUSED.
+    useSimStore.getState().registerSimEngine(id, engine);
+
+    // AUTO-CREATE MAP: Initialize OccupancyGrid immediately so navigation
+    // always has a grid available for pathfinding and DWA obstacle avoidance.
+    // Without this, navigateToGoal falls back to straight-line waypoints.
+    // NOTE: We don't call startMapping() because that also starts auto-exploration
+    // which would conflict with user's manual navigation. We only create the grid
+    // and set mappingActive so processLidarTick can populate it.
+    try {
+      const mapState = useMapStore.getState();
+      const grid = new OccupancyGrid(200, 200, 0.1, spawnX, spawnY);
+      mapState.updateOccupancyGrid(id, grid);
+      // Set mappingActive and mapperInstances directly via setState
+      useMapStore.setState((s) => ({
+        mappingActive: { ...s.mappingActive, [id]: true },
+        mapperInstances: { ...s.mapperInstances, [id]: grid },
+        occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+        mapToOdom: { ...s.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } },
+      }));
+      console.log(`[GazeboTDTU] 🗺️ Auto-created map for SimBot "${name}" — passive mapping enabled`);
+    } catch (e) {
+      console.warn('[GazeboTDTU] Failed to auto-create map:', e);
+    }
+
     console.log(`[GazeboTDTU] 🤖 SimBot "${name}" spawned at (${spawnX}, ${spawnY}) — Physics running at 50Hz`);
     return id;
   },
@@ -1454,6 +698,9 @@ const useRobotStore = create((set, get) => ({
     const robot = get().robots[id];
     if (engine) engine.stop();
     if (robot?._timers) robot._timers.forEach(t => clearInterval(t));
+
+    // Unregister from simStore
+    useSimStore.getState().unregisterSimEngine(id);
 
     set((s) => {
       const { [id]: _e, ...restEngines } = s.simEngines;
@@ -1544,66 +791,16 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
-  // ============================================================
-  //   DWA TUNING ACTIONS (Phase 3)
-  // ============================================================
-
-  /**
-   * Cập nhật một hoặc nhiều thông số DWA
-   * @param {object} partial - { maxSpeedTrans: 0.5, clearanceBias: 15, ... }
-   */
-  setDWAConfig: (partial) => {
-    set((s) => {
-      const merged = { ...s.dwaConfig, ...partial };
-      localStorage.setItem(DWA_CONFIG_KEY, JSON.stringify(merged));
-      return { dwaConfig: merged, dwaActivePreset: 'custom' };
-    });
-  },
-
-  /**
-   * Reset DWA config về giá trị mặc định
-   */
-  resetDWAConfig: () => {
-    localStorage.removeItem(DWA_CONFIG_KEY);
-    set({ dwaConfig: { ...DWA_DEFAULTS }, dwaActivePreset: 'balanced' });
-  },
-
-  /**
-   * Tải một preset DWA (cautious | balanced | aggressive | custom)
-   */
-  loadDWAPreset: (name) => {
-    const state = get();
-    const preset = DWA_PRESETS[name] || state.dwaCustomPresets[name];
-    if (!preset) {
-      console.warn(`[DWA] Unknown preset: ${name}`);
-      return;
-    }
-    const config = { ...DWA_DEFAULTS, ...preset };
-    localStorage.setItem(DWA_CONFIG_KEY, JSON.stringify(config));
-    set({ dwaConfig: config, dwaActivePreset: name });
-  },
-
-  /**
-   * Lưu config hiện tại thành custom preset
-   */
-  saveDWAPreset: (name) => {
-    const state = get();
-    const updated = { ...state.dwaCustomPresets, [name]: { ...state.dwaConfig } };
-    localStorage.setItem(DWA_PRESETS_KEY, JSON.stringify(updated));
-    set({ dwaCustomPresets: updated, dwaActivePreset: name });
-  },
-
-  /**
-   * Xoá custom preset
-   */
-  deleteDWAPreset: (name) => {
-    const state = get();
-    const updated = { ...state.dwaCustomPresets };
-    delete updated[name];
-    localStorage.setItem(DWA_PRESETS_KEY, JSON.stringify(updated));
-    set({ dwaCustomPresets: updated });
-  },
+  // ── DWA actions delegated to dwaStore.js ──
+  setDWAConfig: (p) => { try { useDWAStore.getState().setDWAConfig(p); } catch(e) {} },
+  resetDWAConfig: () => { try { useDWAStore.getState().resetDWAConfig(); } catch(e) {} },
+  loadDWAPreset: (n) => { try { useDWAStore.getState().loadDWAPreset(n); } catch(e) {} },
+  saveDWAPreset: (n) => { try { useDWAStore.getState().saveDWAPreset(n); } catch(e) {} },
+  deleteDWAPreset: (n) => { try { useDWAStore.getState().deleteDWAPreset(n); } catch(e) {} },
 }));
+
+// Register in store registry for cross-store access (navStore accesses this via registry)
+registerStore('robotStore', useRobotStore);
 
 export default useRobotStore;
 
@@ -1613,7 +810,9 @@ export default useRobotStore;
 //     import useDWAStore from '../stores/dwaStore';
 //     import useMapStore from '../stores/mapStore';
 //     import useSimStore from '../stores/simStore';
+//     import useNavStore from '../stores/navStore';
 // ============================================================
 export { default as useDWAStore } from './dwaStore.js';
 export { default as useMapStore } from './mapStore.js';
 export { default as useSimStore } from './simStore.js';
+export { default as useNavStore } from './navStore.js';

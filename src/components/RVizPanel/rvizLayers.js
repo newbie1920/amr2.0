@@ -112,40 +112,87 @@ export function drawGrid(ctx, w, h, viewport) {
 //   2. OCCUPANCY MAP
 // ============================================================
 
+// Cache for occupancy map offscreen canvas
+let _occMapCache = { scanCount: -1, width: 0, height: 0, canvas: null, lastUpdate: 0 };
+
+function _renderOccMapCanvas(grid) {
+  const w = grid.width;
+  const h = grid.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.createImageData(w, h);
+  const data = imgData.data;
+
+  for (let gy = 0; gy < h; gy++) {
+    for (let gx = 0; gx < w; gx++) {
+      const lo = grid.logOdds[gy * w + gx];
+      if (lo > -0.3 && lo < 0.3) continue; // Unknown
+
+      // Flip Y
+      const canvasRow = h - 1 - gy;
+      const pxIdx = (canvasRow * w + gx) * 4;
+
+      if (lo > 0.5) {
+        // Occupied — red with intensity
+        const intensity = Math.min(1.0, (lo - 0.5) / 3.5);
+        const alpha = Math.round((0.4 + 0.6 * intensity) * 255);
+        data[pxIdx]     = 239;
+        data[pxIdx + 1] = 68;
+        data[pxIdx + 2] = 68;
+        data[pxIdx + 3] = alpha;
+      } else if (lo < -0.5) {
+        // Free — dark gray
+        data[pxIdx]     = 20;
+        data[pxIdx + 1] = 24;
+        data[pxIdx + 2] = 30;
+        data[pxIdx + 3] = 120;
+      }
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+
 export function drawOccupancyMap(ctx, w, h, viewport, grid) {
   if (!grid || !grid.logOdds) return;
 
   const { worldToScreen, scale } = viewport;
   const cellPx = grid.resolution * scale;
-  
-  // Skip if cells too small to see
-  if (cellPx < 1) return;
+  if (cellPx < 0.5) return; // Too zoomed out
 
-  for (let gy = 0; gy < grid.height; gy++) {
-    for (let gx = 0; gx < grid.width; gx++) {
-      const lo = grid.logOdds[gy * grid.width + gx];
-      
-      // Skip unknown cells
-      if (lo > -0.3 && lo < 0.3) continue;
-
-      const worldX = grid.originX + gx * grid.resolution;
-      const worldY = grid.originY + gy * grid.resolution;
-      const s = worldToScreen(worldX, worldY + grid.resolution);
-
-      if (lo > 0.5) {
-        // Occupied — red with intensity
-        const intensity = Math.min(1.0, (lo - 0.5) / 3.5);
-        ctx.fillStyle = `rgba(239, 68, 68, ${0.4 + 0.6 * intensity})`;
-      } else if (lo < -0.5) {
-        // Free — dark gray
-        ctx.fillStyle = COLORS.free;
-      } else {
-        continue;
-      }
-
-      ctx.fillRect(s.x, s.y, cellPx + 0.5, cellPx + 0.5);
-    }
+  // Cache: re-render when grid changes
+  const sc = grid.scanCount || 0;
+  const lu = grid.lastUpdate || 0;
+  if (
+    _occMapCache.scanCount !== sc ||
+    _occMapCache.width !== grid.width ||
+    _occMapCache.height !== grid.height ||
+    _occMapCache.lastUpdate !== lu
+  ) {
+    _occMapCache.canvas = _renderOccMapCanvas(grid);
+    _occMapCache.scanCount = sc;
+    _occMapCache.width = grid.width;
+    _occMapCache.height = grid.height;
+    _occMapCache.lastUpdate = lu;
   }
+
+  if (!_occMapCache.canvas) return;
+
+  const topLeftWorld = {
+    x: grid.originX,
+    y: grid.originY + grid.height * grid.resolution,
+  };
+  const s = worldToScreen(topLeftWorld.x, topLeftWorld.y);
+  const pixW = grid.width * grid.resolution * scale;
+  const pixH = grid.height * grid.resolution * scale;
+
+  const prevSmooth = ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(_occMapCache.canvas, s.x, s.y, pixW, pixH);
+  ctx.imageSmoothingEnabled = prevSmooth;
 }
 
 // ============================================================
@@ -261,7 +308,27 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
   const { worldToScreen, scale } = viewport;
   const rScreen = worldToScreen(robotX, robotY);
 
-  // Laser rays (sparse — every 10th ray)
+  // 1. FoV Area (vùng rẻ quạt màu vàng nhạt)
+  ctx.fillStyle = 'rgba(250, 204, 21, 0.08)'; // Vàng nhạt
+  ctx.beginPath();
+  ctx.moveTo(rScreen.x, rScreen.y);
+  
+  // Sắp xếp góc để vẽ polygon liên tục
+  const sortedPts = [...lidarPts].sort((a, b) => a.a - b.a);
+  for (const pt of sortedPts) {
+    const distM = pt.d / 1000.0;
+    if (distM < 0.05 || distM > 8.0) continue;
+
+    const worldAngle = robotTheta + (pt.a * Math.PI) / 180;
+    const hx = robotX + Math.cos(worldAngle) * distM;
+    const hy = robotY + Math.sin(worldAngle) * distM;
+    const hScreen = worldToScreen(hx, hy);
+    ctx.lineTo(hScreen.x, hScreen.y);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // 2. Laser rays (sparse — every 10th ray)
   ctx.strokeStyle = COLORS.laserRay;
   ctx.lineWidth = 0.5;
   ctx.beginPath();
@@ -301,7 +368,7 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
 //   7. ROBOT POSE
 // ============================================================
 
-export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, robotRadius = 0.12) {
+export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, robotRadius = 0.12, linearVel = 0, odomTheta = null) {
   const { worldToScreen, scale } = viewport;
   const s = worldToScreen(robotX, robotY);
   const rPx = robotRadius * scale;
@@ -311,26 +378,57 @@ export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, r
   ctx.arc(s.x, s.y, rPx, 0, Math.PI * 2);
   ctx.fillStyle = COLORS.robotFill;
   ctx.fill();
-  ctx.strokeStyle = COLORS.robot;
+  ctx.strokeStyle = COLORS.robot; // green viền robot
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  // Heading arrow
-  // In screen space: world theta → screen angle (flip Y)
+  // Chiều dài mũi tên tỷ lệ thuận với vận tốc tức thời (tối thiểu = 1.8 * rPx)
+  const speedScale = Math.max(0, Math.min(1.5, Math.abs(linearVel))); // Clamp để không dài quá
+  const arrowLen = rPx * 1.8 + (speedScale * scale * 0.4);
+
+  // 1. Mũi tên Odometry (xanh dương lớn)
+  if (odomTheta !== null && odomTheta !== undefined) {
+    const odomScreenAngle = -odomTheta; // Y is flipped
+    const odomArrowX = s.x + Math.cos(odomScreenAngle) * arrowLen;
+    const odomArrowY = s.y + Math.sin(odomScreenAngle) * arrowLen;
+
+    ctx.strokeStyle = '#3b82f6'; // Xanh dương (blue-500)
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y);
+    ctx.lineTo(odomArrowX, odomArrowY);
+    ctx.stroke();
+
+    const headLen = 8;
+    const headAngle = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(odomArrowX, odomArrowY);
+    ctx.lineTo(
+      odomArrowX - headLen * Math.cos(odomScreenAngle - headAngle),
+      odomArrowY - headLen * Math.sin(odomScreenAngle - headAngle)
+    );
+    ctx.moveTo(odomArrowX, odomArrowY);
+    ctx.lineTo(
+      odomArrowX - headLen * Math.cos(odomScreenAngle + headAngle),
+      odomArrowY - headLen * Math.sin(odomScreenAngle + headAngle)
+    );
+    ctx.stroke();
+  }
+
+  // 2. Mũi tên Heading Corrected/Filtered (đỏ lớn)
   const screenAngle = -robotTheta; // Y is flipped
-  const arrowLen = rPx * 1.8;
   const arrowX = s.x + Math.cos(screenAngle) * arrowLen;
   const arrowY = s.y + Math.sin(screenAngle) * arrowLen;
 
-  ctx.strokeStyle = COLORS.robot;
-  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = '#ef4444'; // Đỏ (red-500)
+  ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(s.x, s.y);
   ctx.lineTo(arrowX, arrowY);
   ctx.stroke();
 
   // Arrowhead
-  const headLen = 6;
+  const headLen = 8;
   const headAngle = 0.5;
   ctx.beginPath();
   ctx.moveTo(arrowX, arrowY);
@@ -577,59 +675,125 @@ export function drawMeasureLine(ctx, viewport, p1, p2) {
 
 // ============================================================
 //   NAV2-STYLE COSTMAP (Inflation Gradient)
-//   Pink-Purple-Cyan gradient giống RViz2 Nav2
+//   Magenta-Cyan-Pink gradient giống RViz2 Nav2
+//   Uses offscreen canvas caching for performance
 // ============================================================
+
+// Pre-compute Nav2-exact color LUT (RGBA bytes)
+const _NAV2_COSTMAP_LUT = (() => {
+  const lut = [];
+  for (let i = 0; i < 256; i++) {
+    if (i === 0) {
+      lut.push(null); // Free — transparent
+      continue;
+    }
+    let r, g, b, a;
+    if (i >= 253) {
+      // LETHAL — dark purple/black (obstacle cell itself)
+      r = 100; g = 0; b = 50; a = 240;
+    } else if (i >= 200) {
+      // INSCRIBED — hot magenta/pink (robot WILL collide)
+      const t = (i - 200) / 53;
+      r = 255; g = Math.round(20 * (1 - t)); b = Math.round(100 + 60 * t); a = 210;
+    } else if (i >= 128) {
+      // HIGH INFLATION — magenta → deep pink
+      const t = (i - 128) / 72;
+      r = Math.round(180 + 75 * t); g = Math.round(30 * (1 - t)); b = Math.round(180 + 30 * t); a = Math.round(130 + 70 * t);
+    } else if (i >= 50) {
+      // MID INFLATION — cyan → magenta (the most visible gradient band)
+      const t = (i - 50) / 78;
+      r = Math.round(t * 180); g = Math.round(220 * (1 - t * 0.85)); b = Math.round(255 - 55 * t); a = Math.round(70 + 60 * t);
+    } else {
+      // LOW INFLATION — light cyan, semi-transparent
+      const t = i / 50;
+      r = 0; g = Math.round(180 + 40 * t); b = 255; a = Math.round(20 + 50 * t);
+    }
+    lut.push([r, g, b, a]);
+  }
+  return lut;
+})();
+
+// Cache key for offscreen canvas
+let _costmapCache = { scanCount: -1, width: 0, height: 0, canvas: null, lastRenderTime: 0, lastUpdate: 0 };
+
+function _renderCostmapCanvas(grid) {
+  const w = grid.width;
+  const h = grid.height;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.createImageData(w, h);
+  const data = imgData.data;
+
+  for (let gy = 0; gy < h; gy++) {
+    for (let gx = 0; gx < w; gx++) {
+      const cost = grid.costmap[gy * w + gx];
+      if (cost === 0) continue;
+
+      const rgba = _NAV2_COSTMAP_LUT[Math.min(cost, 254)];
+      if (!rgba) continue;
+
+      // Flip Y: canvas row 0 is top, but grid row 0 is bottom
+      const canvasRow = h - 1 - gy;
+      const pxIdx = (canvasRow * w + gx) * 4;
+      data[pxIdx]     = rgba[0];
+      data[pxIdx + 1] = rgba[1];
+      data[pxIdx + 2] = rgba[2];
+      data[pxIdx + 3] = rgba[3];
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
 
 export function drawCostmapNav2(ctx, w, h, viewport, grid) {
   if (!grid || !grid.costmap) return;
 
   const { worldToScreen, scale } = viewport;
   const cellPx = grid.resolution * scale;
-  if (cellPx < 1.5) return; // Skip at extreme zoom out
+  if (cellPx < 0.5) return; // Too zoomed out
 
-  // Pre-compute color lookup table (0-254)
-  if (!drawCostmapNav2._lut) {
-    const lut = new Array(255);
-    for (let i = 0; i < 255; i++) {
-      if (i === 0) {
-        lut[i] = null; // Free — transparent
-      } else if (i >= 253) {
-        // Lethal — solid dark red/black
-        lut[i] = 'rgba(139, 0, 0, 0.85)';
-      } else if (i >= 200) {
-        // Inscribed — hot pink
-        lut[i] = 'rgba(255, 0, 127, 0.7)';
-      } else {
-        // Inflation gradient: purple → cyan → light blue
-        const t = i / 200; // 0 → 1
-        const r = Math.round(180 * t);           // 0 → 180
-        const g = Math.round(50 + 100 * (1 - t));  // 150 → 50
-        const b = Math.round(220 + 35 * (1 - t));  // 255 → 220
-        const a = (0.08 + 0.45 * t).toFixed(2);
-        lut[i] = `rgba(${r}, ${g}, ${b}, ${a})`;
-      }
-    }
-    drawCostmapNav2._lut = lut;
+  // Cache: re-render offscreen canvas when grid data changes
+  // Invalidate on: scanCount change, grid resize, grid._dirty flag,
+  // or grid.lastUpdate timestamp change (catches inflateObstacles/load)
+  const sc = grid.scanCount || 0;
+  const lu = grid.lastUpdate || 0;
+  const now = Date.now();
+  const needsRedraw =
+    _costmapCache.scanCount !== sc ||
+    _costmapCache.width !== grid.width ||
+    _costmapCache.height !== grid.height ||
+    _costmapCache.lastUpdate !== lu ||
+    (grid._dirty && now - _costmapCache.lastRenderTime > 400);
+
+  if (needsRedraw) {
+    _costmapCache.canvas = _renderCostmapCanvas(grid);
+    _costmapCache.scanCount = sc;
+    _costmapCache.width = grid.width;
+    _costmapCache.height = grid.height;
+    _costmapCache.lastUpdate = lu;
+    _costmapCache.lastRenderTime = now;
   }
-  const lut = drawCostmapNav2._lut;
 
-  for (let gy = 0; gy < grid.height; gy++) {
-    for (let gx = 0; gx < grid.width; gx++) {
-      const idx = gy * grid.width + gx;
-      const cost = grid.costmap[idx];
-      if (cost === 0) continue;
+  if (!_costmapCache.canvas) return;
 
-      const color = lut[Math.min(cost, 254)];
-      if (!color) continue;
+  // Draw cached texture scaled to viewport
+  // Grid origin is bottom-left in world, canvas origin is top-left
+  const topLeftWorld = {
+    x: grid.originX,
+    y: grid.originY + grid.height * grid.resolution,
+  };
+  const s = worldToScreen(topLeftWorld.x, topLeftWorld.y);
+  const pixW = grid.width * grid.resolution * scale;
+  const pixH = grid.height * grid.resolution * scale;
 
-      const worldX = grid.originX + gx * grid.resolution;
-      const worldY = grid.originY + gy * grid.resolution;
-      const s = worldToScreen(worldX, worldY + grid.resolution);
-
-      ctx.fillStyle = color;
-      ctx.fillRect(s.x, s.y, cellPx + 0.5, cellPx + 0.5);
-    }
-  }
+  // Use imageSmoothingEnabled=false for crisp pixels
+  const prevSmooth = ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(_costmapCache.canvas, s.x, s.y, pixW, pixH);
+  ctx.imageSmoothingEnabled = prevSmooth;
 }
 
 // ============================================================
@@ -734,4 +898,295 @@ export function drawNavStatus(ctx, w, h, session) {
   ctx.fillRect(barX, barY, barW, barH);
   ctx.fillStyle = color;
   ctx.fillRect(barX, barY, barW * (progress / 100), barH);
+}
+
+// ============================================================
+//   ROBOT FOOTPRINT (Nav2 inscribed radius circle)
+// ============================================================
+
+export function drawRobotFootprint(ctx, viewport, robotX, robotY, robotRadius = 0.22) {
+  const { worldToScreen, scale } = viewport;
+  const s = worldToScreen(robotX, robotY);
+  const rPx = robotRadius * scale;
+
+  // Inscribed collision circle — dashed cyan
+  ctx.strokeStyle = 'rgba(6, 182, 212, 0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, rPx, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Fill with subtle cyan
+  ctx.fillStyle = 'rgba(6, 182, 212, 0.06)';
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, rPx, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Preferred clearance ring — outer dashed yellow
+  const clearancePx = 0.45 * scale; // preferredClearance
+  ctx.strokeStyle = 'rgba(250, 204, 21, 0.2)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 4]);
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, clearancePx, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ============================================================
+//   LOCAL COSTMAP WINDOW (highlight around robot)
+// ============================================================
+
+export function drawLocalCostmapWindow(ctx, viewport, robotX, robotY, windowSize = 3.0) {
+  const { worldToScreen, scale } = viewport;
+  const half = windowSize / 2;
+  const tl = worldToScreen(robotX - half, robotY + half);
+  const br = worldToScreen(robotX + half, robotY - half);
+  const w = br.x - tl.x;
+  const h = br.y - tl.y;
+
+  // Dashed cyan border
+  ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.roundRect(tl.x, tl.y, w, h, 4);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Corner labels
+  ctx.fillStyle = 'rgba(6, 182, 212, 0.4)';
+  ctx.font = '8px Inter, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('local_costmap', tl.x + 4, tl.y - 3);
+}
+
+// ============================================================
+//   DWA TRAJECTORY PREVIEW (chosen path preview)
+// ============================================================
+
+export function drawDWATrajectory(ctx, viewport, trajectory) {
+  if (!trajectory || trajectory.length < 2) return;
+
+  const { worldToScreen } = viewport;
+  const t = Date.now() / 1000;
+
+  // Gradient from green (near) → cyan (far)
+  const pts = trajectory.map(p => worldToScreen(p.x, p.y));
+
+  // Glow effect
+  ctx.strokeStyle = 'rgba(34, 197, 94, 0.15)';
+  ctx.lineWidth = 8;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    ctx.lineTo(pts[i].x, pts[i].y);
+  }
+  ctx.stroke();
+
+  // Main trajectory line — animated dash
+  ctx.strokeStyle = '#22c55e';
+  ctx.lineWidth = 2.5;
+  ctx.setLineDash([6, 4]);
+  ctx.lineDashOffset = -t * 30; // Animated marching ants
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    ctx.lineTo(pts[i].x, pts[i].y);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
+
+  // Endpoint dot — where robot will be
+  const last = pts[pts.length - 1];
+  ctx.fillStyle = 'rgba(34, 197, 94, 0.7)';
+  ctx.beginPath();
+  ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ============================================================
+//   ANIMATED PATH (gradient + marching ants)
+// ============================================================
+
+export function drawAnimatedPath(ctx, w, h, viewport, path, robotX, robotY) {
+  if (!path || path.length < 2) return;
+
+  const { worldToScreen } = viewport;
+  const t = Date.now() / 1000;
+
+  // Convert to screen coords
+  const pts = path.map(p => worldToScreen(p.x, p.y));
+
+  // --- 1) Glow background ---
+  ctx.strokeStyle = 'rgba(59, 130, 246, 0.1)';
+  ctx.lineWidth = 10;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+
+  // --- 2) Gradient path segments ---
+  for (let i = 0; i < pts.length - 1; i++) {
+    const progress = i / (pts.length - 1);
+    // Green near robot → Blue → Purple at goal
+    const r = Math.round(59 + 100 * progress);
+    const g = Math.round(200 - 130 * progress);
+    const b = Math.round(130 + 116 * progress);
+    const alpha = 0.6 + 0.3 * Math.sin(t * 2 + i * 0.5);
+
+    ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(pts[i].x, pts[i].y);
+    ctx.lineTo(pts[i + 1].x, pts[i + 1].y);
+    ctx.stroke();
+  }
+
+  // --- 3) Marching ants overlay ---
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 8]);
+  ctx.lineDashOffset = -t * 40;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
+
+  // --- 4) Waypoint dots ---
+  for (let i = 0; i < pts.length; i++) {
+    const progress = i / (pts.length - 1);
+    const dotR = 2 + progress * 2;
+    ctx.fillStyle = `rgba(${Math.round(59 + 100 * progress)}, ${Math.round(200 - 130 * progress)}, ${Math.round(130 + 116 * progress)}, 0.8)`;
+    ctx.beginPath();
+    ctx.arc(pts[i].x, pts[i].y, dotR, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ============================================================
+//   GOAL POSE ARROW (Nav2-style large arrow at goal)
+// ============================================================
+
+export function drawGoalPoseArrow(ctx, viewport, goal, robotX, robotY) {
+  if (!goal) return;
+
+  const { worldToScreen, scale } = viewport;
+  const s = worldToScreen(goal.x, goal.y);
+  const t = Date.now() / 1000;
+
+  // Compute heading from robot to goal for the arrow direction
+  const heading = Math.atan2(goal.y - robotY, goal.x - robotX);
+  const screenAngle = -heading; // Flip Y for screen
+
+  // Animated pulse ring
+  const pulseR = 14 + 5 * Math.sin(t * 2.5);
+  ctx.strokeStyle = `rgba(168, 85, 247, ${0.2 + 0.15 * Math.sin(t * 2.5)})`;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, pulseR, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Outer ring — purple/magenta
+  ctx.strokeStyle = '#a855f7';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, 12, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Inner fill
+  ctx.fillStyle = 'rgba(168, 85, 247, 0.25)';
+  ctx.beginPath();
+  ctx.arc(s.x, s.y, 12, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Large directional arrow
+  const arrowLen = 24;
+  const arrowTipX = s.x + Math.cos(screenAngle) * arrowLen;
+  const arrowTipY = s.y + Math.sin(screenAngle) * arrowLen;
+
+  ctx.strokeStyle = '#a855f7';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(s.x, s.y);
+  ctx.lineTo(arrowTipX, arrowTipY);
+  ctx.stroke();
+
+  // Arrowhead (filled triangle)
+  const headLen = 10;
+  const headAngle = 0.45;
+  ctx.fillStyle = '#a855f7';
+  ctx.beginPath();
+  ctx.moveTo(arrowTipX, arrowTipY);
+  ctx.lineTo(
+    arrowTipX - headLen * Math.cos(screenAngle - headAngle),
+    arrowTipY - headLen * Math.sin(screenAngle - headAngle)
+  );
+  ctx.lineTo(
+    arrowTipX - headLen * Math.cos(screenAngle + headAngle),
+    arrowTipY - headLen * Math.sin(screenAngle + headAngle)
+  );
+  ctx.closePath();
+  ctx.fill();
+
+  // Crosshair
+  ctx.strokeStyle = 'rgba(168, 85, 247, 0.6)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(s.x - 18, s.y); ctx.lineTo(s.x - 6, s.y);
+  ctx.moveTo(s.x + 6, s.y);  ctx.lineTo(s.x + 18, s.y);
+  ctx.moveTo(s.x, s.y - 18); ctx.lineTo(s.x, s.y - 6);
+  ctx.moveTo(s.x, s.y + 6);  ctx.lineTo(s.x, s.y + 18);
+  ctx.stroke();
+
+  // Label
+  ctx.fillStyle = '#c084fc';
+  ctx.font = 'bold 10px Inter, monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`🎯 Goal (${goal.x.toFixed(1)}, ${goal.y.toFixed(1)})`, s.x, s.y + 28);
+}
+
+// ============================================================
+//   ROBOT TRAIL (breadcrumb history)
+// ============================================================
+
+export function drawRobotTrail(ctx, viewport, trail) {
+  if (!trail || trail.length < 2) return;
+
+  const { worldToScreen } = viewport;
+
+  // Trail line — fading gradient
+  for (let i = 1; i < trail.length; i++) {
+    const progress = i / trail.length;
+    const alpha = progress * 0.4; // Recent = brighter
+    const s1 = worldToScreen(trail[i - 1].x, trail[i - 1].y);
+    const s2 = worldToScreen(trail[i].x, trail[i].y);
+
+    ctx.strokeStyle = `rgba(250, 204, 21, ${alpha})`;
+    ctx.lineWidth = 1 + progress;
+    ctx.beginPath();
+    ctx.moveTo(s1.x, s1.y);
+    ctx.lineTo(s2.x, s2.y);
+    ctx.stroke();
+  }
+
+  // Trail dots — every 5th point
+  for (let i = 0; i < trail.length; i += 5) {
+    const progress = i / trail.length;
+    const alpha = 0.1 + progress * 0.5;
+    const s = worldToScreen(trail[i].x, trail[i].y);
+    ctx.fillStyle = `rgba(250, 204, 21, ${alpha})`;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }

@@ -28,10 +28,12 @@ const EXPAND_MARGIN = 8;
 /** Số cells mở rộng thêm mỗi lần */
 const EXPAND_AMOUNT = 30;
 
+import { ROBOT_RADIUS } from './warehouse.js';
+
 /** Articubot Nav2 inflation params */
 const COST_SCALING_FACTOR = 3.0;  // articubot: 3.0 — controls exponential decay
-const INSCRIBED_RADIUS = 0.22;    // articubot robot_radius: 0.22m
-const INFLATION_RADIUS_M = 0.55;  // articubot: 0.55m
+const INSCRIBED_RADIUS = ROBOT_RADIUS; // 0.15m for 30x30cm robot
+const INFLATION_RADIUS_M = 0.75;  // Wider than articubot for better gradient visibility
 
 // ============================================================
 //   OCCUPANCY GRID DATA STRUCTURE
@@ -137,14 +139,24 @@ export class OccupancyGrid {
       const pt = lidarPoints[i];
       const distM = pt.d / 1000.0;
 
-      if (distM < MIN_LIDAR_RANGE_M || distM > MAX_LIDAR_RANGE_M) continue;
+      if (distM < MIN_LIDAR_RANGE_M) continue;
+
+      let isHit = true;
+      let traceDistM = distM;
+
+      // If the ray hits nothing or hits beyond our map's max range,
+      // we still want to trace free space up to the max range, but NOT mark an obstacle.
+      if (distM >= MAX_LIDAR_RANGE_M) {
+        isHit = false;
+        traceDistM = MAX_LIDAR_RANGE_M;
+      }
 
       const lidarRad = (pt.a * Math.PI) / 180.0;
       // World angle: same convention as simLidar (theta + localAngle)
       const worldAngle = robotHeading + lidarRad;
 
-      const endX = robotX + Math.cos(worldAngle) * distM;
-      const endY = robotY + Math.sin(worldAngle) * distM;
+      const endX = robotX + Math.cos(worldAngle) * traceDistM;
+      const endY = robotY + Math.sin(worldAngle) * traceDistM;
 
       const eg = this.worldToGrid(endX, endY);
 
@@ -152,7 +164,7 @@ export class OccupancyGrid {
       const endGX = Math.max(0, Math.min(this.width - 1, eg.gx));
       const endGY = Math.max(0, Math.min(this.height - 1, eg.gy));
 
-      this._bresenhamUpdate(robotGX, robotGY, endGX, endGY);
+      this._bresenhamUpdate(robotGX, robotGY, endGX, endGY, isHit);
     }
 
     this.scanCount++;
@@ -222,7 +234,7 @@ export class OccupancyGrid {
   //   BRESENHAM RAY TRACING + LOG-ODDS
   // ============================================================
 
-  _bresenhamUpdate(x0, y0, x1, y1) {
+  _bresenhamUpdate(x0, y0, x1, y1, isHit = true) {
     const dx = Math.abs(x1 - x0);
     const dy = Math.abs(y1 - y0);
     const sx = x0 < x1 ? 1 : -1;
@@ -232,7 +244,11 @@ export class OccupancyGrid {
 
     while (true) {
       if (x === x1 && y === y1) {
-        this._updateLogOdds(x, y, L_OCC);
+        if (isHit) {
+          this._updateLogOdds(x, y, L_OCC);
+        } else {
+          this._updateLogOdds(x, y, L_FREE);
+        }
         break;
       }
       this._updateLogOdds(x, y, L_FREE);
@@ -610,6 +626,11 @@ export class OccupancyGrid {
     }
 
     grid._syncDataFromLogOdds();
+
+    // Re-inflate costmap on load (since exportJSON only saves logOdds)
+    const inflCells = Math.ceil(INFLATION_RADIUS_M / grid.resolution);
+    grid.inflateObstacles(inflCells);
+
     grid.lastUpdate = json.timestamp || Date.now();
     grid._dirty = true;
     return grid;
@@ -651,6 +672,11 @@ export class OccupancyGrid {
     }
 
     grid._syncDataFromLogOdds();
+
+    // Re-inflate costmap on load
+    const inflCells = Math.ceil(INFLATION_RADIUS_M / grid.resolution);
+    grid.inflateObstacles(inflCells);
+
     grid._dirty = true;
     grid.lastUpdate = Date.now();
     return grid;
@@ -671,6 +697,101 @@ export class OccupancyGrid {
       logOdds: this.logOdds,
       costmap: this.costmap,
     };
+  }
+
+  /**
+   * Tạo OccupancyGrid từ danh sách wall segments (line segments).
+   * Dùng cho SIM mode — bản đồ kho hàng đã biết trước, không cần LiDAR quét.
+   * 
+   * @param {Array<{x1,y1,x2,y2}>} segments - Danh sách tường (world meters)
+   * @param {number} resolution - Cell size (meters), default 0.1
+   * @param {number} padding - Thêm padding xung quanh bounding box (meters)
+   * @returns {OccupancyGrid}
+   */
+  static createFromSegments(segments, resolution = 0.1, padding = 1.0) {
+    if (!segments || segments.length === 0) {
+      console.warn('[OccupancyGrid] createFromSegments: no segments provided');
+      return null;
+    }
+
+    // Find bounding box of all segments
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const seg of segments) {
+      minX = Math.min(minX, seg.x1, seg.x2);
+      minY = Math.min(minY, seg.y1, seg.y2);
+      maxX = Math.max(maxX, seg.x1, seg.x2);
+      maxY = Math.max(maxY, seg.y1, seg.y2);
+    }
+
+    // Add padding
+    minX -= padding;
+    minY -= padding;
+    maxX += padding;
+    maxY += padding;
+
+    const worldW = maxX - minX;
+    const worldH = maxY - minY;
+    const gridW = Math.ceil(worldW / resolution);
+    const gridH = Math.ceil(worldH / resolution);
+
+    // Create grid centered on bounding box
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+    const grid = new OccupancyGrid(gridW, gridH, resolution, centerX, centerY);
+    // Override origin to be at minX, minY
+    grid.originX = minX;
+    grid.originY = minY;
+    grid.worldWidth = gridW * resolution;
+    grid.worldHeight = gridH * resolution;
+
+    // Rasterize each segment using Bresenham + wall thickness
+    for (const seg of segments) {
+      const g0 = grid.worldToGrid(seg.x1, seg.y1);
+      const g1 = grid.worldToGrid(seg.x2, seg.y2);
+
+      // Bresenham line from g0 to g1
+      const dx = Math.abs(g1.gx - g0.gx);
+      const dy = Math.abs(g1.gy - g0.gy);
+      const sx = g0.gx < g1.gx ? 1 : -1;
+      const sy = g0.gy < g1.gy ? 1 : -1;
+      let err = dx - dy;
+      let x = g0.gx, y = g0.gy;
+
+      while (true) {
+        // Mark cell + neighbors for wall thickness (1 cell thick)
+        for (let ty = -1; ty <= 1; ty++) {
+          for (let tx = -1; tx <= 1; tx++) {
+            const cx = x + tx, cy = y + ty;
+            if (grid.inBounds(cx, cy)) {
+              const idx = cy * grid.width + cx;
+              grid.logOdds[idx] = L_MAX;
+            }
+          }
+        }
+        if (x === g1.gx && y === g1.gy) break;
+        const e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x += sx; }
+        if (e2 < dx) { err += dx; y += sy; }
+      }
+    }
+
+    // Mark all space NOT near walls as free
+    for (let i = 0; i < grid.logOdds.length; i++) {
+      if (grid.logOdds[i] < 0.1) {
+        grid.logOdds[i] = L_MIN; // Strongly free
+      }
+    }
+
+    grid._syncDataFromLogOdds();
+    grid.scanCount = 999; // Mark as "complete map"
+    grid._dirty = true;
+
+    // Inflate obstacles
+    const inflCells = Math.ceil(INFLATION_RADIUS_M / resolution);
+    grid.inflateObstacles(inflCells);
+
+    console.log(`[OccupancyGrid] Created from ${segments.length} segments → ${gridW}×${gridH} grid (${worldW.toFixed(1)}×${worldH.toFixed(1)}m)`);
+    return grid;
   }
 }
 

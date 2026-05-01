@@ -10,6 +10,7 @@ import { create } from 'zustand';
 import { OccupancyGrid } from '../core/lidarMapper.js';
 import { ScanMatcher } from '../core/scanMatcher.js';
 import { startExploration, stopExploration, getExplorationInfo } from '../core/exploration.js';
+import { navWorkerApi } from '../core/navWorkerSetup.js';
 
 const MAP_STORAGE_KEY = 'amr_saved_maps';
 
@@ -153,18 +154,65 @@ const useMapStore = create((set, get) => ({
   // ============================================================
 
   /**
-   * Apply SLAM results from Worker back to store
+   * Cập nhật Lidar SLAM (gọi từ telemetry callback)
    */
-  applySlamResult: (id, result) => {
-    if (result.corrected) {
-      set((s) => ({
-        mapToOdom: { ...s.mapToOdom, [id]: result.newTf },
-        isMatching: { ...s.isMatching, [id]: false },
-      }));
-    } else {
-      set((s) => ({
-        isMatching: { ...s.isMatching, [id]: false },
-      }));
+  processLidarTick: (id, telem, now, getRobotStore) => {
+    const state = get();
+    const isMapping = state.mappingActive[id];
+    const isLocalizing = state.localizationActive?.[id];
+
+    if ((isMapping || isLocalizing) && state.mapperInstances[id]) {
+      const grid = state.mapperInstances[id];
+      const lidarPts = telem.lidar || [];
+      if (lidarPts.length > 0) {
+        const headingDeg = telem.heading ?? 0;
+        const odomX = telem.x ?? 0;
+        const odomY = telem.y ?? 0;
+        const odomTheta = headingDeg * Math.PI / 180;
+
+        const tf = state.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
+        let mapX = odomX + tf.dx;
+        let mapY = odomY + tf.dy;
+        let mapTheta = odomTheta + tf.dTheta;
+        if (navWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
+          set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
+
+          navWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
+            const freshState = get();
+            
+            if (matched.corrected) {
+              const c = matched.correction;
+              const freshTf = freshState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
+              const newTf = {
+                dx: freshTf.dx + c.dx,
+                dy: freshTf.dy + c.dy,
+                dTheta: freshTf.dTheta + c.dTheta,
+              };
+
+              set((s) => ({
+                mapToOdom: { ...s.mapToOdom, [id]: newTf },
+                isMatching: { ...s.isMatching, [id]: false }
+              }));
+            } else {
+              set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
+            }
+          }).catch(e => {
+            console.error("[SLAM] Worker Error:", e);
+            set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
+          });
+        }
+
+        if (isMapping) {
+          grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
+        }
+
+        if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
+          set((s) => ({
+            _lastGridUpdate: now,
+            occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+          }));
+        }
+      }
     }
   },
 
@@ -241,6 +289,44 @@ const useMapStore = create((set, get) => ({
     const mapEntry = get().savedMaps.find(m => m.id === mapId);
     if (!mapEntry) return false;
     return get().loadMap(robotId, mapEntry.data);
+  },
+
+  /** Tự động load map mới nhất đã lưu cho robot */
+  autoLoadLatestMap: (robotId) => {
+    const maps = get().savedMaps;
+    if (!maps || maps.length === 0) return false;
+    
+    // Tìm map mới nhất (sort theo createdAt giảm dần)
+    const sortedMaps = [...maps].sort((a, b) => b.createdAt - a.createdAt);
+    const latestMap = sortedMaps[0];
+    
+    console.log(`[MapManager] Tự động load map mới nhất: "${latestMap.name}" cho robot ${robotId}`);
+    return get().loadMap(robotId, latestMap.data);
+  },
+
+  /**
+   * Tạo bản đồ tĩnh từ world segments (SIM mode).
+   * Không cần LiDAR quét — bản đồ kho hàng đã biết trước.
+   * @param {string} robotId 
+   * @param {Array<{x1,y1,x2,y2}>} segments - Wall segments từ SimEngine
+   */
+  generateSimMap: (robotId, segments) => {
+    if (!segments || segments.length === 0) {
+      console.warn('[MapManager] generateSimMap: no segments');
+      return false;
+    }
+    
+    const grid = OccupancyGrid.createFromSegments(segments, 0.1, 1.0);
+    if (!grid) return false;
+
+    set((state) => ({
+      mapperInstances: { ...state.mapperInstances, [robotId]: grid },
+      occupancyGrid: { ...state.occupancyGrid, [robotId]: grid },
+      mappingActive: { ...state.mappingActive, [robotId]: false },
+    }));
+
+    console.log(`[MapManager] ✅ Bản đồ kho hàng SIM đã sẵn sàng cho robot ${robotId}`);
+    return true;
   },
 
   exportSavedMap: (mapId) => {

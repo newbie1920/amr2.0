@@ -1,11 +1,13 @@
 /**
- * AMR 2.0 — Task Manager Component
+ * AMR 2.0 — Task Manager Component v2
  * Quản lý nhiệm vụ nhập/xuất hàng
  */
 
 import { useState, useEffect } from 'react';
 import useTaskStore from '../../stores/taskStore.js';
 import useRobotStore from '../../stores/robotStore.js';
+import useNavStore from '../../stores/navStore.js';
+import useMapStore from '../../stores/mapStore.js';
 import { SHELVES, GATES, findSlotById } from '../../core/warehouse.js';
 import { navWorkerApi } from '../../core/navWorkerSetup.js';
 import vi from '../../i18n/vi.js';
@@ -13,11 +15,22 @@ import { supabase } from '../../utils/supabaseClient.js';
 
 // === VISUAL SHELF COMPONENT ===
 function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType }) {
-  // Helpers to draw shelf visually
+  // Hash function to generate distinct color based on SKU string
+  const getColorForSku = (sku) => {
+    if (!sku) return 'hsl(0, 0%, 50%)';
+    let hash = 0;
+    for (let i = 0; i < sku.length; i++) {
+      hash = sku.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    const hue = Math.abs(hash) % 360;
+    // Use high saturation and medium lightness for vibrant colors
+    return `hsl(${hue}, 75%, 55%)`;
+  };
+
   return (
     <div style={{ marginTop: '12px', padding: '10px', background: 'var(--bg-lighter)', borderRadius: 'var(--radius-md)' }}>
       <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '8px', textAlign: 'center' }}>
-        {taskType === 'import' ? '👇 Bấm vào ô TRỐNG để chọn vị trí cất hàng' : '👇 Bấm vào ô CÓ HÀNG để chọn món xuất kho'}
+        {taskType === 'import' ? '👇 Bấm vào ô TRỐNG để chọn vị trí cất hàng' : '📍 Vị trí hàng trong kho (Tự động chọn)'}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', paddingBottom: '8px' }}>
         {SHELVES.map(shelf => (
@@ -33,7 +46,7 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
                    
                    // Logic
                    const isOccupied = !!itemInSlot;
-                   const canSelect = taskType === 'import' ? !isOccupied : isOccupied;
+                   const canSelect = taskType === 'import' ? !isOccupied : false; // Export không cho click chọn nữa vì auto
                    
                    // styling
                    let bgColor = 'rgba(255,255,255,0.03)';
@@ -41,15 +54,19 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
                    let textColor = 'var(--text-secondary)';
                    
                    if (isOccupied) {
-                     bgColor = 'rgba(239, 68, 68, 0.15)'; // redish
-                     borderColor = 'var(--accent-danger)';
+                     const itemColor = getColorForSku(itemInSlot.sku);
+                     bgColor = itemColor.replace('hsl', 'hsla').replace(')', ', 0.25)'); // transparent background
+                     borderColor = itemColor;
                      textColor = 'var(--text-primary)';
                    }
                    
                    if (isSelected) {
                      borderColor = 'var(--accent-primary)';
-                     bgColor = 'rgba(91, 130, 246, 0.2)'; // blueish selection
-                     if (isOccupied) bgColor = 'rgba(239, 68, 68, 0.4)'; 
+                     bgColor = 'rgba(91, 130, 246, 0.4)'; // blueish selection
+                     if (isOccupied) {
+                         const itemColor = getColorForSku(itemInSlot.sku);
+                         bgColor = itemColor.replace('hsl', 'hsla').replace(')', ', 0.5)'); 
+                     }
                    }
                    
                    return (
@@ -136,10 +153,19 @@ export default function TaskManager({ onPathGenerated }) {
 
   const handleSelectExistingItem = (sku) => {
     setSelectedSku(sku);
+    let targetSlotId = '';
+    // Tìm trong kho
     const item = inventory.find(i => i.sku === sku);
     if (item) {
-      // automatically highlight its slot
-      setUserSelectedSlotId(item.slot_id);
+      targetSlotId = item.slot_id;
+    } else {
+      // Tìm trong lịch sử task
+      const recentTask = tasks.find(t => t.type === 'import' && t.orderInfo?.sku === sku);
+      if (recentTask) targetSlotId = recentTask.slotId;
+    }
+    
+    if (targetSlotId) {
+      setUserSelectedSlotId(targetSlotId);
     }
   };
 
@@ -160,28 +186,53 @@ export default function TaskManager({ onPathGenerated }) {
         finalSku = newSku || `FREERUN-${Date.now()}`;
         finalName = newName;
       } else {
-        targetSlotId = inventory.find(i => i.sku === selectedSku)?.slot_id;
+        // Hàng có sẵn (Kho hoặc Đang chờ)
+        let itemInfo = inventory.find(i => i.sku === selectedSku);
+        if (itemInfo) {
+          targetSlotId = itemInfo.slot_id;
+          finalName = itemInfo.name;
+        } else {
+          const recentTask = tasks.find(t => t.type === 'import' && t.orderInfo?.sku === selectedSku);
+          if (recentTask) {
+            targetSlotId = recentTask.slotId;
+            finalName = recentTask.orderInfo.name;
+          }
+        }
+        
         if (!targetSlotId) return alert('Vui lòng chọn 1 mã hàng có sẵn!');
         finalSku = selectedSku;
-        finalName = inventory.find(i => i.sku === selectedSku)?.name;
       }
       
       // Chúng ta KHÔNG cập nhật Supabase ở đây nữa mà để vào orderInfo
       // Database chỉ update khi xe thực sự báo NAV_DONE
     } else {
-      // Export
-      const invItem = inventory.find(i => i.sku === selectedSku);
-      if (!invItem) return alert('Vui lòng chọn hàng để xuất kho!');
-      targetSlotId = invItem.slot_id;
+      // Export — tự động tìm vị trí hàng trong kho
+      let invItem = inventory.find(i => i.sku === selectedSku);
+      if (invItem) {
+        targetSlotId = invItem.slot_id;
+        finalName = invItem.name;
+      } else {
+        // Fallback: tìm trong task history
+        const recentTask = tasks.find(t => t.type === 'import' && t.orderInfo?.sku === selectedSku);
+        if (recentTask) {
+          targetSlotId = recentTask.slotId;
+          finalName = recentTask.orderInfo.name;
+        }
+      }
+      if (!targetSlotId) return alert('Vui lòng chọn hàng để xuất kho!');
+      finalSku = selectedSku;
     }
 
     if (!targetSlotId) return;
 
+    console.log('[TaskManager] Creating task:', { taskType, targetSlotId, finalSku, finalName, quantity, selectedGateId });
+
     const task = createTask(taskType, targetSlotId, {
       sku: finalSku || selectedSku,
-      name: finalName || inventory.find(i => i.sku === selectedSku)?.name,
+      name: finalName,
       qty: quantity,
-      importType: taskType === 'import' ? importType : undefined
+      importType: taskType === 'import' ? importType : undefined,
+      gateId: selectedGateId
     });
 
     // Auto routing → Tìm xe rảnh rỗi và đủ pin
@@ -191,7 +242,9 @@ export default function TaskManager({ onPathGenerated }) {
       const batt = r.telemetry?.batt ?? 100;
       // Xe chưa nhận nhiệm vụ chạy nào hoặc đã xong
       const isIdle = navStatus === 'IDLE' || navStatus === 'DONE' || navStatus === 'ERROR';
-      return isIdle && batt > 20;
+      // Kiểm tra không có task in_progress nào đang gắn vào xe này
+      const hasActiveTask = tasks.some(t => t.assignedRobotId === r.id && (t.status === 'in_progress' || t.status === 'assigned'));
+      return isIdle && batt > 20 && !hasActiveTask;
     });
 
     if (availableRobots.length > 0) {
@@ -216,32 +269,66 @@ export default function TaskManager({ onPathGenerated }) {
 
       if (slotInfo) {
         // Bước 1: Tìm đường A* từ xe → ô kệ
-        const gridData = useRobotStore.getState().grid.serialize();
-        const result = await navWorkerApi.findPath(
-          gridData,
-          robot.telemetry.x, robot.telemetry.y,
-          slotInfo.slot.approach.x, slotInfo.slot.approach.y
-        );
-        if (result.success) {
-          // Vẽ đường trên bản đồ 3D
-          if (onPathGenerated) onPathGenerated(result.path);
+        const mapState = useMapStore.getState();
+        const mapGrid = mapState.mapperInstances?.[robot.id] || mapState.occupancyGrid?.[robot.id];
+        const gridData = mapGrid ? mapGrid.serialize() : null;
+        console.log('[TaskManager] Grid lookup:', { robotId: robot.id, hasMapper: !!mapState.mapperInstances?.[robot.id], hasGrid: !!mapState.occupancyGrid?.[robot.id], gridData: !!gridData });
+        if (!gridData) { 
+          console.warn('[TaskManager] No map grid available for pathfinding');
+          alert('⚠️ Chưa có bản đồ! Vui lòng Spawn lại SimBot hoặc quét bản đồ trước.'); 
+          return; 
+        }
+        
+        try {
+          const result = await navWorkerApi.findPath(
+            gridData,
+            robot.telemetry.x, robot.telemetry.y,
+            slotInfo.slot.approach.x, slotInfo.slot.approach.y
+          );
+          console.log('[TaskManager] A* result:', { success: result.success, pathLen: result.path?.length, from: `(${robot.telemetry.x?.toFixed(2)}, ${robot.telemetry.y?.toFixed(2)})`, to: `(${slotInfo.slot.approach.x}, ${slotInfo.slot.approach.y})` });
           
-          // Bước 2: Gửi path + heading xuống ESP32
-          const { navigateRobot } = useRobotStore.getState();
-          navigateRobot(robot.id, result.path, slotInfo.slot.heading || 90);
-          
-          // Gắn robot vào task và đổi trạng thái
-          const { updateTask } = useTaskStore.getState();
-          updateTask(task.id, { 
-            status: 'in_progress', 
-            assignedRobotId: robot.id,
-            // Đánh dấu để check 1 lần duy nhất khi DONE
-            dbUpdated: false 
-          });
+          if (result.success) {
+            // Vẽ đường trên bản đồ 3D
+            if (onPathGenerated) onPathGenerated(result.path);
+            
+            // Bước 2: Gửi path + heading xuống ESP32
+            const { navigateRobot } = useNavStore.getState();
+            navigateRobot(robot.id, result.path, slotInfo.slot.heading || 90);
+            
+            // Gắn robot vào task và đổi trạng thái
+            const { updateTask } = useTaskStore.getState();
+            updateTask(task.id, { 
+              status: 'in_progress', 
+              assignedRobotId: robot.id,
+              dbUpdated: false 
+            });
+          } else {
+            console.error('[TaskManager] A* pathfinding failed:', result.error);
+            alert(`⚠️ Không tìm được đường đi! ${result.error || 'Đường bị chặn hoặc bản đồ chưa đủ.'}`);
+          }
+        } catch (err) {
+          console.error('[TaskManager] Pathfinding error:', err);
+          alert(`❌ Lỗi tìm đường: ${err.message}`);
         }
       }
     } else {
-      console.warn("Không có robot nào đang rảnh và đủ pin! Nhiệm vụ đang ở trạng thái chờ.");
+      const debugInfo = connectedRobots.map(r => `${r.name}: nav=${r.telemetry?.nav || '?'}, batt=${r.telemetry?.batt ?? '?'}`).join(', ');
+      console.warn("[TaskManager] No available robots!", { connectedCount: connectedRobots.length, robots: debugInfo });
+      
+      // Check if robots exist but are busy
+      if (connectedRobots.length > 0) {
+        const busyRobots = connectedRobots.filter(r => {
+          const nav = r.telemetry?.nav || 'IDLE';
+          return nav !== 'IDLE' && nav !== 'DONE' && nav !== 'ERROR';
+        });
+        if (busyRobots.length > 0) {
+          alert(`⏳ Tất cả ${busyRobots.length} xe đang bận nhiệm vụ khác. Task sẽ chờ tới khi xe rảnh.`);
+        } else {
+          alert(`⚠️ Xe không khả dụng! Debug: ${debugInfo}`);
+        }
+      } else {
+        alert('❌ Chưa có robot nào kết nối! Vui lòng Spawn SimBot trước.');
+      }
     }
 
     // Reset
@@ -273,9 +360,32 @@ export default function TaskManager({ onPathGenerated }) {
   const historyTasks = tasks.filter(t => ['completed', 'canceled'].includes(t.status)).reverse(); // Mới nhất lên đầu
   const selectedTask = tasks.find(t => t.id === selectedTaskId);
   
-  const filteredInventory = inventory.filter(i => 
-    i.name.toLowerCase().includes(searchQuery.toLowerCase()) || 
-    i.sku.toLowerCase().includes(searchQuery.toLowerCase())
+  // Gộp hàng hóa từ Supabase và từ lịch sử Task (những hàng vừa nhập chưa xong)
+  const combinedItemsMap = new Map();
+  
+  // 1. Từ DB
+  inventory.forEach(i => combinedItemsMap.set(i.sku, i));
+  
+  // 2. Từ Tasks (recent)
+  tasks.forEach(t => {
+    if (t.type === 'import' && t.orderInfo?.sku) {
+      if (!combinedItemsMap.has(t.orderInfo.sku)) {
+        combinedItemsMap.set(t.orderInfo.sku, {
+          id: `recent_${t.orderInfo.sku}`,
+          sku: t.orderInfo.sku,
+          name: t.orderInfo.name,
+          quantity: 0, // Chưa chính thức vào kho
+          isRecent: true
+        });
+      }
+    }
+  });
+
+  const combinedInventory = Array.from(combinedItemsMap.values());
+
+  const filteredInventory = combinedInventory.filter(i => 
+    i.name?.toLowerCase().includes(searchQuery.toLowerCase()) || 
+    i.sku?.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   return (
@@ -366,7 +476,9 @@ export default function TaskManager({ onPathGenerated }) {
               >
                 {filteredInventory.length === 0 && <option disabled>Không tìm thấy hàng phù hợp</option>}
                 {filteredInventory.map(s => (
-                  <option key={s.id} value={s.sku}>[{s.sku}] {s.name} (SL:{s.quantity})</option>
+                  <option key={s.id} value={s.sku}>
+                    [{s.sku}] {s.name} {s.isRecent ? '(Đang chờ nhập)' : `(Kho: ${s.quantity})`}
+                  </option>
                 ))}
               </select>
             </div>
@@ -626,11 +738,11 @@ function TaskCard({ task, onClick }) {
 }
 
 /**
- * Task Details Modal
+ * Task Details Modal — Premium UI
  */
 function TaskDetailsModal({ task, onClose, onPathGenerated }) {
   const { cancelTask, updateTask } = useTaskStore();
-  const { navigateRobot, resumeRobot } = useRobotStore();
+  const { navigateRobot, resumeNav } = useNavStore();
   const robots = useRobotStore(s => s.robots);
   const robot = task.assignedRobotId ? robots[task.assignedRobotId] : null;
 
@@ -638,18 +750,19 @@ function TaskDetailsModal({ task, onClose, onPathGenerated }) {
     if (!robot || robot.status !== 'connected') return alert('Robot không kết nối!');
     
     if (task.status === 'paused') {
-      // Nếu chỉ tạm dừng (pause mềm), gửi lệnh tiếp tục
-      resumeRobot(robot.id);
+      resumeNav(robot.id);
       updateTask(task.id, { status: 'in_progress', error: null });
     } else if (task.status === 'failed') {
-      // Nếu lỗi timeout (ESP32 đã xóa path), cần vẽ lại đường đi từ vị trí hiện tại
       const slotInfo = findSlotById(task.slotId);
       if (!slotInfo) return alert('Không tìm thấy tọa độ đích!');
       
-      const targetX = task.type === 'import' ? slotInfo.slot.approach.x : slotInfo.slot.approach.x; // Simplified
-      const targetY = task.type === 'import' ? slotInfo.slot.approach.y : slotInfo.slot.approach.y;
+      const targetX = slotInfo.slot.approach.x;
+      const targetY = slotInfo.slot.approach.y;
 
-      const gridData = useRobotStore.getState().grid.serialize();
+      const mapState = useMapStore.getState();
+      const mapGrid = mapState.mapperInstances?.[robot.id] || mapState.occupancyGrid?.[robot.id];
+      const gridData = mapGrid ? mapGrid.serialize() : null;
+      if (!gridData) { alert('Không có bản đồ để tìm đường!'); return; }
       const result = await navWorkerApi.findPath(gridData, robot.telemetry.x, robot.telemetry.y, targetX, targetY);
       if (result.success) {
         if (onPathGenerated) onPathGenerated(result.path);
@@ -663,91 +776,132 @@ function TaskDetailsModal({ task, onClose, onPathGenerated }) {
   };
 
   const handleCancel = () => {
-    if (window.confirm('Bạn có chắc chắn muốn hủy nhiệm vụ này? Robot sẽ dừng lại.')) {
+    if (window.confirm('Bạn có chắc chắn muốn hủy nhiệm vụ này?')) {
       if (task.status === 'in_progress' || task.status === 'paused' || task.status === 'failed') {
         cancelTask(task.id, 'Người dùng chủ động hủy');
-        if (robot) {
-          useRobotStore.getState().navStopRobot(robot.id);
-        }
+        if (robot) useNavStore.getState().navStopRobot(robot.id);
       }
       onClose();
     }
   };
 
+  const statusMap = {
+    pending:     { label: 'Chờ xử lý',     color: '#94a3b8', icon: '⏳' },
+    assigned:    { label: 'Đã phân công',   color: '#f59e0b', icon: '📋' },
+    in_progress: { label: 'Đang thực hiện', color: '#3b82f6', icon: '🚀' },
+    completed:   { label: 'Hoàn thành',     color: '#22c55e', icon: '✅' },
+    failed:      { label: 'Thất bại',       color: '#ef4444', icon: '❌' },
+    paused:      { label: 'Tạm dừng',       color: '#f59e0b', icon: '⏸️' },
+    canceled:    { label: 'Đã hủy',         color: '#6b7280', icon: '🚫' },
+  };
+  const st = statusMap[task.status] || statusMap.pending;
+
+  const InfoRow = ({ label, value, valueColor, fullWidth }) => (
+    <div style={{ gridColumn: fullWidth ? '1 / -1' : undefined }}>
+      <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '3px', textTransform: 'uppercase', letterSpacing: '0.8px', fontWeight: 600 }}>{label}</div>
+      <div style={{ fontSize: '14px', fontWeight: 500, color: valueColor || '#e2e8f0', lineHeight: 1.4 }}>{value}</div>
+    </div>
+  );
+
   return (
     <div style={{
-      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
-      background: 'rgba(0,0,0,0.6)', zIndex: 1000,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      padding: '20px'
-    }}>
+      position: 'fixed', inset: 0,
+      background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(4px)', zIndex: 1000,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px'
+    }} onClick={onClose}>
       <div style={{
-        background: 'var(--bg-darker)', borderRadius: 'var(--radius-lg)',
-        width: '100%', maxWidth: '400px', border: '1px solid var(--border)',
-        boxShadow: '0 10px 30px rgba(0,0,0,0.5)', overflow: 'hidden'
-      }}>
-        <div style={{ padding: '16px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ fontWeight: 'bold' }}>Chi tiết nhiệm vụ #{task.id}</div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', fontSize: '18px' }}>✕</button>
+        background: 'linear-gradient(180deg, #1e293b 0%, #0f172a 100%)',
+        borderRadius: '16px', width: '100%', maxWidth: '400px',
+        border: '1px solid rgba(148,163,184,0.12)',
+        boxShadow: '0 25px 60px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.04)',
+        overflow: 'hidden'
+      }} onClick={e => e.stopPropagation()}>
+
+        {/* ── Header ── */}
+        <div style={{ padding: '20px 24px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ fontSize: '10px', color: '#475569', textTransform: 'uppercase', letterSpacing: '1.2px', fontWeight: 700, marginBottom: '6px' }}>
+              Nhiệm vụ #{task.id}
+            </div>
+            <div style={{ fontSize: '18px', fontWeight: 700, color: '#f1f5f9' }}>
+              {task.type === 'import' ? '📦 Nhập Kho' : '🚚 Xuất Kho'}
+            </div>
+          </div>
+          <button onClick={onClose} style={{
+            background: 'rgba(148,163,184,0.08)', border: 'none', color: '#64748b',
+            cursor: 'pointer', fontSize: '14px', width: '30px', height: '30px',
+            borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}>✕</button>
         </div>
 
-        <div style={{ padding: '16px', fontSize: '13px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Loại nhiệm vụ:</span>
-            <span style={{ fontWeight: '500' }}>{task.type === 'import' ? '📦 Nhập kho' : '🚚 Xuất kho'}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Vị trí / Ô kệ:</span>
-            <span>{task.slotId}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Hàng hóa:</span>
-            <span>{task.orderInfo?.name} (SKU: {task.orderInfo?.sku})</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Số lượng:</span>
-            <span>{task.orderInfo?.qty}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Robot đảm nhận:</span>
-            <span>{robot ? robot.name : 'Chưa phân công'}</span>
-          </div>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <span style={{ color: 'var(--text-muted)' }}>Tạo lúc:</span>
-            <span>{new Date(task.createdAt).toLocaleTimeString()}</span>
-          </div>
-
-          {task.completedAt && (
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: 'var(--text-muted)' }}>Kết thúc lúc:</span>
-              <span>{new Date(task.completedAt).toLocaleTimeString()}</span>
-            </div>
-          )}
-
-          {(task.status === 'failed' || task.status === 'paused' || task.status === 'canceled') && task.error && (
-            <div style={{ background: 'rgba(239, 68, 68, 0.15)', padding: '10px', borderRadius: '6px', color: 'var(--accent-danger)', marginTop: '8px', border: '1px solid rgba(239, 68, 68, 0.3)' }}>
-              <strong>Lý do dừng:</strong> {task.error}
-            </div>
-          )}
+        {/* ── Status Badge ── */}
+        <div style={{ padding: '0 24px 16px' }}>
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: '6px',
+            background: `${st.color}18`, border: `1px solid ${st.color}30`,
+            borderRadius: '20px', padding: '5px 14px',
+            fontSize: '12px', color: st.color, fontWeight: 600
+          }}>
+            {st.icon} {st.label}
+          </span>
         </div>
 
-        <div style={{ padding: '16px', borderTop: '1px solid var(--border)', display: 'flex', gap: '10px' }}>
+        {/* ── Info Grid ── */}
+        <div style={{ padding: '0 24px 20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+            <InfoRow label="Vị trí kệ" value={task.slotId} />
+            <InfoRow label="Số lượng" value={task.orderInfo?.qty || 1} />
+            <InfoRow label="Hàng hóa" fullWidth value={
+              <>{task.orderInfo?.name || '—'}<span style={{ fontSize: '11px', color: '#64748b', marginLeft: '8px' }}>SKU: {task.orderInfo?.sku || '—'}</span></>
+            } />
+            <InfoRow label="Robot" value={robot ? `🤖 ${robot.name}` : '— Chưa phân công'} valueColor={robot ? '#22c55e' : '#64748b'} />
+            <InfoRow label="Tạo lúc" value={new Date(task.createdAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} />
+            {task.completedAt && (
+              <InfoRow label="Kết thúc" fullWidth value={new Date(task.completedAt).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} />
+            )}
+          </div>
+        </div>
+
+        {/* ── Error Banner ── */}
+        {(task.status === 'failed' || task.status === 'paused' || task.status === 'canceled') && task.error && (
+          <div style={{ padding: '0 24px 16px' }}>
+            <div style={{
+              background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)',
+              padding: '10px 14px', borderRadius: '10px',
+              fontSize: '12px', color: '#fca5a5', lineHeight: 1.5
+            }}>
+              <strong style={{ color: '#ef4444' }}>⚠️ </strong>{task.error}
+            </div>
+          </div>
+        )}
+
+        {/* ── Actions ── */}
+        <div style={{
+          padding: '14px 24px 20px', borderTop: '1px solid rgba(148,163,184,0.08)',
+          display: 'flex', gap: '8px'
+        }}>
           {(task.status === 'failed' || task.status === 'paused') && (
-            <button className="btn btn--primary" style={{ flex: 1 }} onClick={handleResume}>
-              ▶ Tiếp Tục
-            </button>
+            <button onClick={handleResume} style={{
+              flex: 1, padding: '10px', borderRadius: '10px', border: 'none',
+              background: 'linear-gradient(135deg, #3b82f6, #2563eb)',
+              color: '#fff', fontWeight: 600, fontSize: '12px', cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(59,130,246,0.25)'
+            }}>▶ Tiếp Tục</button>
           )}
-          
           {(task.status === 'in_progress' || task.status === 'failed' || task.status === 'paused') && (
-            <button className="btn btn--danger" style={{ flex: 1 }} onClick={handleCancel}>
-              ⏹ Hủy Nhiệm Vụ
-            </button>
+            <button onClick={handleCancel} style={{
+              flex: 1, padding: '10px', borderRadius: '10px', border: 'none',
+              background: 'linear-gradient(135deg, #ef4444, #dc2626)',
+              color: '#fff', fontWeight: 600, fontSize: '12px', cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(239,68,68,0.25)'
+            }}>⏹ Hủy</button>
           )}
-          
-          <button className="btn btn--ghost" style={{ flex: 1 }} onClick={onClose}>
-            Đóng
-          </button>
+          <button onClick={onClose} style={{
+            flex: 1, padding: '10px', borderRadius: '10px',
+            border: '1px solid rgba(148,163,184,0.15)',
+            background: 'rgba(148,163,184,0.06)',
+            color: '#94a3b8', fontWeight: 600, fontSize: '12px', cursor: 'pointer'
+          }}>Đóng</button>
         </div>
       </div>
     </div>

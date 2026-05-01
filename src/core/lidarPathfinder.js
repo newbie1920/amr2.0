@@ -143,7 +143,8 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
       worldPath = _smoothPath(worldPath, grid);
 
       // 4) Đơn giản hóa đường (bỏ các điểm nằm trên đường thẳng)
-      const simplified = _rdpSimplify(worldPath, 0.05);
+      // Giảm tolerance để giữ nguyên độ cong của đường, tránh rdp "kéo thẳng" cắt qua vật cản
+      const simplified = _rdpSimplify(worldPath, 0.02);
 
       // 5) Giới hạn số lượng waypoint
       const limited = _limitWaypoints(simplified, 20);
@@ -177,11 +178,13 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
         if (lo1 > 0.3 || lo2 > 0.3) continue;
       }
 
-      // Cost: base + costmap penalty
+      // Cost: base + costmap penalty (Nav2-grade)
       let moveCost = dir.cost;
-      if (useCostmap) {
+      if (useCostmap && grid.costmap) {
         const cm = grid.costmap[nIdx];
-        moveCost += cm * 0.02; // Soft penalty near obstacles
+        if (cm >= 253) continue;        // Lethal — treat as wall
+        if (cm >= 200) moveCost += 500.0; // Inscribed — practically forbidden
+        else moveCost += cm * 1.5;      // High penalty to force path into blue (free) space
       }
       // Unknown cells have extra penalty
       if (Math.abs(lo) <= 0.3) {
@@ -282,9 +285,19 @@ function _smoothPath(path, grid, weight_data = 0.5, weight_smooth = 0.3, toleran
       newPath[i].y += weight_data * (path[i].y - newPath[i].y) +
                       weight_smooth * (newPath[i - 1].y + newPath[i + 1].y - 2.0 * newPath[i].y);
 
-      // Check collision on the grid
+      // Check collision on the grid (prevent pulling path into obstacles or high costmap areas)
       const gPos = grid.worldToGrid(newPath[i].x, newPath[i].y);
-      if (grid.getLogOdds(gPos.gx, gPos.gy) > 0.3 || (grid.costmap && grid.getCost && grid.getCost(gPos.gx, gPos.gy) >= 200)) {
+      let isBlocked = grid.getLogOdds(gPos.gx, gPos.gy) > 0.3;
+      
+      if (!isBlocked && grid.costmap) {
+        const cIdx = gPos.gy * grid.width + gPos.gx;
+        const cost = grid.costmap[cIdx];
+        if (cost >= 10) { // Do not smooth into ANY inflated area (pink/red)
+          isBlocked = true;
+        }
+      }
+
+      if (isBlocked) {
         // Revert if smoothing pushes path into obstacle
         newPath[i].x = auxX;
         newPath[i].y = auxY;
