@@ -74,7 +74,7 @@
 // Safety
 #define CMD_TIMEOUT_MS    1000      // Dừng motor nếu mất lệnh (ms)
 #define CONTROL_FREQ_HZ   50       // 50Hz control loop (20ms)
-#define TELEMETRY_INTERVAL 33     // ~30Hz telemetry broadcast (ms)
+#define TELEMETRY_INTERVAL 100    // ~10Hz telemetry broadcast — giảm tải WiFi cho lidar data
 
 // ============================================================
 //   IMU FUSION

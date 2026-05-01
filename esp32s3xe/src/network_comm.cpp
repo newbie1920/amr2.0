@@ -330,7 +330,7 @@ void broadcast_telemetry() {
     JsonArray ls = telem["lidar"].to<JsonArray>();
     bool hasObstruction = obstacleDetected && millis() - timeObstacleLastDetected < 500;
     telem["obs"] = hasObstruction;
-    for (int i = 0; i < 360; i += 2) { 
+    for (int i = 0; i < 360; i += 3) { // Mỗi 3° → ~120 points max, tiết kiệm buffer
       if (lidarDists[i] > 0 && lidarDists[i] < 3000) {
         JsonObject p = ls.add<JsonObject>();
         p["a"] = i;             
@@ -338,11 +338,14 @@ void broadcast_telemetry() {
       }
     }
 
-    static uint8_t telemBuf[3072];
+    static uint8_t telemBuf[4096]; // Tăng buffer cho lidar data
     telemBuf[0] = 0x02; 
     size_t len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
-    if (len > sizeof(telemBuf) - 1) len = sizeof(telemBuf) - 1; 
-    webSocket.broadcastBIN(telemBuf, len + 1);
+    if (len == 0 || len > sizeof(telemBuf) - 1) {
+      Serial.printf("[TELEM] WARNING: MsgPack overflow! len=%d, max=%d\n", len, sizeof(telemBuf) - 1);
+      len = 0; // Bỏ frame này, không gửi data bị cắt
+    }
+    if (len > 0) webSocket.broadcastBIN(telemBuf, len + 1);
     
     static unsigned long lastGridSendTime = 0;
     if (streamOccupancyGrid && millis() - lastGridSendTime > 500) {
