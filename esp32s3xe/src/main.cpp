@@ -11,6 +11,8 @@
 #include <Wire.h>
 #include <RPLidar.h>
 #include <Adafruit_NeoPixel.h>
+#include <TelnetStream.h>
+#include <esp_task_wdt.h>  // Hardware Watchdog Timer
 
 #include "config.h"
 #include "navigator.h"
@@ -55,6 +57,9 @@ void controlTask(void *pvParameters) {
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / CONTROL_FREQ_HZ);
   TickType_t xLastWakeTime = xTaskGetTickCount();
   float deltaT = 1.0f / CONTROL_FREQ_HZ;
+
+  // Subscribe controlTask to hardware watchdog (5 second timeout)
+  esp_task_wdt_add(NULL);
 
   for (;;) {
     // ── IMU Read ────────────────────────────────────────
@@ -116,7 +121,27 @@ void controlTask(void *pvParameters) {
     robotX += dist * cos(robotTheta);
     robotY += dist * sin(robotTheta);
 
-    // ── AUTONOMOUS NAVIGATOR ──
+    // ── OBSTACLE CHECK TRƯỚC — ưu tiên cao nhất ──────────
+    // FIX Bug #2: Di chuyển obstacle check LÊN TRƯỚC navigator
+    // để đảm bảo E-STOP xử lý trước khi navigator tính velocity mới.
+    if (obstacleDetected && millis() - timeObstacleLastDetected < 500) {
+        if (navigator.isNavigating() && navigator.state == NAV_TRACKING) {
+            navigator.pause();
+            Serial.println("[LIDAR] E-STOP: Phat hien vat can truoc xe!");
+        }
+        if (targetLeftVel > 0 || targetRightVel > 0) {
+            targetLeftVel = 0;
+            targetRightVel = 0;
+        }
+    } else if (obstacleDetected && millis() - timeObstacleLastDetected >= 500) {
+        obstacleDetected = false;
+        if (navigator.isNavigating() && navigator.state == NAV_PAUSED) {
+            navigator.resume();
+            Serial.println("[LIDAR] Vat can da di chuyen, RESUME!");
+        }
+    }
+
+    // ── AUTONOMOUS NAVIGATOR (chỉ chạy nếu không bị E-STOP) ──
     if (navigator.isNavigating()) {
       navigator.update(robotX, robotY, robotTheta);
       float navV = navigator.cmdLinear;
@@ -126,6 +151,10 @@ void controlTask(void *pvParameters) {
     }
 
     // ── Motor PI + Feedforward ──────────────────────────
+    if (brakeEnabled) {
+      targetLeftVel = 0;
+      targetRightVel = 0;
+    }
     float targetL = targetLeftVel;
     float targetR = targetRightVel;
     
@@ -156,23 +185,8 @@ void controlTask(void *pvParameters) {
     setMotor(MOTOR_LEFT_IN1, MOTOR_LEFT_IN2, 0, pwmLeft);
     setMotor(MOTOR_RIGHT_IN3, MOTOR_RIGHT_IN4, 1, pwmRight);
 
-    // Obstacle Avoidance Auto-Pause Logic
-    if (obstacleDetected && millis() - timeObstacleLastDetected < 500) {
-        if (navigator.isNavigating() && navigator.state == NAV_TRACKING) {
-            navigator.pause();
-            Serial.println("[LIDAR] E-STOP: Phat hien vat can truoc xe!");
-        }
-        if (targetL > 0 || targetR > 0) {
-            targetLeftVel = 0;
-            targetRightVel = 0;
-        }
-    } else if (obstacleDetected && millis() - timeObstacleLastDetected >= 500) {
-        obstacleDetected = false;
-        if (navigator.isNavigating() && navigator.state == NAV_PAUSED) {
-            navigator.resume();
-            Serial.println("[LIDAR] Vat can da di chuyen, RESUME!");
-        }
-    }
+    // Feed watchdog — proves controlTask is alive
+    esp_task_wdt_reset();
 
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
@@ -183,13 +197,25 @@ void controlTask(void *pvParameters) {
 // ============================================================
 void lidarTask(void *pvParameters) {
   lidarRunning = true;
+  
+  // Diagnostic counters
+  unsigned long lidarOkCount = 0;
+  unsigned long lidarFailCount = 0;
+  unsigned long lidarQualityOkCount = 0;
+  unsigned long lastDiagTime = 0;
+  int nonZeroDistCount = 0;
+  static int consecutiveFails = 0;
+  
   for (;;) {
     if (IS_OK(lidar.waitPoint())) {
+      lidarOkCount++;
+      consecutiveFails = 0; // Reset fail counter when we successfully read a point
       float distance = lidar.getCurrentPoint().distance; // distance value in mm
       float angle    = lidar.getCurrentPoint().angle;    // angle value in degrees
       uint8_t quality = lidar.getCurrentPoint().quality; // quality of the current measurement
 
       if (quality > 0) {
+        lidarQualityOkCount++;
         int deg = (int)round(angle) % 360;
         lidarDists[deg] = (uint16_t)distance;
         
@@ -211,10 +237,67 @@ void lidarTask(void *pvParameters) {
         lastGridUpdateTime = millis();
       }
     } else {
-      analogWrite(LIDAR_PWM_PIN, 0); 
-      vTaskDelay(pdMS_TO_TICKS(100));
-      lidar.begin(lidarSerial);
-      analogWrite(LIDAR_PWM_PIN, 255); // Tăng tốc độ quay Lidar lên tối đa
+      lidarFailCount++;
+      consecutiveFails++;
+      
+      vTaskDelay(pdMS_TO_TICKS(10)); // Tránh spam vòng lặp
+      
+      // Nếu lỗi quá 50 lần liên tiếp (hơn 500ms không có data), tiến hành reset Lidar
+      if (consecutiveFails > 50) {
+        Serial.println("[LIDAR] Mat tin hieu qua lau. Reset Lidar...");
+        analogWrite(LIDAR_PWM_PIN, 0); 
+        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        rplidar_response_device_info_t info;
+        if (IS_OK(lidar.getDeviceInfo(info, 100))) {
+            lidar.startScan(); 
+            analogWrite(LIDAR_PWM_PIN, 200); // 80% PWM — A1M8 tối ưu
+            vTaskDelay(pdMS_TO_TICKS(3000)); // QUAN TRỌNG: Phải chờ 3s để motor đạt tốc độ ổn định trước khi đọc!
+        } else {
+            // Không tìm thấy thiết bị, thử reset serial và bật lại motor để thử lại ở chu kỳ sau
+            Serial.println("\n[DEBUG] --- BẮT ĐẦU BÀI TEST RAW UART (TRONG VÒNG LẶP) ---");
+            Serial.println("[DEBUG] Gửi lệnh GET_INFO (0xA5 0x50) thủ công...");
+            uint8_t get_info_cmd[] = {0xA5, 0x50};
+            lidarSerial.write(get_info_cmd, 2);
+            vTaskDelay(pdMS_TO_TICKS(200)); // Chờ Lidar phản hồi
+            
+            int bytes_avail = lidarSerial.available();
+            Serial.printf("[DEBUG] Số byte Lidar trả về: %d\n", bytes_avail);
+            
+            if (bytes_avail > 0) {
+                Serial.print("[DEBUG] Dữ liệu (HEX): ");
+                while(lidarSerial.available()) {
+                    Serial.printf("%02X ", lidarSerial.read());
+                }
+                Serial.println("\n[DEBUG] KẾT LUẬN: Dây RX Tốt! Lỗi do Baudrate hoặc nhiễu.");
+            } else {
+                Serial.println("[DEBUG] KẾT LUẬN: KHÔNG CÓ TÍN HIỆU ĐIỆN VỀ ESP32!");
+                Serial.println("  1. Dây RX/TX đang cắm lỏng hoặc cắm sai.");
+                Serial.println("  2. Lidar bị treo mạch logic.");
+            }
+            Serial.println("------------------------------------------------------\n");
+
+            lidar.begin(lidarSerial);
+            analogWrite(LIDAR_PWM_PIN, 200);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+        consecutiveFails = 0;
+      }
+    }
+    
+    // === DIAGNOSTIC: In ra mỗi 3 giây ===
+    if (millis() - lastDiagTime > 3000) {
+      lastDiagTime = millis();
+      // Đếm số khoảng cách khác 0
+      nonZeroDistCount = 0;
+      for (int i = 0; i < 360; i++) {
+        if (lidarDists[i] > 0) nonZeroDistCount++;
+      }
+      // Serial.printf("[LIDAR] ok=%lu fail=%lu qualOk=%lu | dists_nonzero=%d/360 | sample[0]=%d [90]=%d [180]=%d [270]=%d\n",
+      //   lidarOkCount, lidarFailCount, lidarQualityOkCount,
+      //   nonZeroDistCount,
+      //   lidarDists[0], lidarDists[90], lidarDists[180], lidarDists[270]);
+      lidarOkCount = lidarFailCount = lidarQualityOkCount = 0;
     }
   }
 }
@@ -236,11 +319,66 @@ void setup() {
   rgbLed.setPixelColor(0, rgbLed.Color(30, 80, 150));
   rgbLed.show();
 
-  // Initialize Lidar
+  // Initialize Lidar — THỨ TỰ QUAN TRỌNG:
+  // 1) Mở serial  2) Bind library  3) Bật motor  4) Chờ motor ổn định  5) startScan
   pinMode(LIDAR_PWM_PIN, OUTPUT);
-  lidar.begin(lidarSerial);
   lidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
-  analogWrite(LIDAR_PWM_PIN, 255); // Tăng tốc độ quay Lidar lên tối đa
+  delay(50); // chờ serial ổn định
+  lidar.begin(lidarSerial);
+  
+  // Force stop any ongoing scan from previous boot and flush buffer
+  lidar.stop();
+  delay(100);
+  while(lidarSerial.available()) lidarSerial.read();
+  
+  // Bật motor TRƯỚC — RPLidar A1M8 cần motor quay ổn định trước khi nhận lệnh scan
+  analogWrite(LIDAR_PWM_PIN, 200);
+  Serial.println("[LIDAR] Motor ON (PWM=200). Cho motor quay 2s...");
+  delay(2000); // CHỜ 2 GIÂY cho motor đạt tốc độ ổn định
+  
+  // Kiểm tra UART thông với Lidar không
+  rplidar_response_device_info_t info;
+  if (IS_OK(lidar.getDeviceInfo(info, 1000))) {
+    Serial.printf("[LIDAR] Device OK! Model:%d FW:%d.%d HW:%d\n", 
+                  info.model, info.firmware_version >> 8, info.firmware_version & 0xFF, info.hardware_version);
+    // Bây giờ mới startScan
+    if (IS_OK(lidar.startScan())) {
+      Serial.println("[LIDAR] startScan() THANH CONG!");
+    } else {
+      Serial.println("[LIDAR] startScan() THAT BAI!");
+    }
+  } else {
+    Serial.println("[LIDAR] !!! KHONG TIM THAY THIET BI LIDAR! Kiem tra day noi:");
+    Serial.printf("[LIDAR]   RX_PIN=%d (noi vao TX cua Lidar)\n", LIDAR_RX_PIN);
+    Serial.printf("[LIDAR]   TX_PIN=%d (noi vao RX cua Lidar)\n", LIDAR_TX_PIN);
+    Serial.println("[LIDAR]   Kiem tra: cap 5V, GND, va dau cam UART co chac khong.");
+    
+    // ==========================================
+    // BÀI TEST CHẨN ĐOÁN MẠCH CỨNG (RAW UART) DÀNH CHO OTA
+    // ==========================================
+    Serial.println("\n[DEBUG] --- BAT DAU BÀI TEST ĐỌC RAW UART TỪ LIDAR ---");
+    Serial.println("[DEBUG] Gửi lệnh GET_INFO (0xA5 0x50) thủ công...");
+    uint8_t get_info_cmd[] = {0xA5, 0x50};
+    lidarSerial.write(get_info_cmd, 2);
+    delay(200); // Chờ Lidar phản hồi
+    
+    int bytes_avail = lidarSerial.available();
+    Serial.printf("[DEBUG] So byte Lidar tra ve: %d\n", bytes_avail);
+    
+    if (bytes_avail > 0) {
+        Serial.print("[DEBUG] Du lieu (HEX): ");
+        while(lidarSerial.available()) {
+            Serial.printf("%02X ", lidarSerial.read());
+        }
+        Serial.println("\n[DEBUG] KET LUAN: Day RX Tot! Loi nam o Baudrate (115200 vs 256000) hoac nhieu tin hieu.");
+    } else {
+        Serial.println("[DEBUG] KET LUAN: Khong co bat ky tin hieu dien nao truyen ve ESP32!");
+        Serial.println("  1. Day TX cua Lidar bi dut hoac tiep xuc kem.");
+        Serial.println("  2. Ban cam sai chan RX tren ESP32.");
+        Serial.println("  3. Mach giao tiep logic cua Lidar da hong.");
+    }
+    Serial.println("------------------------------------------------------\n");
+  }
 
   leftPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_LEFT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);
   rightPID = new WheelPID(KP_VEL, KI_VEL, 0.0f, FF_GAIN_RIGHT, 1.0f / CONTROL_FREQ_HZ, 5.0f, MIN_PWM);
@@ -266,6 +404,12 @@ void setup() {
 
   init_network();
 
+  // Initialize hardware watchdog: 5 second timeout, auto-reset on hang
+  esp_task_wdt_init(5, true);  // 5s timeout, panic on trigger (auto-reset)
+  // Subscribe main loop (loop runs on core 1)
+  esp_task_wdt_add(NULL);
+  Serial.println("[BOOT] Hardware Watchdog Timer: 5s timeout, panic=true");
+
   xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 10, NULL, 1);
   xTaskCreatePinnedToCore(lidarTask, "LidarTask", 8192, NULL, 1, NULL, 0);
 
@@ -282,6 +426,9 @@ void setup() {
 //   MAIN LOOP - Orchestrator
 // ============================================================
 void loop() {
+  // Feed main loop watchdog
+  esp_task_wdt_reset();
+
   update_network();
   broadcast_telemetry();
   update_oled();
@@ -307,12 +454,12 @@ void loop() {
   if(millis() - lastPrint > 10000) {
       lastPrint = millis();
       int battPct = constrain((int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
-      Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
-          WiFi.localIP().toString().c_str(),
-          battPct,
-          (imuAvailable && gyroCalibrated) ? "OK" : (imuAvailable ? "CAL" : "--"),
-          webSocket.connectedClients(),
-          robotX, robotY, robotTheta * 180.0f / PI);
+      // Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
+      //     WiFi.localIP().toString().c_str(),
+      //     battPct,
+      //     (imuAvailable && gyroCalibrated) ? "OK" : (imuAvailable ? "CAL" : "--"),
+      //     webSocket.connectedClients(),
+      //     robotX, robotY, robotTheta * 180.0f / PI);
   }
 
   if (!navigator.isNavigating() && millis() - lastCmdTime > CMD_TIMEOUT_MS) {

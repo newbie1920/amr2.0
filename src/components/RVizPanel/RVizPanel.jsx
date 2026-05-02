@@ -199,6 +199,17 @@ export default function RVizPanel({ activePath }) {
     return () => ro.disconnect();
   }, []);
 
+  // ── Auto-Clear Goal & Path ──────────────────────────────
+  const prevNavActive = useRef(false);
+  useEffect(() => {
+    const isActive = !!navSession?.active;
+    if (prevNavActive.current && !isActive) {
+      setGoalMarker(null);
+      setNavPath(null);
+    }
+    prevNavActive.current = isActive;
+  }, [navSession?.active]);
+
   // ── Wheel Event (Non-Passive) ─────────────────────────────
   
   useEffect(() => {
@@ -296,17 +307,22 @@ export default function RVizPanel({ activePath }) {
     }
   }, [activeTool, measurePoints, viewport, activeRobotId, telem, robots, navigateToGoal]);
 
+  const handleClearGoal = useCallback(() => {
+    if (activeRobotId && navSession?.active) {
+      stopAppNavigation(activeRobotId, 'CANCELED', true);
+    }
+    setGoalMarker(null);
+    setNavPath(null);
+  }, [activeRobotId, navSession, stopAppNavigation]);
+
   // Right-click to clear measurements & goal
   const handleContextMenu = useCallback((e) => {
     e.preventDefault();
     if (measurePoints.p1) {
       setMeasurePoints({ p1: null, p2: null });
     }
-    if (goalMarker && !navSession?.active) {
-      setGoalMarker(null);
-      setNavPath(null);
-    }
-  }, [measurePoints, goalMarker, navSession]);
+    handleClearGoal();
+  }, [measurePoints, handleClearGoal]);
 
   // ── Render Loop ───────────────────────────────────────────
 
@@ -419,6 +435,15 @@ export default function RVizPanel({ activePath }) {
       <div style={headerStyle}>
         <span style={titleStyle}>📊 RVizTDTU</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+          {goalMarker && (
+            <button
+              style={{ ...headerBtnStyle(false), color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.4)' }}
+              onClick={handleClearGoal}
+              title="Clear Goal & Cancel Navigation"
+            >
+              ❌ Clear Goal
+            </button>
+          )}
           <button
             style={headerBtnStyle(followRobot)}
             onClick={() => setFollowRobot(!followRobot)}

@@ -68,13 +68,17 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   }
 
   if (doc["cmd"] == "reset_odom") {
-    robotX = 2.5; robotY = 9.0; robotTheta = -PI/2; robotDistance = 0;
+    // FIX Bug #12: Accept optional coordinates, default to (0, 0, 0)
+    float resetX = doc["x"] | 0.0f;
+    float resetY = doc["y"] | 0.0f;
+    float resetTheta = doc["theta"] | 0.0f;
+    robotX = resetX; robotY = resetY; robotTheta = resetTheta; robotDistance = 0;
     leftTicks = rightTicks = lastTicksL = lastTicksR = 0;
     targetLeftVel = targetRightVel = 0;
     gyroTheta = encoderTheta = fusedTheta = robotTheta;
     leftPID->reset();
     rightPID->reset();
-    Serial.println("[CMD] Odometry reset.");
+    Serial.printf("[CMD] Odometry reset to (%.2f, %.2f, %.2f).\n", resetX, resetY, resetTheta);
   }
 
   if (doc["cmd"] == "set_pose") {
@@ -92,25 +96,20 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     JsonArray pathArr = doc["path"].as<JsonArray>();
     int count = pathArr.size();
     if (count > 0 && count <= MAX_WAYPOINTS) {
-      navigator.waypointCount = count;
-      navigator.currentWpIdx = 0;
+      // FIX Bug #3: Dùng loadPath() thay vì gán thủ công
+      // loadPath() sẽ reset recovery counters, progress check, ref position
+      Waypoint tempWps[MAX_WAYPOINTS];
       for (int i = 0; i < count; i++) {
-        navigator.waypoints[i].x = pathArr[i]["x"];
-        navigator.waypoints[i].y = pathArr[i]["y"];
-        navigator.waypoints[i].heading = NAN;
-        navigator.waypoints[i].useReverse = false;
+        tempWps[i].x = pathArr[i]["x"];
+        tempWps[i].y = pathArr[i]["y"];
+        tempWps[i].heading = NAN;
+        tempWps[i].useReverse = false;
       }
       float endH = NAN;
       if (!doc["finalHeading"].isNull()) {
         endH = doc["finalHeading"].as<float>() * PI / 180.0f;
       }
-      navigator.finalHeading = endH;
-      
-      navigator.state = NAV_TRACKING;
-      navigator.cmdLinear = 0;
-      navigator.cmdAngular = 0;
-      navigator.navStartTime = millis();
-      navigator.lastWpReachTime = millis();
+      navigator.loadPath(tempWps, count, endH);
       
       JsonDocument ack;
       ack["type"] = "nav_ack";
@@ -157,11 +156,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   }
 
   if (!doc["linear"].isNull() && !navigator.isNavigating()) {
-    float v = doc["linear"];
-    float w = doc["angular"];
-    targetLeftVel = constrain((v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-    targetRightVel = constrain((v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-    lastCmdTime = millis();
+    if (!brakeEnabled) {
+      float v = doc["linear"];
+      float w = doc["angular"];
+      targetLeftVel = constrain((v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      targetRightVel = constrain((v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      lastCmdTime = millis();
+    }
   }
 }
 

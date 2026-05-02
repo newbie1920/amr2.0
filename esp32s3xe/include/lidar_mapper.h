@@ -16,11 +16,15 @@
 //   CONFIG
 // ============================================================
 
-/** Grid size: 10m x 10m = 40x40 cells @ 0.25m resolution */
-#define GRID_SIZE 40                    // 40x40 cells
-#define GRID_RESOLUTION 0.25f           // mét/cell
-#define GRID_WIDTH_M (GRID_SIZE * GRID_RESOLUTION)  // 10m
-#define GRID_HEIGHT_M (GRID_SIZE * GRID_RESOLUTION) // 10m
+/** Grid size: 8m x 8m = 80x80 cells @ 0.1m resolution
+ *  FIX Bug #9: Tăng từ 40x40@0.25m → 80x80@0.1m cho resolution 
+ *  phù hợp hơn (robot wheelbase = 0.17m, cell = 0.1m).
+ *  RAM usage: 80*80*1 = 6.4KB — chấp nhận được cho ESP32-S3 (320KB)
+ */
+#define GRID_SIZE 80                    // 80x80 cells
+#define GRID_RESOLUTION 0.1f            // mét/cell (khớp với web-side grid)
+#define GRID_WIDTH_M (GRID_SIZE * GRID_RESOLUTION)  // 8m
+#define GRID_HEIGHT_M (GRID_SIZE * GRID_RESOLUTION) // 8m
 
 /** Occupancy probabilities (log-odds style) */
 #define LOGODDS_OCC 50      // Ghi nhận cell bị chiếm (+ 50)
@@ -105,7 +109,9 @@ public:
       if (!pt.quality) continue;
       
       // Convert polar → Cartesian (world frame)
-      float angle_rad = (pt.angle + robot_heading) * M_PI / 180.0f;
+      // FIX Bug #4: pt.angle is in degrees, robot_heading is in radians
+      // Convert angle to radians first, THEN add heading
+      float angle_rad = (pt.angle * M_PI / 180.0f) + robot_heading;
       float end_x = robot_x + pt.distance * cosf(angle_rad);
       float end_y = robot_y + pt.distance * sinf(angle_rad);
       

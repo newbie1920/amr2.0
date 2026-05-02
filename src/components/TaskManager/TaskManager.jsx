@@ -12,6 +12,54 @@ import { SHELVES, GATES, findSlotById } from '../../core/warehouse.js';
 import { navWorkerApi } from '../../core/navWorkerSetup.js';
 import vi from '../../i18n/vi.js';
 import { supabase } from '../../utils/supabaseClient.js';
+import useInventoryStore from '../../stores/inventoryStore.js';
+import { injectTrafficIntoGridData } from '../../core/trafficManager.js';
+
+export async function executeTaskStep(task, robotId, onPathGenerated) {
+  if (!task || !robotId) return false;
+  if (task.currentStepIdx >= task.steps.length) return false;
+
+  const step = task.steps[task.currentStepIdx];
+  const targetX = step.target.x;
+  const targetY = step.target.y;
+  const heading = step.target.heading || 90;
+
+  const robot = useRobotStore.getState().robots[robotId];
+  if (!robot) return false;
+
+  const mapState = useMapStore.getState();
+  const mapGrid = mapState.mapperInstances?.[robotId] || mapState.occupancyGrid?.[robotId];
+  const gridData = mapGrid ? mapGrid.serialize() : null;
+  if (!gridData) { 
+    alert('Không có bản đồ để tìm đường!'); 
+    return false; 
+  }
+
+  try {
+    const navSessions = useNavStore.getState().appNavigationSessions;
+    const trafficGridData = injectTrafficIntoGridData(gridData, robotId, useRobotStore.getState().robots, navSessions);
+    const result = await navWorkerApi.findPath(trafficGridData, robot.telemetry.x, robot.telemetry.y, targetX, targetY, true, true);
+    
+    console.log('[TaskManager] findPath result:', result, 'to', targetX, targetY);
+    
+    if (result.success && result.path.length > 1) {
+      if (onPathGenerated) onPathGenerated(result.path);
+      const { navigateRobot } = useNavStore.getState();
+      navigateRobot(robotId, result.path, heading);
+      
+      const { updateTask } = useTaskStore.getState();
+      updateTask(task.id, { status: 'in_progress', assignedRobotId: robotId, error: null, dbUpdated: false });
+      return true;
+    } else {
+      alert(`Không tìm được đường đi đến: ${step.description}`);
+      return false;
+    }
+  } catch (e) {
+    console.error('Path error:', e);
+    alert('Lỗi tìm đường: ' + e.message);
+    return false;
+  }
+}
 
 // === VISUAL SHELF COMPONENT ===
 function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType }) {
@@ -30,7 +78,7 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
   return (
     <div style={{ marginTop: '12px', padding: '10px', background: 'var(--bg-lighter)', borderRadius: 'var(--radius-md)' }}>
       <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '8px', textAlign: 'center' }}>
-        {taskType === 'import' ? '👇 Bấm vào ô TRỐNG để chọn vị trí cất hàng' : '📍 Vị trí hàng trong kho (Tự động chọn)'}
+        {taskType === 'import' ? '📍 Hệ thống tự động chỉ định ô trống cho hàng mới' : '📍 Vị trí hàng trong kho (Tự động chọn)'}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', paddingBottom: '8px' }}>
         {SHELVES.map(shelf => (
@@ -72,19 +120,21 @@ function VisualShelfSelector({ inventory, selectedSlotId, onSelectSlot, taskType
                    return (
                      <div 
                        key={slot.id}
-                       onClick={() => canSelect && onSelectSlot(slot.id, itemInSlot)}
+                       onClick={() => {
+                         // Cho phép click để xem thông tin của hàng cũ nếu muốn
+                       }}
                        style={{
                          flex: 1, minWidth: 0, height: '40px', 
                          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                          border: `1px solid ${borderColor}`,
                          background: bgColor,
                          borderRadius: '4px',
-                         cursor: canSelect ? 'pointer' : 'not-allowed',
-                         opacity: canSelect ? 1 : 0.5,
+                         cursor: 'default',
+                         opacity: isOccupied ? 1 : 0.6,
                          transition: 'all 0.2s',
                          overflow: 'hidden'
                        }}
-                       title={isOccupied ? `${itemInSlot.name} (SL:${itemInSlot.quantity})` : 'Trống'}
+                       title={isOccupied ? `${itemInSlot.name} (SL:${itemInSlot.quantity})` : 'Trống (Hệ thống sẽ tự động cấp phát khi nhập hàng)'}
                      >
                        <span style={{ fontSize: '9px', color: 'var(--text-muted)' }}>{l.name} - Ô {slot.id.split('_').pop()}</span>
                        <span style={{ fontSize: '10px', fontWeight: 'bold', color: textColor, whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', width: '100%', textAlign: 'center' }}>
@@ -108,9 +158,10 @@ export default function TaskManager({ onPathGenerated }) {
   const [taskType, setTaskType] = useState('import');
   const [showForm, setShowForm] = useState(false);
   
-  // WMS Form States
-  const [inventory, setInventory] = useState([]);
-  const [loadingInv, setLoadingInv] = useState(false);
+  // Global Inventory Store
+  const inventory = useInventoryStore((s) => s.inventory);
+  const setupSubscription = useInventoryStore((s) => s.setupSubscription);
+  const fetchInventory = useInventoryStore((s) => s.fetchInventory);
   
   const [importType, setImportType] = useState('new'); // 'new' | 'existing'
   const [selectedSku, setSelectedSku] = useState('');
@@ -126,23 +177,14 @@ export default function TaskManager({ onPathGenerated }) {
   const robots = useRobotStore((s) => s.robots);
   const connectedRobots = Object.values(robots).filter(r => r.status === 'connected');
 
-  // Load Inventory from Supabase
-  const loadInventory = async () => {
-    setLoadingInv(true);
-    try {
-      const { data, error } = await supabase.from('inventory').select('*');
-      if (!error && data) {
-        setInventory(data);
-      }
-    } catch (e) {
-      console.log('No supabase connection yet', e);
-    }
-    setLoadingInv(false);
-  };
-
+  // Load Inventory and Subscriptions
   useEffect(() => {
-    loadInventory();
-  }, [showForm]);
+    fetchInventory();
+    const unsubscribe = setupSubscription();
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [fetchInventory, setupSubscription]);
 
   const handleSelectSlotVisual = (slotId, itemInSlot) => {
     setUserSelectedSlotId(slotId);
@@ -178,11 +220,27 @@ export default function TaskManager({ onPathGenerated }) {
 
     if (taskType === 'import') {
       if (importType === 'new') {
-        if (!userSelectedSlotId) return alert('Vui lòng chọn 1 ô trống trên Kệ để chứa hàng mới!');
         if (!newName) return alert('Vui lòng nhập Tên Hàng Hóa!');
         if (requireSku && !newSku) return alert('Vui lòng nhập Mã SKU!');
         
-        targetSlotId = userSelectedSlotId;
+        // Auto-find first empty slot
+        let foundEmptySlot = null;
+        for (const shelf of SHELVES) {
+          for (const lvl of shelf.levels) {
+            for (const slot of lvl.slots) {
+              if (!inventory.some(i => i.slot_id === slot.id)) {
+                foundEmptySlot = slot.id;
+                break;
+              }
+            }
+            if (foundEmptySlot) break;
+          }
+          if (foundEmptySlot) break;
+        }
+        
+        if (!foundEmptySlot) return alert('Không tìm thấy ô trống nào trên kệ! Kho đã đầy.');
+        
+        targetSlotId = foundEmptySlot;
         finalSku = newSku || `FREERUN-${Date.now()}`;
         finalName = newName;
       } else {
@@ -225,6 +283,25 @@ export default function TaskManager({ onPathGenerated }) {
 
     if (!targetSlotId) return;
 
+    const slotInfo = findSlotById(targetSlotId);
+    if (!slotInfo) return alert('Không tìm thấy thông tin ô kệ!');
+
+    const gate = Object.values(GATES).find(g => g.id === selectedGateId);
+    if (!gate) return alert('Không tìm thấy thông tin cổng!');
+
+    let steps = [];
+    if (taskType === 'import') {
+      steps = [
+        { description: `Đi tới cổng ${gate.id} lấy hàng`, target: { x: gate.x, y: gate.y, heading: gate.heading || 90 } },
+        { description: `Cất hàng vào kệ ${slotInfo.slot.id}`, target: { x: slotInfo.slot.approach.x, y: slotInfo.slot.approach.y, heading: slotInfo.slot.heading || 90 } }
+      ];
+    } else {
+      steps = [
+        { description: `Đi lấy hàng ở kệ ${slotInfo.slot.id}`, target: { x: slotInfo.slot.approach.x, y: slotInfo.slot.approach.y, heading: slotInfo.slot.heading || 90 } },
+        { description: `Chở hàng ra cổng ${gate.id}`, target: { x: gate.x, y: gate.y, heading: gate.heading || 90 } }
+      ];
+    }
+
     console.log('[TaskManager] Creating task:', { taskType, targetSlotId, finalSku, finalName, quantity, selectedGateId });
 
     const task = createTask(taskType, targetSlotId, {
@@ -233,30 +310,24 @@ export default function TaskManager({ onPathGenerated }) {
       qty: quantity,
       importType: taskType === 'import' ? importType : undefined,
       gateId: selectedGateId
-    });
+    }, steps);
 
     // Auto routing → Tìm xe rảnh rỗi và đủ pin
-    // 1. Lọc xe đang rảnh (nav === 'IDLE' hoặc DONE/ERROR) và pin > 20%
     const availableRobots = connectedRobots.filter(r => {
       const navStatus = r.telemetry?.nav || 'IDLE';
-      const batt = r.telemetry?.batt ?? 100;
-      // Xe chưa nhận nhiệm vụ chạy nào hoặc đã xong
-      const isIdle = navStatus === 'IDLE' || navStatus === 'DONE' || navStatus === 'ERROR';
-      // Kiểm tra không có task in_progress nào đang gắn vào xe này
+      const batt = r.telemetry?.battery ?? 100;
+      const isIdle = navStatus === 'IDLE' || navStatus === 'DONE' || navStatus === 'ERROR' || navStatus === 'CANCELED';
       const hasActiveTask = tasks.some(t => t.assignedRobotId === r.id && (t.status === 'in_progress' || t.status === 'assigned'));
       return isIdle && batt > 20 && !hasActiveTask;
     });
 
     if (availableRobots.length > 0) {
-      // 2. Tìm xe gần điểm bắt đầu nhất
       let startPoint = { x: 0, y: 0 };
-      const slotInfo = findSlotById(targetSlotId);
       
       if (taskType === 'import') {
-         const gate = Object.values(GATES).find(g => g.id === selectedGateId);
-         if (gate) { startPoint = { x: gate.x, y: gate.y }; }
+         startPoint = { x: gate.x, y: gate.y };
       } else {
-         if (slotInfo) { startPoint = { x: slotInfo.slot.approach.x, y: slotInfo.slot.approach.y }; }
+         startPoint = { x: slotInfo.slot.approach.x, y: slotInfo.slot.approach.y };
       }
 
       availableRobots.sort((a, b) => {
@@ -266,53 +337,21 @@ export default function TaskManager({ onPathGenerated }) {
       });
 
       const robot = availableRobots[0];
+      
+      const { updateTask } = useTaskStore.getState();
+      updateTask(task.id, { 
+        assignedRobotId: robot.id, 
+        status: 'in_progress',
+        error: null
+      });
 
-      if (slotInfo) {
-        // Bước 1: Tìm đường A* từ xe → ô kệ
-        const mapState = useMapStore.getState();
-        const mapGrid = mapState.mapperInstances?.[robot.id] || mapState.occupancyGrid?.[robot.id];
-        const gridData = mapGrid ? mapGrid.serialize() : null;
-        console.log('[TaskManager] Grid lookup:', { robotId: robot.id, hasMapper: !!mapState.mapperInstances?.[robot.id], hasGrid: !!mapState.occupancyGrid?.[robot.id], gridData: !!gridData });
-        if (!gridData) { 
-          console.warn('[TaskManager] No map grid available for pathfinding');
-          alert('⚠️ Chưa có bản đồ! Vui lòng Spawn lại SimBot hoặc quét bản đồ trước.'); 
-          return; 
-        }
-        
-        try {
-          const result = await navWorkerApi.findPath(
-            gridData,
-            robot.telemetry.x, robot.telemetry.y,
-            slotInfo.slot.approach.x, slotInfo.slot.approach.y
-          );
-          console.log('[TaskManager] A* result:', { success: result.success, pathLen: result.path?.length, from: `(${robot.telemetry.x?.toFixed(2)}, ${robot.telemetry.y?.toFixed(2)})`, to: `(${slotInfo.slot.approach.x}, ${slotInfo.slot.approach.y})` });
-          
-          if (result.success) {
-            // Vẽ đường trên bản đồ 3D
-            if (onPathGenerated) onPathGenerated(result.path);
-            
-            // Bước 2: Gửi path + heading xuống ESP32
-            const { navigateRobot } = useNavStore.getState();
-            navigateRobot(robot.id, result.path, slotInfo.slot.heading || 90);
-            
-            // Gắn robot vào task và đổi trạng thái
-            const { updateTask } = useTaskStore.getState();
-            updateTask(task.id, { 
-              status: 'in_progress', 
-              assignedRobotId: robot.id,
-              dbUpdated: false 
-            });
-          } else {
-            console.error('[TaskManager] A* pathfinding failed:', result.error);
-            alert(`⚠️ Không tìm được đường đi! ${result.error || 'Đường bị chặn hoặc bản đồ chưa đủ.'}`);
-          }
-        } catch (err) {
-          console.error('[TaskManager] Pathfinding error:', err);
-          alert(`❌ Lỗi tìm đường: ${err.message}`);
-        }
-      }
+      // Update the local task reference to match what's in the store so executeTaskStep doesn't fail
+      const updatedTask = { ...task, assignedRobotId: robot.id, status: 'in_progress' };
+
+      // Execute step 0
+      executeTaskStep(updatedTask, robot.id, onPathGenerated);
     } else {
-      const debugInfo = connectedRobots.map(r => `${r.name}: nav=${r.telemetry?.nav || '?'}, batt=${r.telemetry?.batt ?? '?'}`).join(', ');
+      const debugInfo = connectedRobots.map(r => `${r.name}: nav=${r.telemetry?.nav || '?'}, batt=${r.telemetry?.battery ?? '?'}`).join(', ');
       console.warn("[TaskManager] No available robots!", { connectedCount: connectedRobots.length, robots: debugInfo });
       
       // Check if robots exist but are busy
@@ -632,7 +671,8 @@ export default function TaskManager({ onPathGenerated }) {
  * Task Card
  */
 function TaskCard({ task, onClick }) {
-  const { navStopRobot } = useRobotStore();
+  const { navStopRobot, pauseRobot, resumeRobot } = useRobotStore();
+  const { cancelTask, updateTask } = useTaskStore();
   const robots = useRobotStore((s) => s.robots);
   const robot = task.assignedRobotId ? robots[task.assignedRobotId] : null;
 
@@ -723,16 +763,72 @@ function TaskCard({ task, onClick }) {
         </div>
       )}
 
-      {/* Nav Stop button — chỉ hiện khi xe đang tự lái */}
-      {task.status === 'in_progress' && task.assignedRobotId && robot?.status === 'connected' && navState !== 'IDLE' && navState !== 'DONE' && navState !== 'ERROR' && navState !== 'PAUSED' && (
-        <button
-          className="btn btn--danger btn--sm btn--full"
-          style={{ marginTop: '8px', fontSize: '11px' }}
-          onClick={(e) => { e.stopPropagation(); navStopRobot(task.assignedRobotId); }}
-        >
-          ⛔ Dừng Tự Lái
-        </button>
-      )}
+      {/* Hành động nhanh trên thẻ */}
+      <div style={{ display: 'flex', gap: '6px', marginTop: '10px' }}>
+        {task.status === 'in_progress' && (
+          <button
+            className="btn btn--warning btn--sm"
+            style={{ flex: 1, fontSize: '11px', padding: '6px' }}
+            onClick={(e) => { 
+              e.stopPropagation(); 
+              if (task.assignedRobotId) pauseRobot(task.assignedRobotId); 
+              updateTask(task.id, { status: 'paused', error: 'Người dùng tạm dừng' });
+            }}
+          >
+            ⏸ Tạm Dừng
+          </button>
+        )}
+        
+        {(task.status === 'paused' || task.status === 'failed') && (
+          <button
+            className="btn btn--primary btn--sm"
+            style={{ flex: 1, fontSize: '11px', padding: '6px' }}
+            onClick={(e) => { 
+              e.stopPropagation(); 
+              if (task.assignedRobotId) {
+                const session = useNavStore.getState().appNavigationSessions[task.assignedRobotId];
+                if (session && session.status === 'PAUSED') {
+                  resumeRobot(task.assignedRobotId);
+                  updateTask(task.id, { status: 'in_progress', error: null });
+                } else {
+                  executeTaskStep(task, task.assignedRobotId, null);
+                }
+              }
+            }}
+          >
+            ▶ Tiếp Tục
+          </button>
+        )}
+
+        {['pending', 'assigned', 'in_progress', 'paused', 'failed'].includes(task.status) && (
+          <button
+            className="btn btn--danger btn--sm"
+            style={{ flex: 1, fontSize: '11px', padding: '6px' }}
+            onClick={(e) => { 
+              e.stopPropagation(); 
+              cancelTask(task.id, 'Người dùng chủ động hủy');
+              if (task.assignedRobotId) navStopRobot(task.assignedRobotId);
+            }}
+          >
+            ⏹ Hủy
+          </button>
+        )}
+
+        {(task.status === 'completed' || task.status === 'canceled') && (
+          <button
+            className="btn btn--sm"
+            style={{ flex: 1, fontSize: '11px', padding: '6px', border: '1px solid rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444' }}
+            onClick={(e) => { 
+              e.stopPropagation(); 
+              if (window.confirm('Bạn có chắc chắn muốn xóa vĩnh viễn nhiệm vụ này khỏi lịch sử?')) {
+                useTaskStore.getState().removeTask(task.id);
+              }
+            }}
+          >
+            🗑 Xóa
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -750,27 +846,15 @@ function TaskDetailsModal({ task, onClose, onPathGenerated }) {
     if (!robot || robot.status !== 'connected') return alert('Robot không kết nối!');
     
     if (task.status === 'paused') {
-      resumeNav(robot.id);
-      updateTask(task.id, { status: 'in_progress', error: null });
-    } else if (task.status === 'failed') {
-      const slotInfo = findSlotById(task.slotId);
-      if (!slotInfo) return alert('Không tìm thấy tọa độ đích!');
-      
-      const targetX = slotInfo.slot.approach.x;
-      const targetY = slotInfo.slot.approach.y;
-
-      const mapState = useMapStore.getState();
-      const mapGrid = mapState.mapperInstances?.[robot.id] || mapState.occupancyGrid?.[robot.id];
-      const gridData = mapGrid ? mapGrid.serialize() : null;
-      if (!gridData) { alert('Không có bản đồ để tìm đường!'); return; }
-      const result = await navWorkerApi.findPath(gridData, robot.telemetry.x, robot.telemetry.y, targetX, targetY);
-      if (result.success) {
-        if (onPathGenerated) onPathGenerated(result.path);
-        navigateRobot(robot.id, result.path, slotInfo.slot.heading || 90);
+      const session = useNavStore.getState().appNavigationSessions[robot.id];
+      if (session && session.status === 'PAUSED') {
+        resumeNav(robot.id);
         updateTask(task.id, { status: 'in_progress', error: null });
       } else {
-        alert('Không tìm được đường đi mới từ vị trí hiện tại!');
+        executeTaskStep(task, robot.id, onPathGenerated);
       }
+    } else if (task.status === 'failed') {
+      executeTaskStep(task, robot.id, onPathGenerated);
     }
     onClose();
   };
@@ -895,6 +979,19 @@ function TaskDetailsModal({ task, onClose, onPathGenerated }) {
               color: '#fff', fontWeight: 600, fontSize: '12px', cursor: 'pointer',
               boxShadow: '0 2px 8px rgba(239,68,68,0.25)'
             }}>⏹ Hủy</button>
+          )}
+          {(task.status === 'completed' || task.status === 'canceled') && (
+            <button onClick={() => {
+              if (window.confirm('Bạn có chắc chắn muốn xóa vĩnh viễn nhiệm vụ này khỏi lịch sử?')) {
+                useTaskStore.getState().removeTask(task.id);
+                onClose();
+              }
+            }} style={{
+              flex: 1, padding: '10px', borderRadius: '10px',
+              border: '1px solid rgba(239, 68, 68, 0.2)',
+              background: 'rgba(239, 68, 68, 0.1)',
+              color: '#ef4444', fontWeight: 600, fontSize: '12px', cursor: 'pointer'
+            }}>🗑 Xóa</button>
           )}
           <button onClick={onClose} style={{
             flex: 1, padding: '10px', borderRadius: '10px',

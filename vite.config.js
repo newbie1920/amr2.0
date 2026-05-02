@@ -28,4 +28,26 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  // Code-splitting: tách bundle 2MB thành chunks nhỏ hơn
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // React core + state management
+          'vendor-react': ['react', 'react-dom', 'zustand'],
+          // 3D visualization (react-three-fiber, three.js)
+          'vendor-3d': ['@react-three/fiber', '@react-three/drei', 'three'],
+          // Database & messaging
+          'vendor-data': ['@supabase/supabase-js', '@msgpack/msgpack'],
+          // Simulation engine (heavy computation)
+          'sim-engine': [
+            './src/core/sim/simEngine.js',
+            './src/core/sim/simLidar.js',
+            './src/core/sim/simWorld.js',
+          ],
+        },
+      },
+    },
+  },
 }));

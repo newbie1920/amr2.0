@@ -49,20 +49,46 @@ const useTaskStore = create(
         const t = get().tasks.find(t => t.id === taskId);
         if (!t || t.dbUpdated) return;
 
-        set((state) => ({
-          tasks: state.tasks.map(task =>
-            task.id === taskId ? { ...task, dbUpdated: true } : task
-          ),
-        }));
-
         if (navState === 'ERROR') {
           get().updateTask(taskId, { status: 'failed', error: errorMsg });
           return;
         }
 
         if (navState === 'DONE') {
+          // If the task has multiple steps and we haven't finished them all
+          if (t.steps && t.steps.length > 0 && t.currentStepIdx < t.steps.length - 1) {
+            get().updateTask(taskId, { 
+              currentStepIdx: t.currentStepIdx + 1,
+              status: 'in_progress'
+            });
+            
+            // Auto-start next step
+            import('../components/TaskManager/TaskManager.jsx').then(module => {
+              const updatedTask = get().tasks.find(tk => tk.id === taskId);
+              if (updatedTask && updatedTask.assignedRobotId) {
+                module.executeTaskStep(updatedTask, updatedTask.assignedRobotId, null);
+              }
+            }).catch(e => console.error("Error auto-starting next step:", e));
+            return; // Do not complete the task yet
+          }
+
+          // Otherwise, it's the final step. Mark as dbUpdated and complete
+          set((state) => ({
+            tasks: state.tasks.map(task =>
+              task.id === taskId ? { ...task, dbUpdated: true } : task
+            ),
+          }));
+
           try {
             const info = t.orderInfo;
+            
+            // Skip DB sync if Supabase is not configured
+            if (!supabase) {
+              console.warn('[Task] Supabase not configured — skipping inventory sync');
+              get().updateTask(taskId, { status: 'completed', completedAt: Date.now(), currentStepIdx: t.steps?.length || 1 });
+              return;
+            }
+            
             // Get current inventory
             const { data: inventory } = await supabase.from('inventory').select('*');
             
@@ -90,7 +116,7 @@ const useTaskStore = create(
                 }
               }
             }
-            get().updateTask(taskId, { status: 'completed', completedAt: Date.now() });
+            get().updateTask(taskId, { status: 'completed', completedAt: Date.now(), currentStepIdx: t.steps?.length || 1 });
             
             // Note: Bắn event để TaskManager biết load lại inventory nếu cần
             window.dispatchEvent(new Event('inventory_changed'));
@@ -104,7 +130,7 @@ const useTaskStore = create(
       /**
        * Tạo nhiệm vụ mới
        */
-      createTask: (type, slotId, orderInfo = {}) => {
+      createTask: (type, slotId, orderInfo = {}, steps = []) => {
         const id = get().taskIdCounter;
         const task = {
           id,
@@ -113,7 +139,7 @@ const useTaskStore = create(
           orderInfo,
           status: 'pending',
           assignedRobotId: null,
-          steps: [],
+          steps: steps,
           currentStepIdx: 0,
           createdAt: Date.now(),
           completedAt: null,

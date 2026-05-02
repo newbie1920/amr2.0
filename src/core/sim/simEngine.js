@@ -29,10 +29,10 @@ const PHYSICS_DT = 1.0 / PHYSICS_HZ;  // 20ms
 const LIDAR_EVERY_N_STEPS = 5;        // Lidar mỗi 5 steps = 10Hz
 
 // Robot physical constraints
-const MAX_LINEAR_VEL = 0.3;    // m/s
-const MAX_ANGULAR_VEL = 2.0;   // rad/s
-const LINEAR_ACCEL = 0.5;      // m/s² (acceleration limit)
-const ANGULAR_ACCEL = 3.0;     // rad/s²
+const MAX_LINEAR_VEL = 1.0;    // m/s
+const MAX_ANGULAR_VEL = 3.0;   // rad/s
+const LINEAR_ACCEL = 2.0;      // m/s² (acceleration limit)
+const ANGULAR_ACCEL = 5.0;     // rad/s²
 
 // Odometry noise (simulating encoder drift)
 const ODOM_NOISE_LINEAR = 0.002;   // m per step

@@ -17,6 +17,7 @@ import useNavStore from '../../stores/navStore.js';
 import { getExplorationPhase, getExplorationInfo } from '../../core/exploration.js';
 import vi from '../../i18n/vi.js';
 import MapManager from '../MapManager/MapManager.jsx';
+import useInventoryStore from '../../stores/inventoryStore.js';
 
 // ============================================================
 //   OCCUPANCY GRID 3D MESH (Textured Plane)
@@ -203,6 +204,7 @@ function WorldLidarPoints({ robotX2D, robotY2D, robotTheta, lidar, warehouseCX, 
 function RealisticShelf({ shelf, cx, cz }) {
   const map2To3X = (x) => x - cx;
   const map2To3Z = (y) => -(y - cz);
+  const inventory = useInventoryStore((s) => s.inventory);
 
   const w = (shelf.bounds.x2 - shelf.bounds.x1);
   const d = (shelf.bounds.y2 - shelf.bounds.y1);
@@ -248,13 +250,21 @@ function RealisticShelf({ shelf, cx, cz }) {
             {lvl.slots.map((slot, sIdx) => {
               const slotW = w / lvl.slots.length;
               const slotCenterLocalX = -w/2 + slotW/2 + sIdx * slotW;
+              const isOccupied = inventory.some(i => i.slot_id === slot.id);
               
               return (
                 <group key={slot.id} position={[slotCenterLocalX, yBase + 0.4, 0]}>
                    {/* Bin Box */}
                    <Box args={[slotW - 0.05, 0.8, d - 0.1]} castShadow receiveShadow>
-                     <meshStandardMaterial color="#1e293b" transparent opacity={0.5} polygonOffset polygonOffsetFactor={1} />
-                     <Edges color="#475569" />
+                     <meshStandardMaterial 
+                       color={isOccupied ? "#ef4444" : "#1e293b"} 
+                       emissive={isOccupied ? "#ef4444" : "#000000"}
+                       emissiveIntensity={isOccupied ? 0.5 : 0}
+                       transparent 
+                       opacity={isOccupied ? 0.8 : 0.5} 
+                       polygonOffset polygonOffsetFactor={1} 
+                     />
+                     <Edges color={isOccupied ? "#f87171" : "#475569"} />
                    </Box>
                    {/* Front Label */}
                    <Text position={[0, 0, d/2 - 0.04]} fontSize={0.12} color="#bae6fd" anchorY="bottom" anchorX="center">
@@ -446,21 +456,22 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         <OccupancyGridMesh grid={activeGrid} cx={cx} cz={cz} />
       )}
 
-      {/* Active Path Line */}
-      {activePath && activePath.length > 1 && (
-        <group>
-          {activePath.map((pt, i) => {
-            if (i === 0) return null;
-            const prev = activePath[i - 1];
-            // Simple path geometry using multiple boxes or tubes (for simplicity just dots here)
-            return (
-              <Sphere key={i} args={[0.05]} position={[map2To3X(pt.x), 0.1, map2To3Z(pt.y)]}>
-                <meshStandardMaterial color="#3b82f6" emissive="#3b82f6" emissiveIntensity={1} />
-              </Sphere>
-            );
-          })}
-        </group>
-      )}
+      {/* Active Paths for all robots */}
+      {Object.values(useNavStore((s) => s.appNavigationSessions) || {}).map((session, index) => {
+        if (!session || session.active !== true || !Array.isArray(session.path) || session.path.length <= 1) return null;
+        return (
+          <group key={session.robotId}>
+            {session.path.map((pt, i) => {
+              if (i === 0) return null;
+              return (
+                <Sphere key={i} args={[0.05]} position={[map2To3X(pt.x), 0.1, map2To3Z(pt.y)]}>
+                  <meshStandardMaterial color="#3b82f6" emissive="#3b82f6" emissiveIntensity={1} />
+                </Sphere>
+              );
+            })}
+          </group>
+        );
+      })}
 
       {/* Robots */}
       {Object.values(robots).map(robot => {
@@ -554,7 +565,7 @@ export default function WarehouseMap({ activePath }) {
   const stopMapping = useMapStore((s) => s.stopMapping);
   const saveMap = useMapStore((s) => s.saveMap);
   const loadMap = useMapStore((s) => s.loadMap);
-  const [viewMode, setViewMode] = useState('iso'); // 'free', 'top', 'iso'
+  const [viewMode, setViewMode] = useState('free'); // 'free', 'top', 'iso'
   const [mapType, setMapType] = useState('3d'); // '3d', 'lidar'
   const [showMapManager, setShowMapManager] = useState(false);
   const [showControls, setShowControls] = useState(true);

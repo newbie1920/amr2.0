@@ -15,6 +15,7 @@ import { create } from 'zustand';
 import { VEL_SOURCE } from '../core/velocityMux.js';
 import { normalizeAngle } from '../core/mathUtils.js';
 import { navWorkerApi } from '../core/navWorkerSetup.js';
+import { injectTrafficIntoGridData } from '../core/trafficManager.js';
 import { registerStore, getRobotStoreState, getMapStoreState, getDWAStoreState } from './storeRegistry.js';
 
 // NOTE: useRobotStore is NOT imported at top-level to avoid circular dependency.
@@ -46,9 +47,9 @@ const APP_NAV = {
   waypointReachTolerance: 0.22,
   // Pure Pursuit parameters
   lookaheadDist: 0.5,           // Look-ahead distance (meters)
-  maxLinearVel: 0.35,           // Max forward speed
+  maxLinearVel: 0.8,            // Max forward speed
   minLinearVel: 0.05,           // Min forward speed
-  maxAngularVel: 1.2,           // Max turning speed
+  maxAngularVel: 2.0,           // Max turning speed
   pursuitGain: 2.0,             // Angular gain for Pure Pursuit
   curveSlowdown: 0.4,           // Speed reduction factor when turning hard
   obstacleDwaThreshold: 8000,   // Only engage DWA if stuck for > 8s (ms)
@@ -376,7 +377,10 @@ const useNavStore = create((set, get) => ({
           navComputationBusy: { ...s.navComputationBusy, [id]: true },
         }));
 
-        navWorkerApi.findPath(grid.serialize(), pose.x, pose.y, goal.x, goal.y, true, true)
+        const navSessions = get().appNavigationSessions;
+        const trafficGridData = injectTrafficIntoGridData(grid.serialize(), id, robotState.robots, navSessions);
+
+        navWorkerApi.findPath(trafficGridData, pose.x, pose.y, goal.x, goal.y, true, true)
           .then((result) => {
             const fresh = get().appNavigationSessions[id];
             if (!fresh?.active) return;
@@ -677,9 +681,13 @@ const useNavStore = create((set, get) => ({
     }
 
     try {
+      // Bơm thông tin luồng giao thông (vị trí/lộ trình các xe khác) vào bản đồ
+      const navSessions = get().appNavigationSessions;
+      const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
+
       // allowUnknown=true: Robot can navigate through unexplored space (Nav2 default)
       // useCostmap=true: A* respects inflation costs to stay away from walls
-      const result = await navWorkerApi.findPath(grid.serialize(), startX, startY, goalX, goalY, true, true);
+      const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
       if (result.success && result.path.length > 1) {
         console.log(`[NavStore] ✅ Path found: ${result.path.length} waypoints. Path:`, result.path.map(p => `(${p.x.toFixed(3)}, ${p.y.toFixed(3)})`).join(' -> '));
         get().startAppNavigation(robotId, result.path, finalHeading);

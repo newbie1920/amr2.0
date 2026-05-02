@@ -88,6 +88,7 @@ public:
   float ref_x = 0;
   float ref_y = 0;
   float ref_theta = 0;
+  bool refInitialized = false; // FIX Bug #5: Dùng flag thay vì so sánh position
 
   // Sai số điều khiển (để vẽ biểu đồ trên Web)
   float error_x = 0;
@@ -119,6 +120,7 @@ public:
     cmdAngular = 0;
     navStartTime = millis();
     recoveryAttempts = 0;
+    refInitialized = false; // Reset flag mỗi lần load path mới
     
     if (count > 0) {
       state = NAV_TRACKING;
@@ -261,11 +263,14 @@ public:
     
     if (state == NAV_TRACKING) {
       // 1. Gắn Virtual Robot vào vị trí hiện tại của xe trong tick đầu tiên
-      if (ref_x == 0 && ref_y == 0 && currentWpIdx == 0) {
+      // FIX Bug #5: Dùng boolean flag thay vì so sánh ref_x == 0
+      // (vì robot có thể spawn tại origin 0,0)
+      if (!refInitialized) {
           ref_x = robotX;
           ref_y = robotY;
           progressCheckX = robotX;
           progressCheckY = robotY;
+          refInitialized = true;
       }
 
       Waypoint& wp = waypoints[currentWpIdx];

@@ -155,9 +155,9 @@ void read_ina3221() {
   static unsigned long lastInaDebug = 0;
   if (millis() - lastInaDebug > 5000) {
     lastInaDebug = millis();
-    Serial.printf("[INA3221] CH1: %.2fV %.3fA | CH2: %.2fV %.3fA | CH3: %.2fV %.3fA\n",
-                  ina_busV[0], ina_currentA[0],
-                  ina_busV[1], ina_currentA[1],
-                  ina_busV[2], ina_currentA[2]);
+    // Serial.printf("[INA3221] CH1: %.2fV %.3fA | CH2: %.2fV %.3fA | CH3: %.2fV %.3fA\n",
+    //               ina_busV[0], ina_currentA[0],
+    //               ina_busV[1], ina_currentA[1],
+    //               ina_busV[2], ina_currentA[2]);
   }
 }

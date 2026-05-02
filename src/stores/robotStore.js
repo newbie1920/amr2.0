@@ -6,16 +6,13 @@
 import { create } from 'zustand';
 import { RobotConnection } from '../core/robotProtocol.js';
 import { OccupancyGrid } from '../core/lidarMapper.js';
-import { ScanMatcher } from '../core/scanMatcher.js';
-import { startExploration, stopExploration, getExplorationInfo } from '../core/exploration.js';
 import { VelocityMux, VEL_SOURCE } from '../core/velocityMux.js';
-import { navWorkerApi } from '../core/navWorkerSetup.js';
 import { SimEngine } from '../core/sim/simEngine.js';
-import { DWA_DEFAULTS } from '../core/dwaPlanner.js';
 import useMapStore from './mapStore.js';
 import useDWAStore from './dwaStore.js';
 import useSimStore from './simStore.js';
 import { registerStore, getNavStoreState } from './storeRegistry.js';
+import { injectTrafficIntoGridData } from '../core/trafficManager.js';
 
 function saveRobotsToStorage(robots) {
   const data = Object.values(robots).map((r) => ({
@@ -31,45 +28,9 @@ function saveRobotsToStorage(robots) {
 //   STORAGE HELPERS (localStorage)
 // ============================================================
 
-const MAP_STORAGE_KEY = 'amr_saved_maps';
-const DWA_CONFIG_KEY = 'amr_dwa_config';
-const DWA_PRESETS_KEY = 'amr_dwa_presets';
 
-function loadDWAConfigFromStorage() {
-  try {
-    const raw = localStorage.getItem(DWA_CONFIG_KEY);
-    return raw ? { ...DWA_DEFAULTS, ...JSON.parse(raw) } : { ...DWA_DEFAULTS };
-  } catch (e) {
-    return { ...DWA_DEFAULTS };
-  }
-}
 
-function loadCustomPresetsFromStorage() {
-  try {
-    const raw = localStorage.getItem(DWA_PRESETS_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch (e) {
-    return {};
-  }
-}
 
-function loadSavedMapsFromStorage() {
-  try {
-    const raw = localStorage.getItem(MAP_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch (e) {
-    console.error('[MapStorage] Error loading maps:', e);
-    return [];
-  }
-}
-
-function saveMapsToStorage(maps) {
-  try {
-    localStorage.setItem(MAP_STORAGE_KEY, JSON.stringify(maps));
-  } catch (e) {
-    console.error('[MapStorage] Error saving maps:', e);
-  }
-}
 
 function setRobotArchitectureProfile(robot, profile) {
   if (robot?.connection?.connected) {
@@ -95,10 +56,7 @@ const useRobotStore = create((set, get) => ({
   simInfo: {},             // { robotId: { running, simTime, rtf, ... } }
   simWorldSegments: [],    // Cached world segments for 3D visualization
 
-  // ── DWA TUNING (Phase 3) ──────────────────────────────────
-  dwaConfig: loadDWAConfigFromStorage(),      // Live DWA parameters
-  dwaActivePreset: 'balanced',                // Current preset name
-  dwaCustomPresets: loadCustomPresetsFromStorage(), // User-saved presets
+
 
   // ============================================================
   //   ACTIONS
@@ -137,6 +95,9 @@ const useRobotStore = create((set, get) => ({
     const muxTimer = setInterval(() => mux.tick(), 200);
     // Lưu mux instance
     get().velocityMuxes[id] = mux;
+    // FIX Bug #10: Lưu timer để cleanup khi removeRobot()
+    if (!get()._muxTimers) get()._muxTimers = {};
+    get()._muxTimers[id] = muxTimer;
 
     let lastUpdate = 0;
     // Lắng nghe telemetry
@@ -170,8 +131,8 @@ const useRobotStore = create((set, get) => ({
         telem.nav_total = effectiveTelem.nav_total;
       }
       
-      // Throttle UI update to ~1Hz (1000ms) to rescue React re-render cycle
-      if (now - lastUpdate > 1000) {
+      // Throttle UI update to ~5Hz (200ms) for smooth robot position display
+      if (now - lastUpdate > 200) {
         lastUpdate = now;
         set((state) => {
           if (!state.robots[id]) return state;
@@ -208,8 +169,15 @@ const useRobotStore = create((set, get) => ({
             const activeTask = taskStore.tasks.find(t => t.status === 'in_progress' && t.assignedRobotId === id);
             
             if (activeTask && activeTask.goalX != null && activeTask.goalY != null) {
-              const gridData = get().grid.serialize();
-              navWorkerApi.findPath(gridData, effectiveTelem.x, effectiveTelem.y, activeTask.goalX, activeTask.goalY)
+              const mapState = useMapStore.getState();
+              const mapGrid = mapState.mapperInstances?.[id] || mapState.occupancyGrid?.[id];
+              const gridData = mapGrid ? mapGrid.serialize() : null;
+              
+              if (gridData) {
+                const navSessions = getNavStoreState().appNavigationSessions;
+                const trafficGridData = injectTrafficIntoGridData(gridData, id, currentState.robots, navSessions);
+
+                navWorkerApi.findPath(trafficGridData, effectiveTelem.x, effectiveTelem.y, activeTask.goalX, activeTask.goalY, true, true)
                 .then(result => {
                   if (result.success && result.path.length > 1) {
                     console.log(`[Replan] Tìm được đường mới qua Grid: ${result.path.length} waypoints`);
@@ -226,6 +194,9 @@ const useRobotStore = create((set, get) => ({
                   console.error('[Replan] NavWorker lỗi:', e);
                   set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
                 });
+              } else {
+                set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
+              }
             } else {
               set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
             }
@@ -328,6 +299,11 @@ const useRobotStore = create((set, get) => ({
     if (robot) {
       try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch(e) {}
       robot.connection.disconnect();
+      // FIX Bug #10: Cleanup muxTimer
+      if (get()._muxTimers?.[id]) {
+        clearInterval(get()._muxTimers[id]);
+        delete get()._muxTimers[id];
+      }
       set((state) => {
         const { [id]: removed, ...rest } = state.robots;
         saveRobotsToStorage(rest);
@@ -465,42 +441,7 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
-  // ============================================================
-  //   LIDAR MAPPING ACTIONS (Delegated to mapStore)
-  // ============================================================
-  // Note: These actions are now managed entirely by mapStore.js
-  // We keep stubs for backwards compatibility if needed, 
-  // but components should use useMapStore directly.
 
-  /** Import map từ JSON file vào danh sách */
-  importMapFromJSON: (jsonData, name = null) => {
-    try {
-      // Validate
-      if (!jsonData || (jsonData.version !== 1 && jsonData.version !== 2)) {
-        throw new Error('Invalid map format');
-      }
-      
-      const mapEntry = {
-        id: `map_${Date.now()}`,
-        name: name || `Imported ${new Date().toLocaleDateString('vi-VN')}`,
-        robotId: 'imported',
-        createdAt: jsonData.timestamp || Date.now(),
-        scanCount: jsonData.scanCount || 0,
-        width: jsonData.width,
-        height: jsonData.height,
-        resolution: jsonData.resolution,
-        data: jsonData,
-      };
-      const maps = [...get().savedMaps, mapEntry];
-      set({ savedMaps: maps });
-      saveMapsToStorage(maps);
-      console.log(`[MapManager] Imported map: ${mapEntry.name}`);
-      return true;
-    } catch (err) {
-      console.error('[MapManager] Import error:', err);
-      return false;
-    }
-  },
 
   // Getters
   getRobot: (id) => get().robots[id],
@@ -515,10 +456,16 @@ const useRobotStore = create((set, get) => ({
    * Thêm robot mô phỏng (không cần IP/WebSocket)
    * Robot sẽ chạy hoàn toàn bằng SimEngine trong browser
    */
-  addSimRobot: (name = 'SimBot', spawnX = 5.0, spawnY = 1.5, spawnTheta = Math.PI / 2) => {
+  addSimRobot: (name = 'SimBot', spawnX = undefined, spawnY = undefined, spawnTheta = Math.PI / 2) => {
     const id = `sim_${Date.now()}`;
     const engine = new SimEngine();
-    engine.reset(spawnX, spawnY, spawnTheta);
+    
+    // Offset spawn position if multiple robots are running to avoid them spawning on top of each other
+    const numSims = Object.keys(get().simEngines).length;
+    const finalX = spawnX !== undefined ? spawnX : 5.0;
+    const finalY = spawnY !== undefined ? spawnY : 1.5 + (numSims * 1.0); // Offset by 1m per robot
+
+    engine.reset(finalX, finalY, spawnTheta);
 
     // Velocity Mux (giống robot thật)
     const mux = new VelocityMux();
@@ -589,8 +536,8 @@ const useRobotStore = create((set, get) => ({
         });
       }
 
-      // Throttle UI update to ~2Hz
-      if (now - lastUIUpdate > 500) {
+      // Throttle UI update to ~5Hz for smooth simulation rendering
+      if (now - lastUIUpdate > 200) {
         lastUIUpdate = now;
         const info = engine.getSimInfo();
         set((s) => {
@@ -791,12 +738,7 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
-  // ── DWA actions delegated to dwaStore.js ──
-  setDWAConfig: (p) => { try { useDWAStore.getState().setDWAConfig(p); } catch(e) {} },
-  resetDWAConfig: () => { try { useDWAStore.getState().resetDWAConfig(); } catch(e) {} },
-  loadDWAPreset: (n) => { try { useDWAStore.getState().loadDWAPreset(n); } catch(e) {} },
-  saveDWAPreset: (n) => { try { useDWAStore.getState().saveDWAPreset(n); } catch(e) {} },
-  deleteDWAPreset: (n) => { try { useDWAStore.getState().deleteDWAPreset(n); } catch(e) {} },
+
 }));
 
 // Register in store registry for cross-store access (navStore accesses this via registry)
