@@ -13,6 +13,7 @@
 #include "odometry.h"
 #include "imu_sensor.h"
 #include "lidar_mapper.h"
+#include "pathfinder.h"
 
 extern WebServer server;
 extern WebSocketsServer webSocket;
@@ -20,6 +21,7 @@ extern WiFiManager wm;
 
 extern Navigator navigator;
 extern OccupancyGridMapper gridMapper;
+extern AStarPathfinder astar;
 extern uint16_t lidarDists[360];
 extern bool obstacleDetected;
 extern unsigned long timeObstacleLastDetected;
@@ -47,6 +49,16 @@ void setArchitectureProfile(const char* profile) {
 }
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+  // Raw binary handlers for custom protocols
+  if (type == WStype_BIN && length > 0) {
+    if (payload[0] == 0x03) {
+      // MAP_DATA (Raw occupancy grid)
+      astar.updateStaticMap(payload + 1, length - 1);
+      Serial.printf("[NET] Nhận Static Map: %d bytes\n", length - 1);
+      return;
+    }
+  }
+
   // Dual-mode: Accept both JSON (TEXT) and MessagePack (BIN)
   JsonDocument doc;
   if (type == WStype_TEXT) {
@@ -118,6 +130,40 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       static uint8_t outBuf[64];
       size_t ackLen = serializeMsgPack(ack, outBuf, sizeof(outBuf));
       webSocket.sendBIN(num, outBuf, ackLen);
+    }
+  }
+
+  // ── KIẾN TRÚC PHÂN TÁN (Decentralized Architecture) ──
+  
+  if (doc["cmd"] == "goto") {
+    if (!allowOnboardNavigation) return;
+    
+    float targetX = doc["x"];
+    float targetY = doc["y"];
+    float endH = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
+    
+    Serial.printf("[NET] Received GOTO: %.2f, %.2f\n", targetX, targetY);
+    
+    Waypoint tempWps[MAX_WAYPOINTS];
+    int count = astar.computePath(robotX, robotY, targetX, targetY, tempWps, MAX_WAYPOINTS);
+    
+    if (count > 0) {
+      navigator.loadPath(tempWps, count, endH);
+      Serial.println("[NET] A* Path generated and loaded to Navigator!");
+    } else {
+      Serial.println("[NET] GOTO Failed: No path found or goal blocked.");
+    }
+  }
+
+  if (doc["cmd"] == "traffic") {
+    // Nhận thông tin các xe khác từ Web để update DWA / A*
+    astar.clearDynamicObstacles();
+    JsonArray robots = doc["robots"].as<JsonArray>();
+    for (JsonObject r : robots) {
+      float rx = r["x"];
+      float ry = r["y"];
+      float radius = r["r"] | 0.3f; // Default 30cm collision radius
+      astar.setDynamicObstacle(rx, ry, radius);
     }
   }
   

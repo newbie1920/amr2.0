@@ -36,27 +36,21 @@ export async function executeTaskStep(task, robotId, onPathGenerated) {
   }
 
   try {
-    const navSessions = useNavStore.getState().appNavigationSessions;
-    const trafficGridData = injectTrafficIntoGridData(gridData, robotId, useRobotStore.getState().robots, navSessions);
-    const result = await navWorkerApi.findPath(trafficGridData, robot.telemetry.x, robot.telemetry.y, targetX, targetY, true, true);
+    const { navigateToGoal } = useNavStore.getState();
+    const result = await navigateToGoal(robotId, targetX, targetY, heading);
     
-    console.log('[TaskManager] findPath result:', result, 'to', targetX, targetY);
-    
-    if (result.success && result.path.length > 1) {
-      if (onPathGenerated) onPathGenerated(result.path);
-      const { navigateRobot } = useNavStore.getState();
-      navigateRobot(robotId, result.path, heading);
-      
+    if (result.success) {
+      if (onPathGenerated && result.path) onPathGenerated(result.path); // path could be empty if generated on ESP32
       const { updateTask } = useTaskStore.getState();
       updateTask(task.id, { status: 'in_progress', assignedRobotId: robotId, error: null, dbUpdated: false });
       return true;
     } else {
-      alert(`Không tìm được đường đi đến: ${step.description}`);
+      alert(`Không thể giao nhiệm vụ đến: ${step.description}`);
       return false;
     }
   } catch (e) {
-    console.error('Path error:', e);
-    alert('Lỗi tìm đường: ' + e.message);
+    console.error('Dispatch error:', e);
+    alert('Lỗi giao nhiệm vụ: ' + e.message);
     return false;
   }
 }

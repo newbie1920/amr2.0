@@ -200,6 +200,39 @@ export class RobotConnection {
   }
 
   /**
+   * Phân tán: Gửi tọa độ đích để ESP32 tự tìm đường (A*)
+   */
+  goto(x, y, finalHeading = null) {
+    const msg = { cmd: 'goto', x, y };
+    if (finalHeading !== null && finalHeading !== undefined) {
+      msg.finalHeading = finalHeading;
+    }
+    this._send(msg);
+    console.log(`[GOTO] Sent target (${x}, ${y}), finalH=${finalHeading}°`);
+  }
+
+  /**
+   * Phân tán: Gửi bản đồ tĩnh dạng Binary
+   */
+  sendMapData(occupancyGrid) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    const data = occupancyGrid.data; // Int8Array
+    const buffer = new Uint8Array(data.length + 1);
+    buffer[0] = 0x03; // Type: MAP_DATA
+    buffer.set(new Uint8Array(data.buffer), 1);
+    this.ws.send(buffer);
+    console.log(`[MAP] Sent static map: ${data.length} bytes`);
+    return true;
+  }
+
+  /**
+   * Phân tán: Gửi tọa độ các xe khác để né
+   */
+  sendTraffic(robotsArray) {
+    this._send({ cmd: 'traffic', robots: robotsArray });
+  }
+
+  /**
    * Dừng tự lái ngay lập tức
    */
   navStop() {

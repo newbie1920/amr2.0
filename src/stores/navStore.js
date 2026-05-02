@@ -652,54 +652,24 @@ const useNavStore = create((set, get) => ({
     return true;
   },
 
-  /**
-   * Navigate to a goal by computing path first (Point-to-Go)
-   * Called from RVizPanel click handler.
-   */
   navigateToGoal: async (robotId, goalX, goalY, finalHeading = null) => {
     const robotState = getRobotStore();
-    const mapState = getMapStore();
     const robot = robotState.robots[robotId];
     if (!robot) return { success: false, error: 'No robot' };
 
-    const telem = robot.telemetry || {};
-    const startX = telem.x ?? 0;
-    const startY = telem.y ?? 0;
+    const isConnected = robot.adapter?.connected ?? robot.connection?.connected;
+    if (!isConnected) return { success: false, error: 'Not connected' };
 
-    const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
-
-    if (!grid) {
-      // No map — send direct waypoint
-      console.warn('[NavStore] No map available — sending direct waypoint');
-      const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
-      get().startAppNavigation(robotId, path, finalHeading);
-      return { success: true, path };
+    // Phân tán: Giao việc trực tiếp cho ESP32 tự tìm đường
+    console.log(`[NavStore] 🌐 Giao nhiệm vụ cho ESP32 tự dò đường: ${goalX}, ${goalY}`);
+    
+    if (robot.adapter) {
+        robot.adapter.goto(goalX, goalY, finalHeading);
+    } else if (robot.connection) {
+        robot.connection.goto(goalX, goalY, finalHeading);
     }
 
-    if (!navWorkerApi) {
-      return { success: false, error: 'NavWorker not available' };
-    }
-
-    try {
-      // Bơm thông tin luồng giao thông (vị trí/lộ trình các xe khác) vào bản đồ
-      const navSessions = get().appNavigationSessions;
-      const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
-
-      // allowUnknown=true: Robot can navigate through unexplored space (Nav2 default)
-      // useCostmap=true: A* respects inflation costs to stay away from walls
-      const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
-      if (result.success && result.path.length > 1) {
-        console.log(`[NavStore] ✅ Path found: ${result.path.length} waypoints. Path:`, result.path.map(p => `(${p.x.toFixed(3)}, ${p.y.toFixed(3)})`).join(' -> '));
-        get().startAppNavigation(robotId, result.path, finalHeading);
-        return { success: true, path: result.path };
-      } else {
-        console.warn('[NavStore] ❌ No path found to goal');
-        return { success: false, error: 'No path found' };
-      }
-    } catch (err) {
-      console.error('[NavStore] Path error:', err);
-      return { success: false, error: err.message };
-    }
+    return { success: true, path: [] }; // Path do ESP32 quản lý
   },
 
   /**

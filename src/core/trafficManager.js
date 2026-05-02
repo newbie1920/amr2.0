@@ -89,3 +89,54 @@ export function injectTrafficIntoGridData(gridData, currentRobotId, allRobots, n
 
   return trafficGridData;
 }
+
+// ============================================================
+// DECENTRALIZED TRAFFIC BROADCAST (ESP32 A*)
+// ============================================================
+let trafficBroadcasterTimer = null;
+
+export function startTrafficBroadcaster(getRobotStoreState) {
+  if (trafficBroadcasterTimer) clearInterval(trafficBroadcasterTimer);
+  
+  trafficBroadcasterTimer = setInterval(() => {
+    const robotState = getRobotStoreState();
+    const allRobots = robotState.robots;
+    
+    // For each physical robot connected
+    for (const id of Object.keys(allRobots)) {
+      const robot = allRobots[id];
+      const isConnected = robot.adapter?.connected ?? robot.connection?.connected;
+      // Note: _sim robots don't need traffic broadcast via WebSocket
+      if (!isConnected || robot._sim) continue;
+      
+      // Build traffic list (exclude self)
+      const trafficList = [];
+      for (const otherId of Object.keys(allRobots)) {
+        if (otherId === id) continue;
+        const otherRobot = allRobots[otherId];
+        if (!otherRobot || !otherRobot.telemetry) continue;
+        
+        trafficList.push({
+          x: otherRobot.telemetry.x || 0,
+          y: otherRobot.telemetry.y || 0,
+          r: ROBOT_RADIUS + 0.15 // Same radius as before
+        });
+      }
+      
+      if (trafficList.length > 0) {
+        if (robot.adapter) {
+          robot.adapter.sendTraffic(trafficList);
+        } else if (robot.connection) {
+          robot.connection.sendTraffic(trafficList);
+        }
+      }
+    }
+  }, 500); // 2Hz is enough for traffic
+}
+
+export function stopTrafficBroadcaster() {
+  if (trafficBroadcasterTimer) {
+    clearInterval(trafficBroadcasterTimer);
+    trafficBroadcasterTimer = null;
+  }
+}

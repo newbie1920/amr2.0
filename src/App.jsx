@@ -20,6 +20,7 @@ import RVizPanel from './components/RVizPanel/RVizPanel.jsx';
 import DWATuningPanel from './components/DWATuningPanel/DWATuningPanel.jsx';
 import useRobotStore from './stores/robotStore.js';
 import vi from './i18n/vi.js';
+import { startTrafficBroadcaster, stopTrafficBroadcaster } from './core/trafficManager.js';
 
 // ── Split Pane Resizer ─────────────────────────────────────
 
@@ -99,6 +100,13 @@ function App() {
 
   useEffect(() => {
     loadStoredRobots();
+    
+    // Start decentralized traffic broadcasting
+    startTrafficBroadcaster(() => useRobotStore.getState());
+    
+    return () => {
+      stopTrafficBroadcaster();
+    };
   }, [loadStoredRobots]);
   const robotList = Object.values(robots);
 

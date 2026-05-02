@@ -18,6 +18,7 @@
 #include "navigator.h"
 #include "wheel_pid.h"
 #include "lidar_mapper.h"
+#include "pathfinder.h"
 
 // Included Modules
 #include "imu_sensor.h"
@@ -30,6 +31,7 @@ SemaphoreHandle_t i2cMutex;
 
 // ─── GLOBAL STATE ────────────────────────────────────────────
 Navigator navigator;
+AStarPathfinder astar;
 
 // ── Lidar A1M8 ──────────────────────────────────────────────
 HardwareSerial lidarSerial(1);
@@ -312,6 +314,9 @@ void setup() {
   Serial.println("\n\n[BOOT] Bat dau setup()...");
 
   init_motors();
+  
+  // Init Pathfinder (20m x 20m, 0.1m resolution)
+  astar.init(200, 200, 0.1f);
 
   // Initialize Onboard RGB LED (dim and soft color)
   rgbLed.begin();
