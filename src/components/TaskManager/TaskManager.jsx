@@ -7,13 +7,10 @@ import { useState, useEffect } from 'react';
 import useTaskStore from '../../stores/taskStore.js';
 import useRobotStore from '../../stores/robotStore.js';
 import useNavStore from '../../stores/navStore.js';
-import useMapStore from '../../stores/mapStore.js';
 import { SHELVES, GATES, findSlotById } from '../../core/warehouse.js';
-import { navWorkerApi } from '../../core/navWorkerSetup.js';
 import vi from '../../i18n/vi.js';
 import { supabase } from '../../utils/supabaseClient.js';
 import useInventoryStore from '../../stores/inventoryStore.js';
-import { injectTrafficIntoGridData } from '../../core/trafficManager.js';
 
 export async function executeTaskStep(task, robotId, onPathGenerated) {
   if (!task || !robotId) return false;
@@ -26,14 +23,6 @@ export async function executeTaskStep(task, robotId, onPathGenerated) {
 
   const robot = useRobotStore.getState().robots[robotId];
   if (!robot) return false;
-
-  const mapState = useMapStore.getState();
-  const mapGrid = mapState.mapperInstances?.[robotId] || mapState.occupancyGrid?.[robotId];
-  const gridData = mapGrid ? mapGrid.serialize() : null;
-  if (!gridData) { 
-    alert('Không có bản đồ để tìm đường!'); 
-    return false; 
-  }
 
   try {
     const { navigateToGoal } = useNavStore.getState();

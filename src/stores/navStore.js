@@ -654,13 +654,49 @@ const useNavStore = create((set, get) => ({
 
   navigateToGoal: async (robotId, goalX, goalY, finalHeading = null) => {
     const robotState = getRobotStore();
+    const mapState = getMapStore();
     const robot = robotState.robots[robotId];
     if (!robot) return { success: false, error: 'No robot' };
 
     const isConnected = robot.adapter?.connected ?? robot.connection?.connected;
     if (!isConnected) return { success: false, error: 'Not connected' };
 
-    // Phân tán: Giao việc trực tiếp cho ESP32 tự tìm đường
+    // ── SIM ROBOTS: Vẫn dùng app-side A* (không có ESP32 thật) ──
+    if (robot._sim) {
+      const telem = robot.telemetry || {};
+      const startX = telem.x ?? 0;
+      const startY = telem.y ?? 0;
+      const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
+
+      if (!grid) {
+        // No map — send direct waypoint
+        const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
+        get().startAppNavigation(robotId, path, finalHeading);
+        return { success: true, path };
+      }
+
+      if (!navWorkerApi) {
+        return { success: false, error: 'NavWorker not available' };
+      }
+
+      try {
+        const navSessions = get().appNavigationSessions;
+        const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
+        const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
+        if (result.success && result.path.length > 1) {
+          console.log(`[NavStore] ✅ SimBot path: ${result.path.length} waypoints`);
+          get().startAppNavigation(robotId, result.path, finalHeading);
+          return { success: true, path: result.path };
+        } else {
+          return { success: false, error: 'No path found (sim)' };
+        }
+      } catch (err) {
+        console.error('[NavStore] Sim path error:', err);
+        return { success: false, error: err.message };
+      }
+    }
+
+    // ── REAL ROBOTS: Phân tán — gửi GOTO cho ESP32 tự tìm đường ──
     console.log(`[NavStore] 🌐 Giao nhiệm vụ cho ESP32 tự dò đường: ${goalX}, ${goalY}`);
     
     if (robot.adapter) {

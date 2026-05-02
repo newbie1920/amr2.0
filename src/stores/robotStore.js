@@ -12,7 +12,6 @@ import useMapStore from './mapStore.js';
 import useDWAStore from './dwaStore.js';
 import useSimStore from './simStore.js';
 import { registerStore, getNavStoreState } from './storeRegistry.js';
-import { injectTrafficIntoGridData } from '../core/trafficManager.js';
 
 function saveRobotsToStorage(robots) {
   const data = Object.values(robots).map((r) => ({
@@ -148,9 +147,8 @@ const useRobotStore = create((set, get) => ({
         });
       }
 
-      // === DYNAMIC REPLANNING: Detect obstacle stuck & auto-replan ===
+      // === DYNAMIC REPLANNING (Decentralized): Detect obstacle stuck & re-dispatch GOTO ===
       if (effectiveTelem.nav === 'PAUSED' && effectiveTelem.obs) {
-        // Robot bị kẹt vật cản — track thời gian
         if (!currentState._obstaclePausedSince) {
           currentState._obstaclePausedSince = {};
         }
@@ -159,9 +157,9 @@ const useRobotStore = create((set, get) => ({
         }
         const stuckDuration = now - currentState._obstaclePausedSince[id];
         
-        // Sau 3 giây kẹt → trigger auto-replan
+        // Sau 3 giây kẹt → re-dispatch GOTO để ESP32 tự tính lại đường
         if (stuckDuration > 3000 && currentState.replanStatus[id] !== 'replanning') {
-          console.log(`[Replan] Robot ${id} kẹt vật cản ${(stuckDuration/1000).toFixed(1)}s → Đang tìm đường mới...`);
+          console.log(`[Replan] Robot ${id} kẹt vật cản ${(stuckDuration/1000).toFixed(1)}s → Re-dispatch GOTO cho ESP32`);
           set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'replanning' } }));
           
           import('./taskStore.js').then(taskModule => {
@@ -169,31 +167,12 @@ const useRobotStore = create((set, get) => ({
             const activeTask = taskStore.tasks.find(t => t.status === 'in_progress' && t.assignedRobotId === id);
             
             if (activeTask && activeTask.goalX != null && activeTask.goalY != null) {
-              const mapState = useMapStore.getState();
-              const mapGrid = mapState.mapperInstances?.[id] || mapState.occupancyGrid?.[id];
-              const gridData = mapGrid ? mapGrid.serialize() : null;
-              
-              if (gridData) {
-                const navSessions = getNavStoreState().appNavigationSessions;
-                const trafficGridData = injectTrafficIntoGridData(gridData, id, currentState.robots, navSessions);
-
-                navWorkerApi.findPath(trafficGridData, effectiveTelem.x, effectiveTelem.y, activeTask.goalX, activeTask.goalY, true, true)
-                .then(result => {
-                  if (result.success && result.path.length > 1) {
-                    console.log(`[Replan] Tìm được đường mới qua Grid: ${result.path.length} waypoints`);
-                    const robot = get().robots[id];
-                    if (robot && robot.connection.connected) {
-                      robot.connection.navigate(result.path, activeTask.finalHeading || null);
-                      set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'sent' } }));
-                    }
-                  } else {
-                    console.warn('[Replan] Không tìm được đường mới qua NavWorker!');
-                    set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
-                  }
-                }).catch(e => {
-                  console.error('[Replan] NavWorker lỗi:', e);
-                  set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
-                });
+              const robot = get().robots[id];
+              if (robot && robot.connection?.connected) {
+                // Phân tán: Gửi lại GOTO để ESP32 tự tìm đường mới
+                robot.connection.goto(activeTask.goalX, activeTask.goalY, activeTask.finalHeading || null);
+                console.log(`[Replan] Re-dispatched GOTO(${activeTask.goalX}, ${activeTask.goalY}) cho ESP32`);
+                set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'sent' } }));
               } else {
                 set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
               }
@@ -578,6 +557,9 @@ const useRobotStore = create((set, get) => ({
         recalibrateGyro: () => {},
         setBrake: () => {},
         navigate: () => {},
+        goto: () => {}, // Stub — sim robots use app-side nav
+        sendMapData: () => {},
+        sendTraffic: () => {},
       },
       status: 'connected',
       telemetry: engine.telemetry,
