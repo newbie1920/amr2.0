@@ -10,7 +10,8 @@ import { create } from 'zustand';
 import { OccupancyGrid } from '../core/lidarMapper.js';
 import { ScanMatcher } from '../core/scanMatcher.js';
 import { startExploration, stopExploration, getExplorationInfo, _setMapStoreGetter } from '../core/exploration.js';
-import { navWorkerApi } from '../core/navWorkerSetup.js';
+import { simNavWorkerApi } from '../core/navWorkerSetup.js';
+import { getRobotStoreState } from './storeRegistry.js';
 
 const MAP_STORAGE_KEY = 'amr_saved_maps';
 
@@ -57,9 +58,23 @@ const useMapStore = create((set, get) => ({
     const rx = telem.x ?? 0;
     const ry = telem.y ?? 0;
 
-    // Set architecture profile
-    const adapter = robot?.adapter;
-    if (adapter) adapter.setArchitectureProfile('pc_slam');
+    const conn = robot?.adapter || robot?.connection;  // Fallback to connection for real robots
+    const isHitl = robot?.connection?.hitlEnabled || telem.hitl;
+
+    // Set architecture profile — MUST reach ESP32 before explore command
+    if (conn) {
+      if (isHitl || telem.onboardNavEnabled) {
+        // HITL / Onboard mode requires hybrid architecture for onboard SLAM
+        if (typeof conn.setArchitectureProfile === 'function') {
+          conn.setArchitectureProfile('hybrid');
+        }
+      } else {
+        // PC SLAM overrides architecture
+        if (typeof conn.setArchitectureProfile === 'function') {
+          conn.setArchitectureProfile('pc_slam');
+        }
+      }
+    }
 
     const grid = new OccupancyGrid(200, 200, 0.1, rx, ry);
     set((state) => ({
@@ -70,27 +85,58 @@ const useMapStore = create((set, get) => ({
     }));
     console.log(`[Mapping] Bắt đầu quét map cho robot ${id} tại (${rx.toFixed(2)}, ${ry.toFixed(2)}), grid 200x200 @0.1m`);
 
-    // Bắt đầu tự khám phá
-    startExploration(id, getRobotStore);
+    if (isHitl || telem.onboardNavEnabled) {
+      // ESP32 Onboard SLAM: Send 'explore' command
+      if (robot?.connection?.connected) {
+        // 1. Reset hitlEngine to safe spawn position FIRST
+        const spawnX = 3.5, spawnY = 2.0, spawnTheta = Math.PI / 2;
+        if (isHitl && robot.connection.hitlEngine) {
+          robot.connection.hitlEngine.reset(spawnX, spawnY, spawnTheta);
+          console.log(`[Mapping] HITL engine reset to (${spawnX}, ${spawnY})`);
+        }
 
-    // Update exploration info mỗi giây cho UI
-    const infoTimer = setInterval(() => {
-      if (!get().mappingActive[id]) { clearInterval(infoTimer); return; }
-      set((s) => ({ explorationInfo: { ...s.explorationInfo, [id]: getExplorationInfo() } }));
-    }, 1000);
+        // 2. Sync ESP32 pose to match hitlEngine spawn (so odometry + grid mapper align)
+        robot.connection._send({ cmd: 'set_pose', x: spawnX, y: spawnY, theta: spawnTheta });
+
+        // 3. Small delay to let architecture profile and pose propagate, then send explore
+        setTimeout(() => {
+          robot.connection._send({ cmd: "explore" });
+          console.log(`[Mapping] Đã gửi lệnh 'explore' cho ESP32 (Onboard SLAM)`);
+        }, 200);
+      }
+    } else {
+      // Web-based PC SLAM Exploration
+      startExploration(id, getRobotStore);
+
+      // Update exploration info mỗi giây cho UI
+      const infoTimer = setInterval(() => {
+        if (!get().mappingActive[id]) { clearInterval(infoTimer); return; }
+        set((s) => ({ explorationInfo: { ...s.explorationInfo, [id]: getExplorationInfo() } }));
+      }, 1000);
+    }
   },
 
   /**
    * Dừng quét + TỰ ĐỘNG lưu map vào danh sách
    */
   stopMapping: (id, getRobotStore) => {
-    stopExploration(id, getRobotStore);
-
-    const grid = get().mapperInstances[id];
     const robotStore = getRobotStore();
     const robot = robotStore.robots[id];
+    const isHitl = robot?.connection?.hitlEnabled || robot?.telemetry?.hitl;
+
+    if (isHitl || robot?.telemetry?.onboardNavEnabled) {
+      if (robot?.connection?.connected) {
+        robot.connection._send({ cmd: "explore_stop" });
+        robot.connection.navStop(); // Force physical halt on the hardware
+        console.log(`[Mapping] Đã gửi lệnh 'explore_stop' và 'navStop' cho ESP32`);
+      }
+    } else {
+      stopExploration(id, getRobotStore);
+    }
+
+    const grid = get().mapperInstances[id];
     const adapter = robot?.adapter;
-    if (adapter && !get().localizationActive[id]) {
+    if (adapter && !get().localizationActive[id] && !isHitl) {
       adapter.setArchitectureProfile('hybrid');
     }
 
@@ -107,10 +153,14 @@ const useMapStore = create((set, get) => ({
         resolution: grid.resolution,
         data: grid.exportJSON(),
       };
-      const maps = [...get().savedMaps, mapEntry];
+      const safeSavedMaps = Array.isArray(get().savedMaps) ? get().savedMaps : [];
+      const maps = [...safeSavedMaps, mapEntry];
       set({ mappingActive: { ...get().mappingActive, [id]: false }, savedMaps: maps });
       saveMapsToStorage(maps);
       console.log(`[Mapping] Dừng quét + Tự động lưu "${mapEntry.name}" (${grid.scanCount} scans)`);
+
+      // Tự động push map xuống ESP32 để xe tự chạy được
+      setTimeout(() => get().pushMapToRobot(id, getRobotStore), 500);
     } else {
       set((state) => ({
         mappingActive: { ...state.mappingActive, [id]: false },
@@ -161,7 +211,9 @@ const useMapStore = create((set, get) => ({
     const isMapping = state.mappingActive[id];
     const isLocalizing = state.localizationActive?.[id];
 
-    if ((isMapping || isLocalizing) && state.mapperInstances[id]) {
+    // Allow passive mapping if grid exists, even if mappingActive is false.
+    // This allows A* and DWA to use the obstacle map during manual driving.
+    if (state.mapperInstances[id]) {
       const grid = state.mapperInstances[id];
       const lidarPts = telem.lidar || [];
       if (lidarPts.length > 0) {
@@ -174,10 +226,10 @@ const useMapStore = create((set, get) => ({
         let mapX = odomX + tf.dx;
         let mapY = odomY + tf.dy;
         let mapTheta = odomTheta + tf.dTheta;
-        if (navWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
+        if (simNavWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
           set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
 
-          navWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
+          simNavWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
             const freshState = get();
             
             if (matched.corrected) {
@@ -261,6 +313,9 @@ const useMapStore = create((set, get) => ({
         mappingActive: { ...state.mappingActive, [id]: false },
       }));
       console.log(`[Mapping] Đã load map: ${grid.scanCount} scans`);
+
+      // Đẩy map xuống ESP32
+      setTimeout(() => get().pushMapToRobot(id, getRobotStoreState), 500);
       return true;
     } catch (err) {
       console.error('[Mapping] Lỗi load map:', err);
@@ -370,7 +425,66 @@ const useMapStore = create((set, get) => ({
       return false;
     }
   },
+
+  // ============================================================
+  //   MAP PUSH — Đẩy bản đồ tĩnh xuống ESP32 (1 lần)
+  // ============================================================
+
+  /**
+   * Push bản đồ tĩnh xuống 1 robot ESP32 cụ thể
+   * @param {string} robotId - ID robot cần push
+   * @param {Function} getRobotStore - getter robotStore
+   * @returns {boolean} true nếu push thành công
+   */
+  pushMapToRobot: (robotId, getRobotStore) => {
+    const state = get();
+    const grid = state.mapperInstances[robotId] || state.occupancyGrid[robotId];
+    if (!grid) {
+      console.warn(`[MapPush] No map available for robot ${robotId}`);
+      return false;
+    }
+
+    const robotStore = getRobotStore();
+    const robot = robotStore.robots[robotId];
+    const conn = robot?.adapter || robot?.connection;
+    if (!conn?.connected) {
+      console.warn(`[MapPush] Robot ${robotId} not connected`);
+      return false;
+    }
+
+    // Prefer sendMapData which builds proper header
+    if (typeof conn.sendMapData === 'function') {
+      const ok = conn.sendMapData(grid);
+      if (ok) {
+        console.log(`[MapPush] ✅ Map pushed to robot ${robotId}: ${grid.width}x${grid.height}`);
+      }
+      return ok;
+    }
+
+    console.warn(`[MapPush] Robot ${robotId} connection has no sendMapData method`);
+    return false;
+  },
+
+  /**
+   * Push bản đồ xuống TẤT CẢ robot đang kết nối
+   * @param {Function} getRobotStore - getter robotStore
+   */
+  pushMapToAllRobots: (getRobotStore) => {
+    const robotStore = getRobotStore();
+    const robots = robotStore.robots;
+    let pushed = 0;
+    for (const [id, robot] of Object.entries(robots)) {
+      const isConn = robot?.adapter?.connected ?? robot?.connection?.connected;
+      if (isConn) {
+        const ok = get().pushMapToRobot(id, getRobotStore);
+        if (ok) pushed++;
+      }
+    }
+    console.log(`[MapPush] Pushed map to ${pushed} robot(s)`);
+    return pushed;
+  },
 }));
+
 
 // Register mapStore getter with exploration module
 _setMapStoreGetter(() => useMapStore.getState());

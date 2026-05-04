@@ -66,7 +66,7 @@ export function OccupancyGridVisualizer({ grid, opacity = 0.9, warehouseCX = 5, 
       for (let gx = 0; gx < w; gx++) {
         const srcIdx = gy * w + gx;
         const lo = grid.logOdds[srcIdx];
-        const dstIdx = ((h - 1 - gy) * w + gx) * 4;
+        const dstIdx = (gy * w + gx) * 4;
 
         // Frontier cells → Cyan
         if (frontierSet.has(srcIdx)) {

@@ -44,7 +44,7 @@ export class SimWorld {
     this.dynamicObstacles = new Map();
 
     /** @type {{x: number, y: number, theta: number}} - Vị trí spawn mặc định */
-    this.defaultSpawn = { x: 5.0, y: 1.5, theta: Math.PI / 2 };
+    this.defaultSpawn = { x: 3.5, y: 2.0, theta: Math.PI / 2 };
 
     this._buildStaticWorld();
   }
@@ -60,18 +60,8 @@ export class SimWorld {
     const W = WAREHOUSE_WIDTH;
     const H = WAREHOUSE_HEIGHT;
 
-    // Tường dưới (y=0) — NHƯNG CÓ GAPS cho cổng
-    const gateGaps = this._computeGateGaps();
-    let prevX = 0;
-    for (const gap of gateGaps) {
-      if (gap.x1 > prevX) {
-        this.staticSegments.push({ x1: prevX, y1: 0, x2: gap.x1, y2: 0, tag: 'wall' });
-      }
-      prevX = gap.x2;
-    }
-    if (prevX < W) {
-      this.staticSegments.push({ x1: prevX, y1: 0, x2: W, y2: 0, tag: 'wall' });
-    }
+    // Tường dưới (y=0)
+    this.staticSegments.push({ x1: 0, y1: 0, x2: W, y2: 0, tag: 'wall' });
 
     // Tường trên (y=H)
     this.staticSegments.push({ x1: 0, y1: H, x2: W, y2: H, tag: 'wall' });
@@ -103,6 +93,105 @@ export class SimWorld {
 
     // Rebuild all segments
     this._rebuildSegments();
+  }
+
+  // ──────────────────────────────────────────────────────────
+  //   SLAM TEST MAP — Tạo bản đồ thử nghiệm cho SLAM
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * Load bản đồ phòng thử nghiệm SLAM thay thế kho xưởng mặc định.
+   * Layout 10x10m:
+   *   - 4 tường biên kín (không có cổng)
+   *   - 3 phòng nối bằng hành lang
+   *   - Cột trụ tròn
+   *   - Vật cản hình hộp rải rác
+   * Robot spawn ở góc dưới trái (1.5, 1.5)
+   */
+  loadSlamTestMap() {
+    this.staticSegments = [];
+    this.dynamicObstacles.clear();
+
+    const W = WAREHOUSE_WIDTH;  // 10m
+    const H = WAREHOUSE_HEIGHT; // 10m
+
+    // ── 1. TƯỜNG BIÊN KÍN ──────────────────────────────────
+    this.staticSegments.push({ x1: 0, y1: 0, x2: W, y2: 0, tag: 'wall' }); // bottom
+    this.staticSegments.push({ x1: W, y1: 0, x2: W, y2: H, tag: 'wall' }); // right
+    this.staticSegments.push({ x1: W, y1: H, x2: 0, y2: H, tag: 'wall' }); // top
+    this.staticSegments.push({ x1: 0, y1: H, x2: 0, y2: 0, tag: 'wall' }); // left
+
+    // ── 2. TƯỜNG CHIA PHÒNG (tạo hành lang) ────────────────
+    
+    // Tường ngang chia tầng dưới/giữa — y=4, gap ở x=2..3 (cửa 1m)
+    this.staticSegments.push({ x1: 0, y1: 4, x2: 2, y2: 4, tag: 'wall' });
+    this.staticSegments.push({ x1: 3, y1: 4, x2: 6.5, y2: 4, tag: 'wall' });
+    this.staticSegments.push({ x1: 7.5, y1: 4, x2: 10, y2: 4, tag: 'wall' });
+
+    // Tường ngang chia tầng giữa/trên — y=7, gap ở x=4..5.5 (cửa 1.5m)
+    this.staticSegments.push({ x1: 0, y1: 7, x2: 4, y2: 7, tag: 'wall' });
+    this.staticSegments.push({ x1: 5.5, y1: 7, x2: 10, y2: 7, tag: 'wall' });
+
+    // Tường dọc chia phòng dưới trái/phải — x=5, y=0..3 (gap ở y=1.5..2.5)
+    this.staticSegments.push({ x1: 5, y1: 0, x2: 5, y2: 1.5, tag: 'wall' });
+    this.staticSegments.push({ x1: 5, y1: 2.5, x2: 5, y2: 4, tag: 'wall' });
+
+    // Tường dọc phòng trên — x=3, y=7..9 (tạo phòng nhỏ góc trái trên)
+    this.staticSegments.push({ x1: 3, y1: 7, x2: 3, y2: 9, tag: 'wall' });
+
+    // ── 3. VẬT CẢN HÌNH HỘP (bàn, kệ nhỏ) ────────────────
+    const boxes = [
+      { cx: 2.0, cy: 2.0, w: 0.8, h: 0.8 },   // Hộp phòng dưới trái
+      { cx: 7.5, cy: 2.0, w: 1.0, h: 0.6 },   // Bàn phòng dưới phải
+      { cx: 8.5, cy: 1.2, w: 0.5, h: 0.5 },   // Hộp nhỏ phòng dưới phải
+      { cx: 1.5, cy: 5.5, w: 0.6, h: 1.2 },   // Kệ dọc phòng giữa trái
+      { cx: 8.0, cy: 5.5, w: 1.2, h: 0.6 },   // Kệ ngang phòng giữa phải
+      { cx: 5.0, cy: 5.8, w: 0.5, h: 0.5 },   // Hộp nhỏ giữa
+      { cx: 1.5, cy: 8.5, w: 0.7, h: 0.7 },   // Hộp phòng trên trái
+      { cx: 7.0, cy: 8.5, w: 1.0, h: 0.8 },   // Bàn phòng trên phải
+    ];
+
+    for (const box of boxes) {
+      const x1 = box.cx - box.w / 2, y1 = box.cy - box.h / 2;
+      const x2 = box.cx + box.w / 2, y2 = box.cy + box.h / 2;
+      this.staticSegments.push({ x1, y1, x2: x2, y2: y1, tag: 'obstacle' });
+      this.staticSegments.push({ x1: x2, y1, x2: x2, y2, tag: 'obstacle' });
+      this.staticSegments.push({ x1: x2, y1: y2, x2: x1, y2, tag: 'obstacle' });
+      this.staticSegments.push({ x1, y1: y2, x2: x1, y2: y1, tag: 'obstacle' });
+    }
+
+    // ── 4. CỘT TRỤ TRÒN (xấp xỉ bát giác) ────────────────
+    const pillars = [
+      { cx: 4.0, cy: 5.5, r: 0.25 },  // Cột giữa
+      { cx: 6.5, cy: 5.5, r: 0.25 },  // Cột giữa phải
+      { cx: 5.0, cy: 8.5, r: 0.3  },  // Cột phòng trên
+    ];
+    
+    for (const p of pillars) {
+      const sides = 8;
+      for (let i = 0; i < sides; i++) {
+        const a1 = (2 * Math.PI * i) / sides;
+        const a2 = (2 * Math.PI * (i + 1)) / sides;
+        this.staticSegments.push({
+          x1: p.cx + p.r * Math.cos(a1),
+          y1: p.cy + p.r * Math.sin(a1),
+          x2: p.cx + p.r * Math.cos(a2),
+          y2: p.cy + p.r * Math.sin(a2),
+          tag: 'obstacle',
+        });
+      }
+    }
+
+    // ── 5. TƯỜNG CHÉO / L-SHAPE ────────────────────────────
+    // L-shape ở phòng giữa phải
+    this.staticSegments.push({ x1: 8.5, y1: 4.5, x2: 8.5, y2: 6.0, tag: 'obstacle' }); // vertical
+    this.staticSegments.push({ x1: 8.5, y1: 6.0, x2: 9.5, y2: 6.0, tag: 'obstacle' }); // horizontal
+
+    // Spawn tại khu vực trống giữa phòng (x=3.5, y=2.0)
+    this.defaultSpawn = { x: 3.5, y: 2.0, theta: Math.PI / 2 };
+
+    this._rebuildSegments();
+    console.log(`[SimWorld] SLAM Test Map loaded: ${this.segments.length} segments`);
   }
 
   /**

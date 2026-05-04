@@ -1,7 +1,7 @@
 import * as Comlink from 'comlink';
 import { ScanMatcher } from './scanMatcher.js';
 import findPathOnGrid from './lidarPathfinder.js';
-import { computeVelocityCmd } from './dwaPlanner.js';
+import MPPIPlanner from './mppiPlanner.js';
 import { ROBOT_RADIUS } from './warehouse.js';
 
 // Dummy Grid object to reconstruct methods on the worker side
@@ -261,9 +261,15 @@ class NavWorkerAPI {
       }
     }
 
-    const result = computeVelocityCmd(pose, vel, globalPlan, grid, dwaConfig);
+    if (!this.mppiPlanner) {
+      this.mppiPlanner = new MPPIPlanner(dwaConfig || {});
+    }
+    // Update config if needed
+    this.mppiPlanner.cfg = { ...this.mppiPlanner.cfg, ...(dwaConfig || {}) };
+    
+    const result = this.mppiPlanner.computeVelocityCmd(pose, globalPlan, grid);
     const t1 = performance.now();
-    console.log(`[Worker] computeVelocity took ${(t1 - t0).toFixed(1)}ms`);
+    console.log(`[Worker] MPPI computeVelocity took ${(t1 - t0).toFixed(1)}ms`);
     return result;
   }
 }

@@ -27,7 +27,7 @@ float lastPwmRight = 0;
 float vL_meas = 0;
 float vR_meas = 0;
 
-// Pose
+// Pose (odometry frame — pure encoder + IMU)
 float robotX = 2.5;
 float robotY = 9.0;
 float robotTheta = -PI/2;
@@ -36,8 +36,30 @@ float encoderTheta = 0;
 float gyroTheta = 0;
 float fusedTheta = 0;
 
+// Map-frame pose (computed from odom + TF)
+float mapX = 2.5;
+float mapY = 9.0;
+float mapTheta = -PI/2;
+
+// TF map→odom transform (accumulated scan matching corrections)
+float tfDx = 0;
+float tfDy = 0;
+float tfDTheta = 0;
+
 // Battery
 float filteredVBatt = 12.0f;
+
+/**
+ * Apply TF transform: mapPose = odomPose ⊕ tfMapOdom
+ * Call this after odometry update or after TF update.
+ */
+void applyTf() {
+    // 2D rigid transform composition:
+    // map = odom + tf (simplified — for small tf offsets, direct addition is fine)
+    mapX     = robotX + tfDx;
+    mapY     = robotY + tfDy;
+    mapTheta = atan2f(sinf(robotTheta + tfDTheta), cosf(robotTheta + tfDTheta));
+}
 
 // ============================================================
 //   ENCODER ISRs

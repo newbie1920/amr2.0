@@ -102,6 +102,7 @@ export class RealRobotAdapter extends BaseRobotAdapter {
   sendVelocity(linear, angular) { this._conn.sendVelocity(linear, angular); }
   sendStop() { this._conn.sendStop(); }
   navigate(path, finalHeading = null) { this._conn.navigate(path, finalHeading); }
+  goto(x, y, finalHeading = null) { this._conn.goto(x, y, finalHeading); }
   navStop() { this._conn.navStop(); }
   pause() { this._conn.pause(); }
   resume() { this._conn.resume(); }
@@ -112,6 +113,7 @@ export class RealRobotAdapter extends BaseRobotAdapter {
   setBrake(enabled) { this._conn.setBrake(enabled); }
   setArchitectureProfile(profile) { this._conn.setArchitectureProfile(profile); }
   sendConfig(config) { this._conn.sendConfig(config); }
+  sendMapData(grid) { return this._conn.sendMapData(grid); }
 
   destroy() {
     this._conn.disconnect();
@@ -130,7 +132,7 @@ export class SimRobotAdapter extends BaseRobotAdapter {
    * @param {number} spawnY     - Spawn Y position
    * @param {number} spawnTheta - Spawn heading (rad)
    */
-  constructor(name = 'SimBot', spawnX = 5.0, spawnY = 1.5, spawnTheta = Math.PI / 2) {
+  constructor(name = 'SimBot', spawnX = 3.5, spawnY = 2.0, spawnTheta = Math.PI / 2) {
     super('sim');
     this.name = name;
     this.ip = 'sim://gazebotdtu';
@@ -174,6 +176,7 @@ export class SimRobotAdapter extends BaseRobotAdapter {
   sendVelocity(linear, angular) { this.engine.setVelocity(linear, angular); }
   sendStop() { this.engine.setVelocity(0, 0); }
   navigate(path, finalHeading = null) { /* App navigation handles this */ }
+  goto(x, y, finalHeading = null) { /* Sim mode uses app navigation */ }
   navStop() { this.engine.setVelocity(0, 0); }
   pause() { this.engine.setVelocity(0, 0); }
   resume() { /* no-op */ }
@@ -183,6 +186,7 @@ export class SimRobotAdapter extends BaseRobotAdapter {
   recalibrateGyro() { /* no-op for sim */ }
   setBrake(enabled) { if (enabled) this.engine.setVelocity(0, 0); }
   setArchitectureProfile(profile) { /* no-op */ }
+  sendMapData(grid) { /* no-op */ return true; }
 
   /** Get SimEngine info for UI */
   getSimInfo() { return this.engine.getSimInfo(); }
@@ -227,8 +231,8 @@ export function createRobotAdapter(type, options = {}) {
   if (type === 'sim') {
     return new SimRobotAdapter(
       options.name || 'SimBot',
-      options.spawnX ?? 5.0,
-      options.spawnY ?? 1.5,
+      options.spawnX ?? 3.5,
+      options.spawnY ?? 2.0,
       options.spawnTheta ?? Math.PI / 2,
     );
   }

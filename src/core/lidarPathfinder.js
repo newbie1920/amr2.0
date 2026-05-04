@@ -234,7 +234,7 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
         const goalG = grid.worldToGrid(goalX, goalY);
         let goalSafe = true;
         if (grid.costmap && grid.inBounds(goalG.gx, goalG.gy)) {
-          if (grid.costmap[goalG.gy * grid.width + goalG.gx] >= 100) goalSafe = false;
+          if (grid.costmap[goalG.gy * grid.width + goalG.gx] >= 253) goalSafe = false;
         }
         if (grid.isOccupied && grid.isOccupied(goalG.gx, goalG.gy)) goalSafe = false;
         if (goalSafe) {
@@ -272,11 +272,10 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
       let costPenalty = 0;
       if (useCostmap && grid.costmap) {
         const cm = grid.costmap[nIdx];
-        if (cm >= 100) continue;          // Approaching pink zone — BLOCKED
+        if (cm >= 253) continue;          // Approaching pink zone — BLOCKED
         if (cm > 0) {
           // Very steep exponential penalty: pushes path to center of corridors.
-          // cm=20 → penalty ~1.7,  cm=40 → penalty ~6.4,  cm=60 → penalty ~19.1,  cm=99 → penalty ~140
-          const normalized = cm / 100;
+          const normalized = cm / 253;
           costPenalty = Math.exp(normalized * 5.0) - 1.0;  // Range: 0 to ~147
         }
       }
@@ -297,7 +296,7 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
         const parentGY = Math.floor(parentIdx / w);
 
         // Check line-of-sight from parent to neighbor
-        if (lineOfSight(parentGX, parentGY, nx, ny, grid, useCostmap, 100)) {
+        if (lineOfSight(parentGX, parentGY, nx, ny, grid, useCostmap, 253)) {
           // Direct path from grandparent → neighbor
           const directDist = Math.hypot(nx - parentGX, ny - parentGY);
           const directG = gScore[parentIdx] + directDist + costPenalty * directDist / Math.max(1, Math.hypot(dir.dx, dir.dy));
@@ -349,7 +348,7 @@ function _losShortcut(path, grid, useCostmap) {
       const fromG = grid.worldToGrid(path[current].x, path[current].y);
       const toG = grid.worldToGrid(path[ahead].x, path[ahead].y);
       
-      if (lineOfSight(fromG.gx, fromG.gy, toG.gx, toG.gy, grid, useCostmap, 100)) {
+      if (lineOfSight(fromG.gx, fromG.gy, toG.gx, toG.gy, grid, useCostmap, 253)) {
         farthest = ahead;
         break;
       }
@@ -379,7 +378,7 @@ function _findNearestPassable(grid, gx, gy, allowUnknown) {
       // Also check costmap — don't return inscribed cells
       if (grid.costmap) {
         const cost = grid.costmap[c.gy * grid.width + c.gx];
-        if (cost >= 100) {
+        if (cost >= 253) {
           // This cell is too close to an obstacle, keep searching
         } else {
           return c;
@@ -454,12 +453,12 @@ function _smoothPath(path, grid) {
         const qg = grid.worldToGrid(q.x, q.y);
         if (grid.inBounds(qg.gx, qg.gy)) {
           const cost = grid.costmap[qg.gy * grid.width + qg.gx];
-          if (cost >= 100) qBlocked = true; // Stay in blue: reject any cell approaching pink zone
+          if (cost >= 253) qBlocked = true; // Stay in blue: reject any cell approaching pink zone
         }
         const rg = grid.worldToGrid(r.x, r.y);
         if (grid.inBounds(rg.gx, rg.gy)) {
           const cost = grid.costmap[rg.gy * grid.width + rg.gx];
-          if (cost >= 100) rBlocked = true; // Stay in blue zone
+          if (cost >= 253) rBlocked = true; // Stay in blue zone
         }
       } else {
         const qg = grid.worldToGrid(q.x, q.y);
@@ -475,7 +474,7 @@ function _smoothPath(path, grid) {
         if (grid.inBounds(mg.gx, mg.gy)) {
           if (grid.costmap) {
             const midCost = grid.costmap[mg.gy * grid.width + mg.gx];
-            if (midCost >= 100) {
+            if (midCost >= 253) {
               qBlocked = true;
               rBlocked = true;
             }

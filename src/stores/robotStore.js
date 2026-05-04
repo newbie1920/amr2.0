@@ -13,6 +13,7 @@ import useDWAStore from './dwaStore.js';
 import useSimStore from './simStore.js';
 import { registerStore, getNavStoreState } from './storeRegistry.js';
 
+
 function saveRobotsToStorage(robots) {
   const data = Object.values(robots).map((r) => ({
     id: r.id,
@@ -147,49 +148,11 @@ const useRobotStore = create((set, get) => ({
         });
       }
 
-      // === DYNAMIC REPLANNING (Decentralized): Detect obstacle stuck & re-dispatch GOTO ===
-      if (effectiveTelem.nav === 'PAUSED' && effectiveTelem.obs) {
-        if (!currentState._obstaclePausedSince) {
-          currentState._obstaclePausedSince = {};
-        }
-        if (!currentState._obstaclePausedSince[id]) {
-          currentState._obstaclePausedSince[id] = now;
-        }
-        const stuckDuration = now - currentState._obstaclePausedSince[id];
-        
-        // Sau 3 giây kẹt → re-dispatch GOTO để ESP32 tự tính lại đường
-        if (stuckDuration > 3000 && currentState.replanStatus[id] !== 'replanning') {
-          console.log(`[Replan] Robot ${id} kẹt vật cản ${(stuckDuration/1000).toFixed(1)}s → Re-dispatch GOTO cho ESP32`);
-          set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'replanning' } }));
-          
-          import('./taskStore.js').then(taskModule => {
-            const taskStore = taskModule.default.getState();
-            const activeTask = taskStore.tasks.find(t => t.status === 'in_progress' && t.assignedRobotId === id);
-            
-            if (activeTask && activeTask.goalX != null && activeTask.goalY != null) {
-              const robot = get().robots[id];
-              if (robot && robot.connection?.connected) {
-                // Phân tán: Gửi lại GOTO để ESP32 tự tìm đường mới
-                robot.connection.goto(activeTask.goalX, activeTask.goalY, activeTask.finalHeading || null);
-                console.log(`[Replan] Re-dispatched GOTO(${activeTask.goalX}, ${activeTask.goalY}) cho ESP32`);
-                set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'sent' } }));
-              } else {
-                set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
-              }
-            } else {
-              set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
-            }
-          });
-        }
-      } else {
-        // Reset obstacle tracking khi không còn PAUSED+obs
-        if (currentState._obstaclePausedSince && currentState._obstaclePausedSince[id]) {
-          delete currentState._obstaclePausedSince[id];
-          if (currentState.replanStatus[id] !== 'idle') {
-            set((s) => ({ replanStatus: { ...s.replanStatus, [id]: 'idle' } }));
-          }
-        }
-      }
+      // === DYNAMIC REPLANNING: Removed — ESP32 handles stuck recovery
+      // via built-in Nav2-style behaviors (RECOVERY_SPIN, RECOVERY_BACKUP, RECOVERY_WAIT).
+      // Replanning from Web would conflict with onboard A* running on ESP32.
+      // If needed in future, use connection.goto() to re-dispatch a new GOTO command.
+
 
       // Sync Navigation Status with Task System (replaces older setInterval in UI)
       if (effectiveTelem.nav === 'ERROR' || effectiveTelem.nav === 'DONE' || effectiveTelem.nav === 'PAUSED') {
@@ -420,7 +383,16 @@ const useRobotStore = create((set, get) => ({
     }
   },
 
-
+  /**
+   * Bật/tắt chế độ HITL (Hardware-in-the-Loop)
+   */
+  toggleHitlMode: (id, enabled) => {
+    const robot = get().robots[id];
+    if (robot && robot.connection && typeof robot.connection.setHitlMode === 'function') {
+      robot.connection.setHitlMode(enabled);
+      console.log(`[robotStore] HITL Mode for ${id}: ${enabled}`);
+    }
+  },
 
   // Getters
   getRobot: (id) => get().robots[id],
@@ -441,8 +413,8 @@ const useRobotStore = create((set, get) => ({
     
     // Offset spawn position if multiple robots are running to avoid them spawning on top of each other
     const numSims = Object.keys(get().simEngines).length;
-    const finalX = spawnX !== undefined ? spawnX : 5.0;
-    const finalY = spawnY !== undefined ? spawnY : 1.5 + (numSims * 1.0); // Offset by 1m per robot
+    const finalX = spawnX !== undefined ? spawnX : 3.5;
+    const finalY = spawnY !== undefined ? spawnY : 2.0 + (numSims * 1.0); // Offset by 1m per robot
 
     engine.reset(finalX, finalY, spawnTheta);
 
@@ -557,9 +529,6 @@ const useRobotStore = create((set, get) => ({
         recalibrateGyro: () => {},
         setBrake: () => {},
         navigate: () => {},
-        goto: () => {}, // Stub — sim robots use app-side nav
-        sendMapData: () => {},
-        sendTraffic: () => {},
       },
       status: 'connected',
       telemetry: engine.telemetry,
@@ -598,14 +567,14 @@ const useRobotStore = create((set, get) => ({
     // Without this, navigateToGoal falls back to straight-line waypoints.
     // NOTE: We don't call startMapping() because that also starts auto-exploration
     // which would conflict with user's manual navigation. We only create the grid
-    // and set mappingActive so processLidarTick can populate it.
+    // and let processLidarTick populate it passively.
     try {
       const mapState = useMapStore.getState();
       const grid = new OccupancyGrid(200, 200, 0.1, spawnX, spawnY);
       mapState.updateOccupancyGrid(id, grid);
-      // Set mappingActive and mapperInstances directly via setState
+      // Set mapperInstances directly via setState (DO NOT set mappingActive to true,
+      // otherwise the SLAM UI button turns RED and triggers auto-exploration bugs)
       useMapStore.setState((s) => ({
-        mappingActive: { ...s.mappingActive, [id]: true },
         mapperInstances: { ...s.mapperInstances, [id]: grid },
         occupancyGrid: { ...s.occupancyGrid, [id]: grid },
         mapToOdom: { ...s.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } },

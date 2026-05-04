@@ -20,16 +20,17 @@ unsigned long lastOledTime = 0;
 
 void init_oled() {
   if (i2cMutex != NULL) {
-    xSemaphoreTake(i2cMutex, portMAX_DELAY);
-    if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(0, 0);
-      display.println("AMR 2.0 Booting...");
-      display.display();
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      if (display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println("AMR 2.0 Booting...");
+        display.display();
+      }
+      xSemaphoreGive(i2cMutex);
     }
-    xSemaphoreGive(i2cMutex);
   }
 }
 
@@ -65,9 +66,10 @@ void update_oled() {
     display.printf("Pos X:%.1f Y:%.1f", robotX, robotY);
 
     if (i2cMutex != NULL) {
-        xSemaphoreTake(i2cMutex, portMAX_DELAY);
-        display.display();
-        xSemaphoreGive(i2cMutex);
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            display.display();
+            xSemaphoreGive(i2cMutex);
+        }
     }
   }
 }

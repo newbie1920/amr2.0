@@ -28,10 +28,19 @@ function loadCustomPresetsFromStorage() {
   }
 }
 
+function loadActivePresetFromStorage() {
+  try {
+    const raw = localStorage.getItem('amr_dwa_active_preset');
+    return raw || 'balanced';
+  } catch (e) {
+    return 'balanced';
+  }
+}
+
 const useDWAStore = create((set, get) => ({
   // State
   dwaConfig: loadDWAConfigFromStorage(),
-  dwaActivePreset: 'balanced',
+  dwaActivePreset: loadActivePresetFromStorage(),
   dwaCustomPresets: loadCustomPresetsFromStorage(),
 
   // Actions
@@ -44,6 +53,7 @@ const useDWAStore = create((set, get) => ({
     set((s) => {
       const merged = { ...s.dwaConfig, ...partial };
       localStorage.setItem(DWA_CONFIG_KEY, JSON.stringify(merged));
+      localStorage.setItem('amr_dwa_active_preset', 'custom');
       return { dwaConfig: merged, dwaActivePreset: 'custom' };
     });
   },
@@ -53,6 +63,7 @@ const useDWAStore = create((set, get) => ({
    */
   resetDWAConfig: () => {
     localStorage.removeItem(DWA_CONFIG_KEY);
+    localStorage.setItem('amr_dwa_active_preset', 'balanced');
     set({ dwaConfig: { ...DWA_DEFAULTS }, dwaActivePreset: 'balanced' });
   },
 
@@ -68,6 +79,7 @@ const useDWAStore = create((set, get) => ({
     }
     const config = { ...DWA_DEFAULTS, ...preset };
     localStorage.setItem(DWA_CONFIG_KEY, JSON.stringify(config));
+    localStorage.setItem('amr_dwa_active_preset', name);
     set({ dwaConfig: config, dwaActivePreset: name });
   },
 
@@ -78,6 +90,7 @@ const useDWAStore = create((set, get) => ({
     const state = get();
     const updated = { ...state.dwaCustomPresets, [name]: { ...state.dwaConfig } };
     localStorage.setItem(DWA_PRESETS_KEY, JSON.stringify(updated));
+    localStorage.setItem('amr_dwa_active_preset', name);
     set({ dwaCustomPresets: updated, dwaActivePreset: name });
   },
 
@@ -90,6 +103,7 @@ const useDWAStore = create((set, get) => ({
     localStorage.setItem(DWA_PRESETS_KEY, JSON.stringify(rest));
     set({ dwaCustomPresets: rest });
     if (state.dwaActivePreset === name) {
+      localStorage.setItem('amr_dwa_active_preset', 'balanced');
       set({ dwaActivePreset: 'balanced' });
     }
   },

@@ -317,6 +317,28 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         <meshStandardMaterial color={C_FLOOR} />
       </mesh>
 
+      {/* 4 Outer Walls (Low walls for LiDAR) */}
+      {mapType === '3d' && (
+        <group>
+          {/* Top Wall (z = -cz) */}
+          <Box args={[WAREHOUSE_WIDTH, 0.5, 0.2]} position={[0, 0.25, -cz]} receiveShadow castShadow>
+            <meshStandardMaterial color="#475569" />
+          </Box>
+          {/* Bottom Wall (z = cz) */}
+          <Box args={[WAREHOUSE_WIDTH, 0.5, 0.2]} position={[0, 0.25, cz]} receiveShadow castShadow>
+            <meshStandardMaterial color="#475569" />
+          </Box>
+          {/* Left Wall (x = -cx) */}
+          <Box args={[0.2, 0.5, WAREHOUSE_HEIGHT]} position={[-cx, 0.25, 0]} receiveShadow castShadow>
+            <meshStandardMaterial color="#475569" />
+          </Box>
+          {/* Right Wall (x = cx) */}
+          <Box args={[0.2, 0.5, WAREHOUSE_HEIGHT]} position={[cx, 0.25, 0]} receiveShadow castShadow>
+            <meshStandardMaterial color="#475569" />
+          </Box>
+        </group>
+      )}
+
       {/* LIDAR Occupancy Grid Visualization (Chỉ ở chế độ LIDAR) */}
       {mapType === 'lidar' && Object.entries(robots).map(([robotId, robot]) => {
         const grid = occupancyGrid?.[robotId];
@@ -692,16 +714,31 @@ export default function WarehouseMap({ activePath }) {
                     textAlign: 'center', fontWeight: 600,
                   }}>
                     {(() => {
-                      const phase = getExplorationPhase();
-                      const info = getExplorationInfo();
-                      if (phase === 'init_spin') return '🔄 Đang xoay 360° quét xung quanh...';
-                      if (phase === 'find_frontier') return '🔍 Đang tìm frontier...';
-                      if (phase === 'navigate') return `🚗 Đang lái đến frontier (${info.clusterCount} vùng)...`;
-                      if (phase === 'arrived_scan') return '📡 Đến nơi, quét thêm...';
-                      if (phase === 'recovery_spin') return '🔄 Recovery: Xoay tìm vùng mới...';
-                      if (phase === 'recovery_backup') return '↩️ Recovery: Lùi lại...';
-                      if (phase === 'complete') return '✅ Map đã quét xong!';
-                      return '⏳ Đang khởi động...';
+                      const robot = robots[activeRobotId];
+                      const telem = robot?.telemetry || {};
+                      const isHitl = robot?.connection?.hitlEnabled || telem.hitl;
+
+                      if (isHitl || telem.onboardNavEnabled) {
+                        // ESP32 Onboard SLAM
+                        const expState = telem.explore || 'IDLE';
+                        if (expState === 'SCAN') return `🔍 Onboard: Đang tìm frontier... (${telem.explore_frontiers || 0} ô)`;
+                        if (expState === 'NAV') return `🚗 Onboard: Lái đến frontier...`;
+                        if (expState === 'DONE') return `✅ Onboard: Đã quét xong!`;
+                        if (expState === 'FAIL') return `⚠️ Onboard: Lỗi tìm đường!`;
+                        return `⏳ Onboard: Đang khởi động... (${expState})`;
+                      } else {
+                        // PC SLAM
+                        const phase = getExplorationPhase();
+                        const info = getExplorationInfo();
+                        if (phase === 'init_spin') return '🔄 Đang xoay 360° quét xung quanh...';
+                        if (phase === 'find_frontier') return '🔍 Đang tìm frontier...';
+                        if (phase === 'navigate') return `🚗 Đang lái đến frontier (${info.clusterCount} vùng)...`;
+                        if (phase === 'arrived_scan') return '📡 Đến nơi, quét thêm...';
+                        if (phase === 'recovery_spin') return '🔄 Recovery: Xoay tìm vùng mới...';
+                        if (phase === 'recovery_backup') return '↩️ Recovery: Lùi lại...';
+                        if (phase === 'complete') return '✅ Map đã quét xong!';
+                        return '⏳ Đang khởi động...';
+                      }
                     })()}
                   </div>
                 )}

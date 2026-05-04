@@ -19,6 +19,10 @@
 #include "wheel_pid.h"
 #include "lidar_mapper.h"
 #include "pathfinder.h"
+#include "dwa_planner.h"
+#include "icp_matcher.h"
+#include "frontier_explorer.h"
+#include "slam_diagnostics.h"
 
 // Included Modules
 #include "imu_sensor.h"
@@ -32,6 +36,24 @@ SemaphoreHandle_t i2cMutex;
 // ─── GLOBAL STATE ────────────────────────────────────────────
 Navigator navigator;
 AStarPathfinder astar;
+DwaPlanner dwaPlanner;
+
+// DWA integration: only run DWA every N control ticks (10Hz vs 50Hz control)
+static unsigned long lastDwaRunMs = 0;
+const unsigned long DWA_INTERVAL_MS = 100; // 10Hz DWA rate
+static bool dwaActive = false;
+static float dwaV = 0, dwaW = 0;
+
+// ─── PATHFINDER FREERTOS (decoupled from network ISR) ────────
+struct GoToRequest {
+    float startX, startY;
+    float goalX,  goalY;
+    float finalHeading;  // NAN = don't care
+};
+QueueHandle_t      pathfinderQueue = nullptr; // Main-task sends GOTO here
+SemaphoreHandle_t  pathMutex       = nullptr; // Guards sharedPath r/w
+Waypoint           sharedPath[MAX_WAYPOINTS];
+int                sharedPathLen   = 0;
 
 // ── Lidar A1M8 ──────────────────────────────────────────────
 HardwareSerial lidarSerial(1);
@@ -45,7 +67,32 @@ unsigned long lastGridUpdateTime = 0;
 static const unsigned long GRID_UPDATE_INTERVAL = 200; // Cập nhật grid mỗi 200ms
 bool streamOccupancyGrid = true;
 bool allowOnboardNavigation = true;
+bool hitlMode = false; // Hardware-in-the-Loop simulation mode
+
+// ── ICP Scan Matching ────────────────────────────────────────
+IcpMatcher icpMatcher;
+// Prev-scan buffer: allocated in PSRAM during setup() if available, else SRAM
+static LidarPoint* icpPrevScan = nullptr;
+static int  icpPrevLen   = 0;
+static bool icpFirstScan = true;
+float icpRmsLast  = 0.0f;   // Dùng để log chất lượng
 const char* architectureProfile = "hybrid";
+
+// ── CSM (Correlative Scan Matching) ──────────────────────────
+#include "csm_matcher.h"
+CsmMatcher csmMatcher;
+static bool csmInitialized = false;
+// CSM activates after ICP has built enough grid data (scanCount > CSM_MIN_SCANS)
+static const int CSM_MIN_SCANS = 10;
+
+// ── SLAM Diagnostics ─────────────────────────────────────────
+SlamDiag slamDiag;
+
+// ── Frontier Exploration ─────────────────────────────────────
+FrontierExplorer frontierExplorer;
+bool explorationRequested = false;  // Set true khi nhận cmd "explore"
+static unsigned long lastExploreCheckMs = 0;
+const unsigned long EXPLORE_CHECK_INTERVAL = 3000;  // Quét frontier mỗi 3 giây
 
 // Network Globals
 WebServer server(HTTP_PORT);
@@ -53,9 +100,123 @@ WebSocketsServer webSocket(WEBSOCKET_PORT);
 WiFiManager wm;
 
 // ============================================================
+//   PATHFINDER FREERTOS TASK (Core 0 — non-blocking A*)
+//   Receives GoToRequest via queue, runs A*, loads path to Navigator.
+//   Runs on Core 0 alongside lidarTask so it never blocks Core 1 motor loop.
+// ============================================================
+void pathfinderTask(void *pvParameters) {
+    GoToRequest req;
+    for (;;) {
+        // Block forever until a GOTO request arrives in the queue
+        if (xQueueReceive(pathfinderQueue, &req, portMAX_DELAY) == pdTRUE) {
+            if (!allowOnboardNavigation) continue;
+
+            Serial.printf("[PFDR] Computing path (%.2f,%.2f) -> (%.2f,%.2f)\n",
+                          req.startX, req.startY, req.goalX, req.goalY);
+
+            Waypoint tmpPath[MAX_WAYPOINTS];
+            int count = astar.computePath(req.startX, req.startY,
+                                          req.goalX,  req.goalY,
+                                          tmpPath, MAX_WAYPOINTS);
+
+            if (count > 0) {
+                // Write to sharedPath under mutex, then load into Navigator
+                if (xSemaphoreTake(pathMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+                    sharedPathLen = count;
+                    memcpy(sharedPath, tmpPath, count * sizeof(Waypoint));
+                    xSemaphoreGive(pathMutex);
+                }
+                navigator.loadPath(tmpPath, count, req.finalHeading);
+                Serial.printf("[PFDR] Path loaded: %d WPs\n", count);
+            } else {
+                Serial.println("[PFDR] No path found — goal blocked or out of map.");
+            }
+        }
+    }
+}
+
+// ============================================================
+//   FRONTIER EXPLORATION TASK (Core 0)
+//   Chạy song song, quét frontier mỗi 3s khi explorationRequested.
+//   Khi navigator.state == DONE/ERROR → tìm frontier mới.
+// ============================================================
+static unsigned long exploreNavStartTime = 0;
+void explorationTask(void *pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Chờ hệ thống ổn định 5s
+
+    for (;;) {
+        // Chỉ active khi được yêu cầu explore
+        if (!explorationRequested || !allowOnboardNavigation) {
+            frontierExplorer.state = FrontierExplorer::EXPLORE_IDLE;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // Chờ đủ interval
+        if (millis() - lastExploreCheckMs < EXPLORE_CHECK_INTERVAL) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        lastExploreCheckMs = millis();
+
+        // State machine
+        switch (frontierExplorer.state) {
+            case FrontierExplorer::EXPLORE_IDLE:
+                frontierExplorer.start();
+                break;
+
+            case FrontierExplorer::EXPLORE_SCANNING: {
+                float gx, gy;
+                applyTf(); // Ensure map pose is current
+                if (frontierExplorer.findNextGoal(gridMapper, mapX, mapY, gx, gy)) {
+                    GoToRequest req;
+                    req.startX = mapX;
+                    req.startY = mapY;
+                    req.goalX  = gx;
+                    req.goalY  = gy;
+                    req.finalHeading = NAN;
+
+                    if (pathfinderQueue) {
+                        xQueueSend(pathfinderQueue, &req, 0);
+                        frontierExplorer.state = FrontierExplorer::EXPLORE_NAVIGATING;
+                        exploreNavStartTime = millis();
+                        Serial.printf("[EXPLORE] Sent GOTO (%.2f,%.2f) to pathfinder\n", gx, gy);
+                    }
+                } else {
+                    explorationRequested = false;
+                    Serial.println("[EXPLORE] === MAP EXPLORATION COMPLETE ===");
+                }
+                break;
+            }
+
+            case FrontierExplorer::EXPLORE_NAVIGATING: {
+                if (navigator.state == NAV_DONE) {
+                    Serial.println("[EXPLORE] Goal reached — scanning for next frontier");
+                    frontierExplorer.state = FrontierExplorer::EXPLORE_SCANNING;
+                } else if (navigator.state == NAV_ERROR || 
+                          (navigator.state == NAV_IDLE && (millis() - exploreNavStartTime > 3000))) {
+                    Serial.println("[EXPLORE] Nav failed or timed out — blacklisting goal");
+                    frontierExplorer.blacklistCurrentGoal();
+                    frontierExplorer.state = FrontierExplorer::EXPLORE_SCANNING;
+                }
+                break;
+            }
+
+            case FrontierExplorer::EXPLORE_COMPLETE:
+            case FrontierExplorer::EXPLORE_FAILED:
+                explorationRequested = false;
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// ============================================================
 //   FREERTOS CONTROL TASK (50Hz)
 // ============================================================
 void controlTask(void *pvParameters) {
+
   const TickType_t xFrequency = pdMS_TO_TICKS(1000 / CONTROL_FREQ_HZ);
   TickType_t xLastWakeTime = xTaskGetTickCount();
   float deltaT = 1.0f / CONTROL_FREQ_HZ;
@@ -65,7 +226,7 @@ void controlTask(void *pvParameters) {
 
   for (;;) {
     // ── IMU Read ────────────────────────────────────────
-    if (imuAvailable) {
+    if (imuAvailable && !hitlMode) {
       gyroZ_raw = mpu6050_readGyroZ();
       if (!gyroCalibrated) {
         mpu6050_calibrate(gyroZ_raw);
@@ -81,75 +242,154 @@ void controlTask(void *pvParameters) {
     }
 
     // ── Read Encoders ───────────────────────────────────
-    noInterrupts();
-    long cL = leftTicks;
-    long cR = rightTicks;
-    interrupts();
+    if (!hitlMode) {
+      noInterrupts();
+      long cL = leftTicks;
+      long cR = rightTicks;
+      interrupts();
 
-    float vL_raw = (float)(cL - lastTicksL) / TICKS_PER_REV * 2.0f * PI / deltaT;
-    float vR_raw = (float)(cR - lastTicksR) / TICKS_PER_REV * 2.0f * PI / deltaT;
-    vL_meas = 0.7f * vL_meas + 0.3f * vL_raw; // Low-pass filter
-    vR_meas = 0.7f * vR_meas + 0.3f * vR_raw;
-    lastTicksL = cL;
-    lastTicksR = cR;
+      float vL_raw = (float)(cL - lastTicksL) / TICKS_PER_REV * 2.0f * PI / deltaT;
+      float vR_raw = (float)(cR - lastTicksR) / TICKS_PER_REV * 2.0f * PI / deltaT;
+      vL_meas = 0.7f * vL_meas + 0.3f * vL_raw; // Low-pass filter
+      vR_meas = 0.7f * vR_meas + 0.3f * vR_raw;
+      lastTicksL = cL;
+      lastTicksR = cR;
 
-    // ── Kinematics ──────────────────────────────────────
-    float v_robot = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
-    float w_encoder = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
+      // ── Kinematics ──────────────────────────────────────
+      float v_robot = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
+      float w_encoder = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
 
-    encoderTheta += w_encoder * deltaT;
-    encoderTheta = atan2(sin(encoderTheta), cos(encoderTheta));
+      encoderTheta += w_encoder * deltaT;
+      encoderTheta = atan2(sin(encoderTheta), cos(encoderTheta));
 
-    // ── Sensor Fusion (Complementary Filter) ────────────
-    float w_fused;
-    if (imuAvailable && gyroCalibrated) {
-      float diff = gyroTheta - encoderTheta;
-      while (diff > PI) diff -= 2.0f * PI;
-      while (diff < -PI) diff += 2.0f * PI;
-      fusedTheta = encoderTheta + COMP_FILTER_ALPHA * diff;
-      fusedTheta = atan2(sin(fusedTheta), cos(fusedTheta));
-      encoderTheta = fusedTheta;
-      w_fused = gyroZ_raw;
-      robotTheta = fusedTheta;
+      // ── Sensor Fusion (Complementary Filter) ────────────
+      float w_fused;
+      if (imuAvailable && gyroCalibrated) {
+        float diff = gyroTheta - encoderTheta;
+        while (diff > PI) diff -= 2.0f * PI;
+        while (diff < -PI) diff += 2.0f * PI;
+        fusedTheta = encoderTheta + COMP_FILTER_ALPHA * diff;
+        fusedTheta = atan2(sin(fusedTheta), cos(fusedTheta));
+        encoderTheta = fusedTheta;
+        w_fused = gyroZ_raw;
+        robotTheta = fusedTheta;
+      } else {
+        fusedTheta = encoderTheta;
+        w_fused = w_encoder;
+        robotTheta = encoderTheta;
+      }
+
+      // Odometry update
+      float dist = v_robot * deltaT;
+      robotDistance += fabs(dist);
+      robotX += dist * cos(robotTheta);
+      robotY += dist * sin(robotTheta);
+      
+      // Recompute map-frame pose after every odom update
+      applyTf();
     } else {
-      fusedTheta = encoderTheta;
-      w_fused = w_encoder;
-      robotTheta = encoderTheta;
+      // ── HITL MODE: Simulated odometry ─────────────────────
+      // Perfect motors: measured = target (no PID error)
+      vL_meas = targetLeftVel;
+      vR_meas = targetRightVel;
+
+      // Compute kinematics exactly like real mode — without this,
+      // robotX/Y never change and Navigator thinks robot is stuck!
+      float v_sim = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
+      float w_sim = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
+
+      robotTheta += w_sim * deltaT;
+      robotTheta = atan2f(sinf(robotTheta), cosf(robotTheta));
+
+      float dist_sim = v_sim * deltaT;
+      robotDistance += fabsf(dist_sim);
+      robotX += dist_sim * cosf(robotTheta);
+      robotY += dist_sim * sinf(robotTheta);
+
+      // Keep encoder/gyro/fused in sync (no drift in simulation)
+      encoderTheta = gyroTheta = fusedTheta = robotTheta;
+
+      // Recompute map-frame pose
+      applyTf();
     }
 
-    // Odometry update
-    float dist = v_robot * deltaT;
-    robotDistance += fabs(dist);
-    robotX += dist * cos(robotTheta);
-    robotY += dist * sin(robotTheta);
+    float v_robot = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
+    float w_fused = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
 
-    // ── OBSTACLE CHECK TRƯỚC — ưu tiên cao nhất ──────────
-    // FIX Bug #2: Di chuyển obstacle check LÊN TRƯỚC navigator
-    // để đảm bảo E-STOP xử lý trước khi navigator tính velocity mới.
+    // ── OBSTACLE HANDLING + DWA LOCAL PLANNER ─────────────────
+    // Thay vì E-STOP cứng, DWA sẽ tự tìm quỹ đạo né vật cản.
+    // E-STOP chỉ kích hoạt khi vật cản RẤT GẦN (< 0.15m) hoặc DWA thất bại.
+    bool hardEstop = false;
     if (obstacleDetected && millis() - timeObstacleLastDetected < 500) {
-        if (navigator.isNavigating() && navigator.state == NAV_TRACKING) {
-            navigator.pause();
-            Serial.println("[LIDAR] E-STOP: Phat hien vat can truoc xe!");
-        }
-        if (targetLeftVel > 0 || targetRightVel > 0) {
-            targetLeftVel = 0;
-            targetRightVel = 0;
-        }
-    } else if (obstacleDetected && millis() - timeObstacleLastDetected >= 500) {
+        hardEstop = true;
+    } else {
         obstacleDetected = false;
-        if (navigator.isNavigating() && navigator.state == NAV_PAUSED) {
-            navigator.resume();
-            Serial.println("[LIDAR] Vat can da di chuyen, RESUME!");
-        }
     }
 
-    // ── AUTONOMOUS NAVIGATOR (chỉ chạy nếu không bị E-STOP) ──
+    // ── AUTONOMOUS NAVIGATOR + DWA ──────────────────────────
     if (navigator.isNavigating()) {
-      navigator.update(robotX, robotY, robotTheta);
-      float navV = navigator.cmdLinear;
-      float navW = navigator.cmdAngular;
-      targetLeftVel = constrain((navV - navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-      targetRightVel = constrain((navV + navW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+      navigator.update(mapX, mapY, mapTheta);
+
+      if (navigator.isRecovering()) {
+        // Trong lúc recovery (lùi/quay), KHÔNG áp dụng DWA.
+        targetLeftVel = constrain((navigator.cmdLinear - navigator.cmdAngular * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+        targetRightVel = constrain((navigator.cmdLinear + navigator.cmdAngular * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+        
+        // Chỉ cấm tiến thẳng khi bị E-STOP
+        if (hardEstop && navigator.cmdLinear > 0) {
+           targetLeftVel = 0; 
+           targetRightVel = 0;
+        }
+      } else {
+        // 1. DWA override: chạy DWA mỗi 100ms khi đang TRACKING
+        if (navigator.state == NAV_TRACKING && millis() - lastDwaRunMs >= DWA_INTERVAL_MS) {
+          lastDwaRunMs = millis();
+          float curV = v_robot;
+          float curW = w_fused;
+          DwaResult dwaResult = dwaPlanner.computeVelocity(
+            mapX, mapY, mapTheta, curV, curW,
+            navigator.waypoints + navigator.currentWpIdx,
+            navigator.waypointCount - navigator.currentWpIdx,
+            gridMapper
+          );
+
+          if (dwaResult.ok) {
+            dwaActive = true;
+            dwaV = dwaResult.v;
+            dwaW = dwaResult.w;
+          } else {
+            // DWA không tìm được quỹ đạo an toàn
+            dwaActive = false;
+          }
+        }
+
+        // 2. Chọn velocity
+        float finalV = 0, finalW = 0;
+        if (dwaActive && navigator.state == NAV_TRACKING) {
+          finalV = dwaV;
+          finalW = dwaW;
+        } else {
+          // Nếu DWA thất bại, dừng robot để kích hoạt progress check (stuck detection) của navigator
+          finalV = 0;
+          finalW = 0;
+          dwaActive = false;
+        }
+
+        targetLeftVel = constrain((finalV - finalW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+        targetRightVel = constrain((finalV + finalW * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
+
+        if (hardEstop && finalV > 0) {
+          targetLeftVel = 0;
+          targetRightVel = 0;
+        }
+      }
+    } else {
+      // Chế độ thủ công: dừng nếu bị E-STOP và đang định chạy tới
+      float manualV = (targetLeftVel + targetRightVel) / 2.0f * WHEEL_RADIUS;
+      if (hardEstop && manualV > 0) {
+          targetLeftVel = 0;
+          targetRightVel = 0;
+      }
     }
 
     // ── Motor PI + Feedforward ──────────────────────────
@@ -184,13 +424,21 @@ void controlTask(void *pvParameters) {
     if (INVERT_LEFT_MOTOR) pwmLeft = -pwmLeft;
     if (INVERT_RIGHT_MOTOR) pwmRight = -pwmRight;
 
-    setMotor(MOTOR_LEFT_IN1, MOTOR_LEFT_IN2, 0, pwmLeft);
-    setMotor(MOTOR_RIGHT_IN3, MOTOR_RIGHT_IN4, 1, pwmRight);
+    if (!hitlMode) {
+      setMotor(MOTOR_LEFT_IN1, MOTOR_LEFT_IN2, 0, pwmLeft);
+      setMotor(MOTOR_RIGHT_IN3, MOTOR_RIGHT_IN4, 1, pwmRight);
+    }
 
     // Feed watchdog — proves controlTask is alive
     esp_task_wdt_reset();
 
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    TickType_t now = xTaskGetTickCount();
+    if (now - xLastWakeTime >= xFrequency) {
+      vTaskDelay(1); // Yield to prevent starvation of lower priority tasks if loop overruns
+      xLastWakeTime = xTaskGetTickCount();
+    } else {
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
   }
 }
 
@@ -209,6 +457,11 @@ void lidarTask(void *pvParameters) {
   static int consecutiveFails = 0;
   
   for (;;) {
+    if (hitlMode) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
     if (IS_OK(lidar.waitPoint())) {
       lidarOkCount++;
       consecutiveFails = 0; // Reset fail counter when we successfully read a point
@@ -225,7 +478,7 @@ void lidarTask(void *pvParameters) {
           gridMapper.add_point(angle, distance / 1000.0f);
         }
 
-        if ((deg <= 30 || deg >= 330) && distance > 50 && distance < 450) {
+        if ((deg <= 30 || deg >= 330) && distance > 50 && distance < 80) {
             obstacleDetected = true;
             timeObstacleLastDetected = millis();
         }
@@ -234,9 +487,130 @@ void lidarTask(void *pvParameters) {
       if (streamOccupancyGrid &&
           millis() - lastGridUpdateTime > GRID_UPDATE_INTERVAL &&
           gridMapper.point_count > 180) {
-        gridMapper.update_pose(robotX, robotY, robotTheta);
-        gridMapper.update_grid();
+
+        // ── SLAM v2: Copy scan buffer BEFORE update_grid clears it ──
+        // This fixes the race condition where ICP was comparing against an empty buffer
+        static LidarPoint icpCurrentScan[360];
+        int icpCurrentLen = gridMapper.point_count;
+        memcpy(icpCurrentScan, gridMapper.points, icpCurrentLen * sizeof(LidarPoint));
+        
+        // Track odometry delta between scans (for ICP init guess)
+        static float prevOdomX = robotX, prevOdomY = robotY, prevOdomTheta = robotTheta;
+        float odomDx = robotX - prevOdomX;
+        float odomDy = robotY - prevOdomY;
+        float odomDTheta = robotTheta - prevOdomTheta;
+        
+        // Update grid using MAP-FRAME pose (odom + TF correction)
+        applyTf();
+        gridMapper.update_pose(mapX, mapY, mapTheta);
+        gridMapper.update_grid();  // This clears gridMapper.points!
         lastGridUpdateTime = millis();
+
+        // ── ICP Pose Correction → updates TF, NOT odom ──────────────
+        if (!hitlMode &&
+            icpPrevScan != nullptr &&
+            !icpFirstScan &&
+            icpPrevLen > 0 &&
+            (fabsf(targetLeftVel) > 0.01f || fabsf(targetRightVel) > 0.01f)) {
+
+            // Use odometry delta as initial guess (helps ICP converge faster)
+            IcpMatcher::Pose2D initGuess = {odomDx, odomDy, odomDTheta};
+            IcpMatcher::Pose2D correction;
+
+            if (icpMatcher.match(
+                    icpPrevScan, icpPrevLen,
+                    icpCurrentScan, icpCurrentLen,
+                    initGuess, correction)) {
+
+                // Clamp correction — tránh jump lớn do nhiễu
+                correction.x     = constrain(correction.x,     -0.05f, 0.05f);
+                correction.y     = constrain(correction.y,     -0.05f, 0.05f);
+                correction.theta = constrain(correction.theta, -0.08f, 0.08f);
+
+                // SLAM v2: Update TF map→odom transform (NOT raw odometry!)
+                // This keeps robotX/Y/Theta as pure odom values
+                const float ICP_WEIGHT = 0.4f;
+                tfDx     += ICP_WEIGHT * correction.x;
+                tfDy     += ICP_WEIGHT * correction.y;
+                tfDTheta += ICP_WEIGHT * correction.theta;
+                tfDTheta  = atan2f(sinf(tfDTheta), cosf(tfDTheta));
+
+                // Recompute map pose with updated TF
+                applyTf();
+
+                // Log RMS chất lượng
+                icpRmsLast = icpMatcher.computeRMS(
+                    icpPrevScan, icpPrevLen,
+                    icpCurrentScan, icpCurrentLen,
+                    correction);
+
+                static unsigned long lastIcpLog = 0;
+                if (millis() - lastIcpLog > 2000) {
+                    lastIcpLog = millis();
+                    Serial.printf("[ICP] dx=%.3f dy=%.3f dth=%.3f rms=%.4f tf=(%.3f,%.3f,%.3f)\n",
+                        correction.x, correction.y, correction.theta, icpRmsLast,
+                        tfDx, tfDy, tfDTheta);
+                }
+            }
+        }
+
+        // Save current scan as prev for next iteration
+        if (icpPrevScan != nullptr && icpCurrentLen > 0) {
+            memcpy(icpPrevScan, icpCurrentScan, icpCurrentLen * sizeof(LidarPoint));
+            icpPrevLen   = icpCurrentLen;
+            icpFirstScan = false;
+        }
+        
+        // Update prev odom for next delta calculation
+        prevOdomX = robotX;
+        prevOdomY = robotY;
+        prevOdomTheta = robotTheta;
+
+        // ── CSM: Correlative Scan Matching (activates after grid has data) ──
+        // CSM uses the occupancy grid directly (likelihood field) → more robust
+        // than ICP point-to-point for structured environments.
+        // Strategy: ICP runs always (fast, incremental). CSM runs additionally
+        // when grid is mature, providing higher-quality corrections.
+        if (csmInitialized && 
+            !hitlMode &&
+            gridMapper.scanCount > CSM_MIN_SCANS &&
+            icpCurrentLen > 30 &&
+            (fabsf(targetLeftVel) > 0.01f || fabsf(targetRightVel) > 0.01f)) {
+            
+            CsmResult csmResult;
+            if (csmMatcher.matchScan(
+                    gridMapper, mapX, mapY, mapTheta,
+                    icpCurrentScan, icpCurrentLen,
+                    csmResult)) {
+                
+                // CSM correction → accumulate into TF (same as ICP)
+                const float CSM_WEIGHT = 0.3f;  // Slightly lower than ICP to avoid overcorrection
+                tfDx     += CSM_WEIGHT * csmResult.dx;
+                tfDy     += CSM_WEIGHT * csmResult.dy;
+                tfDTheta += CSM_WEIGHT * csmResult.dTheta;
+                tfDTheta  = atan2f(sinf(tfDTheta), cosf(tfDTheta));
+                applyTf();
+
+                static unsigned long lastCsmLog = 0;
+                if (millis() - lastCsmLog > 3000) {
+                    lastCsmLog = millis();
+                    Serial.printf("[CSM] dx=%.3f dy=%.3f dth=%.3f score=%.2f ms=%.0f\n",
+                        csmResult.dx, csmResult.dy, csmResult.dTheta,
+                        csmResult.score, csmMatcher.lastMatchMs);
+                }
+            }
+            slamDiag.scanMatchMs = csmMatcher.lastMatchMs;
+        }
+
+        // ── SLAM Diagnostics update ──────────────────────────────
+        slamDiag.updateMatchScore(icpRmsLast);
+        slamDiag.updateTfNorm(tfDx, tfDy, tfDTheta);
+        slamDiag.frontierCount = frontierExplorer.frontierCellCount;
+        // Grid stats: only compute every 5 scans (128x128 iteration is ~3ms)
+        if (gridMapper.scanCount % 5 == 0) {
+            slamDiag.updateGridStats(gridMapper);
+        }
+
       }
     } else {
       lidarFailCount++;
@@ -315,8 +689,13 @@ void setup() {
 
   init_motors();
   
-  // Init Pathfinder (20m x 20m, 0.1m resolution)
-  astar.init(200, 200, 0.1f);
+  // Init Pathfinder to match SLAM grid dimensions
+  astar.init(GRID_SIZE, GRID_SIZE, GRID_RESOLUTION);
+  astar.setSlamMap(&gridMapper);
+  
+  // Center SLAM grid on robot's spawn position
+  gridMapper.centerOnPosition(robotX, robotY);
+  applyTf(); // Initialize map pose = odom pose (tfDx/Dy/DTheta = 0)
 
   // Initialize Onboard RGB LED (dim and soft color)
   rgbLed.begin();
@@ -395,7 +774,10 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(400000);
-  Wire.setTimeout(20);
+  Wire.setTimeout(10); // Stream timeout
+#if defined(ESP32)
+  Wire.setTimeOut(10); // Hardware I2C timeout
+#endif
 
   i2cMutex = xSemaphoreCreateMutex();
   
@@ -415,8 +797,40 @@ void setup() {
   esp_task_wdt_add(NULL);
   Serial.println("[BOOT] Hardware Watchdog Timer: 5s timeout, panic=true");
 
-  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, NULL, 10, NULL, 1);
-  xTaskCreatePinnedToCore(lidarTask, "LidarTask", 8192, NULL, 1, NULL, 0);
+  // ── ICP Prev-scan buffer: PSRAM nếu có, fallback SRAM ───────
+  icpPrevScan = (LidarPoint*)heap_caps_malloc(
+      360 * sizeof(LidarPoint),
+      psramFound() ? MALLOC_CAP_SPIRAM : MALLOC_CAP_DEFAULT);
+  if (icpPrevScan) {
+      Serial.printf("[ICP] Prev-scan buffer: %d bytes in %s\n",
+          (int)(360 * sizeof(LidarPoint)),
+          psramFound() ? "PSRAM" : "SRAM");
+  } else {
+      Serial.println("[ICP] WARN: heap_caps_malloc failed! ICP disabled.");
+  }
+
+  // ── CSM Matcher: likelihood field buffer (GRID_SIZE² = ~16KB) ──
+  csmInitialized = csmMatcher.init();
+  if (csmInitialized) {
+      Serial.printf("[CSM] Likelihood field: %d bytes in %s\n",
+          GRID_SIZE * GRID_SIZE,
+          psramFound() ? "PSRAM" : "SRAM");
+  } else {
+      Serial.println("[CSM] WARN: init failed! CSM disabled.");
+  }
+
+  // ── FreeRTOS inter-task communication ───────────────────────
+
+  // Queue depth = 2: drop old requests if pathfinder is busy (GOTO from UI)
+  pathfinderQueue = xQueueCreate(2, sizeof(GoToRequest));
+  pathMutex       = xSemaphoreCreateMutex();
+  Serial.println("[BOOT] Pathfinder queue + mutex created.");
+
+  xTaskCreatePinnedToCore(pathfinderTask, "PathfinderTask", 16384, NULL, 5,  NULL, 0);
+  xTaskCreatePinnedToCore(controlTask,    "ControlTask",    8192,  NULL, 10, NULL, 1);
+  xTaskCreatePinnedToCore(lidarTask,      "LidarTask",      16384, NULL, 1,  NULL, 0);
+  xTaskCreatePinnedToCore(explorationTask, "ExploreTask",   16384, NULL, 2,  NULL, 0);
+
 
   Serial.println("================================================");
   Serial.println("  AMR 2.0 FIRMWARE - ESP32-S3 N16R8             ");
@@ -459,12 +873,12 @@ void loop() {
   if(millis() - lastPrint > 10000) {
       lastPrint = millis();
       int battPct = constrain((int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
-      // Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
-      //     WiFi.localIP().toString().c_str(),
-      //     battPct,
-      //     (imuAvailable && gyroCalibrated) ? "OK" : (imuAvailable ? "CAL" : "--"),
-      //     webSocket.connectedClients(),
-      //     robotX, robotY, robotTheta * 180.0f / PI);
+      Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
+          WiFi.localIP().toString().c_str(),
+          battPct,
+          (imuAvailable && gyroCalibrated) ? "OK" : (imuAvailable ? "CAL" : "--"),
+          webSocket.connectedClients(),
+          robotX, robotY, robotTheta * 180.0f / PI);
   }
 
   if (!navigator.isNavigating() && millis() - lastCmdTime > CMD_TIMEOUT_MS) {

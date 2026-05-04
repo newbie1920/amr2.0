@@ -16,10 +16,10 @@
 // ============================================================
 
 const L_PRIOR = 0;
-const L_OCC = 0.85;
-const L_FREE = -0.85; // Tăng sức mạnh xóa bóng ma (từ -0.4 lên -0.85)
+const L_OCC = 0.9;
+const L_FREE = -0.2; // Giảm sức mạnh xóa bóng ma để giữ vật cản tĩnh
 const L_MIN = -5.0;
-const L_MAX = 3.0; // Giảm giới hạn nhớ vật cản tĩnh để vật cản động biến mất nhanh hơn (từ 5.0 xuống 3.0)
+const L_MAX = 10.0; // Tăng giới hạn nhớ để vật cản không bị quên
 const MAX_LIDAR_RANGE_M = 3.0;
 const MIN_LIDAR_RANGE_M = 0.12;  // Lọc noise thân robot
 
@@ -33,7 +33,7 @@ import { ROBOT_RADIUS } from './warehouse.js';
 /** Articubot Nav2 inflation params */
 const COST_SCALING_FACTOR = 3.0;  // articubot: 3.0 — controls exponential decay
 const INSCRIBED_RADIUS = ROBOT_RADIUS; // 0.15m for 30x30cm robot
-const INFLATION_RADIUS_M = 0.75;  // Wider than articubot for better gradient visibility
+const INFLATION_RADIUS_M = 0.60;  // Match A* exploration logic
 
 // ============================================================
 //   OCCUPANCY GRID DATA STRUCTURE
@@ -291,12 +291,15 @@ export class OccupancyGrid {
     const w = this.width, h = this.height;
     const res = this.resolution;
 
+    // Reset costmap before inflating so old obstacles are cleared
+    this.costmap.fill(0);
+
+    // We need a distance array to track BFS distance
+    const distGrid = new Float32Array(w * h);
+    distGrid.fill(9999);
+
     // Nav2-style radii in cells
     const inscribedCells = Math.ceil(INSCRIBED_RADIUS / res);
-
-    // BFS distance grid (in cells)
-    const distGrid = new Float32Array(w * h);
-    distGrid.fill(Infinity);
 
     // BFS queue: [index, distance_cells]
     const queue = [];
@@ -649,18 +652,33 @@ export class OccupancyGrid {
     const robotX = view.getFloat32(7, true);
     const robotY = view.getFloat32(11, true);
     const robotHeading = view.getFloat32(15, true);
-    const expectedBytes = 19 + width * height;
+    
+    // SLAM v2: dynamic origin appended to header
+    let offset = 19;
+    let originX = 0;
+    let originY = 0;
+    
+    // Check if buffer is large enough for the v2 header (27 bytes)
+    if (buffer.byteLength >= 27 + width * height) {
+      originX = view.getFloat32(19, true);
+      originY = view.getFloat32(23, true);
+      offset = 27;
+    }
+
+    const expectedBytes = offset + width * height;
 
     if (buffer.byteLength < expectedBytes) {
       throw new Error(`Occupancy grid buffer too short: ${buffer.byteLength} < ${expectedBytes}`);
     }
 
-    const grid = new OccupancyGrid(width, height, resolution, robotX, robotY);
+    const grid = new OccupancyGrid(width, height, resolution, 0, 0);
+    // Use dynamic origin from ESP32
+    grid.originX = originX;
+    grid.originY = originY;
     grid.robotX = robotX;
     grid.robotY = robotY;
     grid.robotHeading = robotHeading;
 
-    let offset = 19;
     for (let gy = 0; gy < height; gy++) {
       for (let gx = 0; gx < width; gx++) {
         const occupancy100 = view.getUint8(offset++);

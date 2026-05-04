@@ -140,6 +140,10 @@ export default function RVizPanel({ activePath }) {
     setLayers(prev => ({ ...prev, [id]: !prev[id] }));
   }, []);
 
+  const mappingActive = useMapStore((s) => s.mappingActive);
+  const startMapping = useMapStore((s) => s.startMapping);
+  const stopMapping = useMapStore((s) => s.stopMapping);
+
   // Auto-clear measure points when switching away from measure tool
   useEffect(() => {
     if (activeTool !== 'measure') {
@@ -177,6 +181,17 @@ export default function RVizPanel({ activePath }) {
   const tf = activeRobotId ? (mapToOdom[activeRobotId] || { dx: 0, dy: 0, dTheta: 0 }) : { dx: 0, dy: 0, dTheta: 0 };
   const navSession = activeRobotId ? appNavigationSessions[activeRobotId] : null;
   const firstSimInfo = Object.values(simInfo)[0];
+  const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
+
+  const handleToggleMapping = useCallback(() => {
+    if (!activeRobotId) return;
+    const getRobotStore = () => useRobotStore.getState();
+    if (isMapping) {
+      stopMapping(activeRobotId, getRobotStore);
+    } else {
+      startMapping(activeRobotId, getRobotStore);
+    }
+  }, [activeRobotId, isMapping, startMapping, stopMapping]);
 
   // Viewport
   const viewport = useRVizViewport(canvasSize.w, canvasSize.h);
@@ -475,6 +490,8 @@ export default function RVizPanel({ activePath }) {
           onToolChange={setActiveTool}
           layers={layers}
           onToggleLayer={toggleLayer}
+          isMapping={isMapping}
+          onToggleMapping={handleToggleMapping}
         />
         <div ref={containerRef} style={canvasStyle}>
           {activeTool === 'goal' && (

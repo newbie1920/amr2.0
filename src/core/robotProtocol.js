@@ -9,6 +9,7 @@
  */
 
 import { encode, decode } from '@msgpack/msgpack';
+import { SimEngine } from './sim/simEngine.js';
 
 // ============================================================
 //   ROBOT CONNECTION CLASS
@@ -35,6 +36,11 @@ export class RobotConnection {
     this.pingTimer = null;
     this.lastPong = 0;
     this.latency = 0;
+
+    // --- HITL MODE ---
+    this.hitlEnabled = false;
+    this.hitlEngine = new SimEngine();
+    this.hitlTimer = null;
 
     // Telemetry data (cập nhật liên tục từ robot)
     this.telemetry = {
@@ -67,6 +73,8 @@ export class RobotConnection {
       architecture: 'hybrid',
       gridStreamEnabled: true,
       onboardNavEnabled: true,
+      slam: { score: 0, tfNorm: 0, tfDeg: 0, coverage: 0 },
+      path: [],              // ESP32 generated onboard A* path
     };
 
     // Callbacks
@@ -75,6 +83,7 @@ export class RobotConnection {
     this.onDisconnect = null;       // () => {}
     this.onError = null;            // (error) => {}
     this.onNavAck = null;           // (data) => {} — ESP32 xác nhận đã nhận path
+    this.onMapAck = null;           // (data) => {} — ESP32 xác nhận đã nhận static map
     this.onLidarGrid = null;       // (grid) => {} — Occupancy grid from LIDAR
   }
 
@@ -179,6 +188,54 @@ export class RobotConnection {
   }
 
   /**
+   * Bật/tắt chế độ HITL (Hardware-in-the-loop)
+   */
+  setHitlMode(enabled) {
+    this.hitlEnabled = enabled;
+    if (this.connected) {
+      this._send({ cmd: 'hitl_mode', enable: enabled });
+    }
+    
+    if (enabled) {
+      // Load SLAM test map (corridors, boxes, pillars)
+      this.hitlEngine.world.loadSlamTestMap();
+      
+      // Start sim engine at the test map's spawn point
+      const spawn = this.hitlEngine.world.defaultSpawn;
+      this.hitlEngine.start();
+      this.hitlEngine.reset(spawn.x, spawn.y, spawn.theta);
+      
+      // Sync ESP32 pose to spawn position
+      if (this.connected) {
+        this._send({ cmd: 'set_pose', x: spawn.x, y: spawn.y, theta: spawn.theta });
+      }
+      
+      console.log(`[HITL] SLAM Test Map loaded. Spawn: (${spawn.x}, ${spawn.y})`);
+      
+      this.hitlTimer = setInterval(() => {
+        if (!this.connected) return;
+        
+        const simTelem = this.hitlEngine.telemetry;
+        
+        // Send virtual sensors to ESP32
+        this._send({
+          cmd: 'hitl_sensor',
+          x: simTelem.x,
+          y: simTelem.y,
+          theta: simTelem.headingRad,
+          lidar: simTelem.lidar || []
+        });
+      }, 100); // 10Hz
+    } else {
+      this.hitlEngine.stop();
+      if (this.hitlTimer) {
+        clearInterval(this.hitlTimer);
+        this.hitlTimer = null;
+      }
+    }
+  }
+
+  /**
    * Truyền tọa độ khởi tạo (set_pose)
    */
   setPose(x, y, theta) {
@@ -212,18 +269,76 @@ export class RobotConnection {
   }
 
   /**
-   * Phân tán: Gửi bản đồ tĩnh dạng Binary
+   * Phân tán: Gửi bản đồ tĩnh dạng Binary kèm header 9 bytes
+   * Layout: [0x03][width:uint16_LE][height:uint16_LE][res:float32_LE][cells:int8[]]
+   * @param {Object} gridOrData - OccupancyGrid instance (phải có .width, .height, .resolution, .data hoặc .logOdds)
+   * @returns {boolean} true nếu gửi thành công
    */
-  sendMapData(occupancyGrid) {
+  sendMapData(gridOrData) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    const data = occupancyGrid.data; // Int8Array
-    const buffer = new Uint8Array(data.length + 1);
-    buffer[0] = 0x03; // Type: MAP_DATA
-    buffer.set(new Uint8Array(data.buffer), 1);
-    this.ws.send(buffer);
-    console.log(`[MAP] Sent static map: ${data.length} bytes`);
+
+    // Hỗ trợ cả grid instance (có .serialize()) và raw data object
+    let width, height, resolution, cells;
+
+    if (typeof gridOrData.serialize === 'function') {
+      // OccupancyGrid instance — extract dimensions + binary cells
+      width = gridOrData.width;
+      height = gridOrData.height;
+      resolution = gridOrData.resolution;
+      // Convert logOdds → binary cells: >0 = occupied(100), <0 = free(0), ~0 = unknown(50)
+      const lo = gridOrData.logOdds || gridOrData.data;
+      cells = new Int8Array(width * height);
+      for (let i = 0; i < width * height; i++) {
+        if (lo[i] > 0.4) cells[i] = 100;       // Occupied
+        else if (lo[i] < -0.4) cells[i] = 0;    // Free
+        else cells[i] = 50;                       // Unknown
+      }
+    } else if (gridOrData.width && gridOrData.height && gridOrData.cells) {
+      // Pre-built data object with { width, height, resolution, cells: Int8Array }
+      width = gridOrData.width;
+      height = gridOrData.height;
+      resolution = gridOrData.resolution;
+      cells = gridOrData.cells instanceof Int8Array ? gridOrData.cells : new Int8Array(gridOrData.cells);
+    } else {
+      console.error('[MAP] sendMapData: invalid grid format');
+      return false;
+    }
+
+    // Chunking the map to prevent ESP32 WebSocket max payload limit (Error 1009)
+    const CHUNK_SIZE = 8192;
+    for (let offset = 0; offset < cells.length; offset += CHUNK_SIZE) {
+      const chunkLength = Math.min(CHUNK_SIZE, cells.length - offset);
+      // Build binary frame: [type:1][w:2][h:2][res:4][offset:4][cells:chunkLength]
+      const HEADER_SIZE = 13; // 1 + 2 + 2 + 4 + 4
+      const totalSize = HEADER_SIZE + chunkLength;
+      const buffer = new ArrayBuffer(totalSize);
+      const view = new DataView(buffer);
+
+      view.setUint8(0, 0x03);                      // Type: MAP_DATA
+      view.setUint16(1, width, true);               // Width (Little Endian)
+      view.setUint16(3, height, true);              // Height (Little Endian)
+      view.setFloat32(5, resolution, true);         // Resolution (Little Endian)
+      view.setUint32(9, offset, true);              // Offset (Little Endian)
+
+      // Copy cell data after header
+      const byteView = new Uint8Array(buffer);
+      byteView.set(new Uint8Array(cells.buffer, offset, chunkLength), HEADER_SIZE);
+
+      this.ws.send(buffer);
+    }
+    
+    console.log(`[MAP] Sent static map chunks: ${width}x${height} @${resolution}m, total ${cells.length} bytes`);
     return true;
   }
+
+  /**
+   * Yêu cầu ESP32 push lại bản đồ (nếu có) — hiện chưa dùng nhưng reserved
+   */
+  requestMap() {
+    this._send({ cmd: 'map_request' });
+    console.log('[MAP] Requesting map from ESP32...');
+  }
+
 
   /**
    * Phân tán: Gửi tọa độ các xe khác để né
@@ -354,8 +469,15 @@ export class RobotConnection {
         return;
       }
 
+      // MAP_ACK — ESP32 confirmed static map received
+      if (data.type === 'map_ack') {
+        console.log(`[Robot ${this.name}] MAP_ACK: ${data.w}x${data.h}, ${data.bytes} bytes`);
+        if (this.onMapAck) this.onMapAck(data);
+        return;
+      }
+
       // Telemetry
-      if (data.telem) {
+      if (data.x !== undefined || data.batt !== undefined) {
         this._processTelemetryData(data);
       }
     } catch (err) {
@@ -384,8 +506,15 @@ export class RobotConnection {
         return;
       }
 
+      // MAP_ACK — ESP32 confirmed static map received
+      if (data.type === 'map_ack') {
+        console.log(`[Robot ${this.name}] MAP_ACK: ${data.w}x${data.h}, ${data.bytes} bytes`);
+        if (this.onMapAck) this.onMapAck(data);
+        return;
+      }
+
       // Telemetry
-      if (data.telem) {
+      if (data.x !== undefined || data.batt !== undefined) {
         this._processTelemetryData(data);
       }
     } catch (err) {
@@ -419,6 +548,7 @@ export class RobotConnection {
    * DRY: Cả 2 luồng decode đều gọi hàm này.
    */
   _processTelemetryData(data) {
+    this.lastPong = Date.now(); // Telemetry is a valid heartbeat
     this.telemetry = {
       x: data.x ?? this.telemetry.x,
       y: data.y ?? this.telemetry.y,
@@ -452,7 +582,34 @@ export class RobotConnection {
       obs: data.obs ?? this.telemetry.obs,
       // Lidar scan data (raw pass-through for mapping)
       lidar: data.lidar || [],
+      // HITL mode
+      hitl: data.hitl ?? this.telemetry.hitl,
+      slam: data.slam ?? this.telemetry.slam,
+      // Exploration (Onboard SLAM)
+      explore: data.explore ?? this.telemetry.explore,
+      explore_goals: data.explore_goals ?? this.telemetry.explore_goals,
+      explore_frontiers: data.explore_frontiers ?? this.telemetry.explore_frontiers,
+      path: data.path ?? this.telemetry.path,
     };
+
+    if (this.hitlEnabled) {
+      // Convert wheel angular velocities (rad/s) from ESP32 to robot velocities (m/s, rad/s)
+      const WHEEL_RADIUS = 0.033;
+      const WHEEL_SEPARATION = 0.22;
+      
+      const vL_ms = (data.vL_r || 0) * WHEEL_RADIUS;
+      const vR_ms = (data.vR_r || 0) * WHEEL_RADIUS;
+      
+      const v = (vL_ms + vR_ms) / 2.0;
+      const w = (vR_ms - vL_ms) / WHEEL_SEPARATION;
+      
+      this.hitlEngine.setVelocity(v, w);
+      
+      // Override lidar with virtual lidar for UI
+      if (this.hitlEngine.telemetry && this.hitlEngine.telemetry.lidar) {
+         this.telemetry.lidar = this.hitlEngine.telemetry.lidar;
+      }
+    }
 
     if (this.onTelemetry) this.onTelemetry(this.telemetry);
   }

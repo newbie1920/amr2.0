@@ -249,6 +249,27 @@ export default function ConnectionPanel() {
                   ✕
                 </button>
               </div>
+
+              {/* HITL Mode Toggle (visible only when connected to a physical robot) */}
+              {isConnected && !robot.id.startsWith('sim_') && (
+                <button
+                  className={`btn btn--sm btn--full`}
+                  style={{
+                    marginTop: '8px',
+                    fontSize: '11px',
+                    background: (robot?.telemetry?.hitl || robot?.connection?.hitlEnabled) ? 'var(--accent-info)' : 'transparent',
+                    borderColor: 'var(--accent-info)',
+                    color: (robot?.telemetry?.hitl || robot?.connection?.hitlEnabled) ? '#fff' : 'var(--accent-info)',
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const next = !(robot?.telemetry?.hitl || robot?.connection?.hitlEnabled);
+                    useRobotStore.getState().toggleHitlMode(robot.id, next);
+                  }}
+                >
+                  {(robot?.telemetry?.hitl || robot?.connection?.hitlEnabled) ? '🌐 HITL: Đang giả lập (ON)' : '🔌 Bật HITL (Hardware-in-Loop)'}
+                </button>
+              )}
             </div>
           );
         })}

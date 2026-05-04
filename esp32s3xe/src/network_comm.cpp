@@ -14,6 +14,8 @@
 #include "imu_sensor.h"
 #include "lidar_mapper.h"
 #include "pathfinder.h"
+#include "frontier_explorer.h"
+#include "slam_diagnostics.h"
 
 extern WebServer server;
 extern WebSocketsServer webSocket;
@@ -27,7 +29,24 @@ extern bool obstacleDetected;
 extern unsigned long timeObstacleLastDetected;
 extern bool streamOccupancyGrid;
 extern bool allowOnboardNavigation;
+extern bool hitlMode;
 extern const char* architectureProfile;
+
+extern FrontierExplorer frontierExplorer;
+extern bool explorationRequested;
+
+// SLAM diagnostics (defined in main.cpp)
+extern SlamDiag slamDiag;
+extern float icpRmsLast;
+
+// Pathfinder task inter-process communication (defined in main.cpp)
+struct GoToRequest {
+    float startX, startY;
+    float goalX,  goalY;
+    float finalHeading;
+};
+extern QueueHandle_t pathfinderQueue;
+
 
 unsigned long lastTelemetryTime = 0;
 
@@ -42,6 +61,14 @@ void setArchitectureProfile(const char* profile) {
     return;
   }
 
+  if (strcmp(profile, "aggressive") == 0) {
+    architectureProfile = "aggressive";
+    streamOccupancyGrid = true;
+    allowOnboardNavigation = true;
+    Serial.println("[ARCH] Switched to AGGRESSIVE profile");
+    return;
+  }
+
   architectureProfile = "hybrid";
   streamOccupancyGrid = true;
   allowOnboardNavigation = true;
@@ -52,9 +79,52 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   // Raw binary handlers for custom protocols
   if (type == WStype_BIN && length > 0) {
     if (payload[0] == 0x03) {
-      // MAP_DATA (Raw occupancy grid)
-      astar.updateStaticMap(payload + 1, length - 1);
-      Serial.printf("[NET] Nhận Static Map: %d bytes\n", length - 1);
+      // ── MAP_DATA binary frame (Chunked) ───────────────────────────────
+      // Layout: [0x03][width:uint16_LE][height:uint16_LE][res:float_LE][offset:uint32_LE][data...]
+      // Header = 1 (type) + 2 + 2 + 4 + 4 = 13 bytes minimum
+      // ────────────────────────────────────────────────────────────────
+      const size_t HEADER_SIZE = 13; // 1 type + 2 w + 2 h + 4 res + 4 offset
+      if (length < HEADER_SIZE) {
+        Serial.printf("[NET] MAP_DATA quá ngắn: %d bytes\n", length);
+        return;
+      }
+
+      uint16_t newW, newH;
+      float    newRes;
+      uint32_t offset;
+      memcpy(&newW,  payload + 1, 2);
+      memcpy(&newH,  payload + 3, 2);
+      memcpy(&newRes, payload + 5, 4);
+      memcpy(&offset, payload + 9, 4);
+
+      // Reinit A* if dimensions changed (or first time)
+      if (!astar.isInitialized() ||
+          newW != (uint16_t)astar.getMapWidth()  ||
+          newH != (uint16_t)astar.getMapHeight() ||
+          fabsf(newRes - astar.getMapResolution()) > 1e-4f) {
+        Serial.printf("[NET] MAP reinit: %dx%d @ %.3fm/cell\n", newW, newH, newRes);
+        astar.init(newW, newH, newRes);
+      }
+
+      const uint8_t* mapPayload = payload + HEADER_SIZE;
+      size_t         payloadLen = length - HEADER_SIZE;
+      astar.updateStaticMap(mapPayload, payloadLen, offset);
+
+      // Send map_ack so Web knows ESP32 received the map chunk
+      // Only send ack when the full map is received to prevent spam, or send every chunk
+      // Web expects one map_ack to know it's done.
+      if (offset + payloadLen >= (uint32_t)(newW * newH)) {
+        JsonDocument ack;
+        ack["type"]  = "map_ack";
+        ack["w"]     = newW;
+        ack["h"]     = newH;
+        ack["bytes"] = (int)(offset + payloadLen);
+        static uint8_t ackBuf[64];
+        size_t ackLen = serializeMsgPack(ack, ackBuf, sizeof(ackBuf));
+        webSocket.sendBIN(num, ackBuf, ackLen);
+        Serial.printf("[NET] Static Map complete: %dx%d (%.3f m/cell, %d bytes total)\n",
+                      newW, newH, newRes, offset + payloadLen);
+      }
       return;
     }
   }
@@ -88,6 +158,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     leftTicks = rightTicks = lastTicksL = lastTicksR = 0;
     targetLeftVel = targetRightVel = 0;
     gyroTheta = encoderTheta = fusedTheta = robotTheta;
+    // Reset TF and recenter grid on new position
+    tfDx = tfDy = tfDTheta = 0;
+    applyTf();
+    gridMapper.centerOnPosition(robotX, robotY);
     leftPID->reset();
     rightPID->reset();
     Serial.printf("[CMD] Odometry reset to (%.2f, %.2f, %.2f).\n", resetX, resetY, resetTheta);
@@ -98,6 +172,54 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     if (!doc["y"].isNull()) robotY = doc["y"];
     if (!doc["theta"].isNull()) robotTheta = doc["theta"];
     gyroTheta = encoderTheta = fusedTheta = robotTheta;
+  }
+
+  if (doc["cmd"] == "hitl_mode") {
+    hitlMode = doc["enable"] | false;
+    Serial.printf("[HITL] Mode set to: %d\n", hitlMode);
+    if (hitlMode) {
+      // Reset mapping for fresh SLAM in virtual environment
+      gridMapper.reset();
+      streamOccupancyGrid = true;
+      Serial.println("[HITL] GridMapper reset, grid streaming ON");
+    }
+  }
+
+  if (doc["cmd"] == "hitl_sensor") {
+    if (hitlMode) {
+      if (!doc["x"].isNull()) robotX = doc["x"];
+      if (!doc["y"].isNull()) robotY = doc["y"];
+      if (!doc["theta"].isNull()) robotTheta = doc["theta"];
+      gyroTheta = encoderTheta = fusedTheta = robotTheta;
+      
+      JsonArray lidarArr = doc["lidar"].as<JsonArray>();
+      memset(lidarDists, 0, sizeof(lidarDists));
+      obstacleDetected = false;
+      
+      if (streamOccupancyGrid) {
+        gridMapper.update_pose(robotX, robotY, robotTheta);
+      }
+
+      for (JsonVariant v : lidarArr) {
+        int a = v["a"];
+        int d = v["d"];
+        if (a >= 0 && a < 360) {
+          lidarDists[a] = d;
+          // Only trigger obstacle for forward-facing beams (±30°), matching real lidarTask logic
+          if ((a <= 30 || a >= 330) && d > 50 && d < 150) {
+            obstacleDetected = true;
+            timeObstacleLastDetected = millis();
+          }
+          if (streamOccupancyGrid && d > 0) {
+            gridMapper.add_point(a, d / 1000.0f);
+          }
+        }
+      }
+
+      if (streamOccupancyGrid) {
+        gridMapper.update_grid();
+      }
+    }
   }
 
   if (doc["cmd"] == "navigate") {
@@ -136,22 +258,25 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   // ── KIẾN TRÚC PHÂN TÁN (Decentralized Architecture) ──
   
   if (doc["cmd"] == "goto") {
-    if (!allowOnboardNavigation) return;
-    
-    float targetX = doc["x"];
-    float targetY = doc["y"];
-    float endH = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
-    
-    Serial.printf("[NET] Received GOTO: %.2f, %.2f\n", targetX, targetY);
-    
-    Waypoint tempWps[MAX_WAYPOINTS];
-    int count = astar.computePath(robotX, robotY, targetX, targetY, tempWps, MAX_WAYPOINTS);
-    
-    if (count > 0) {
-      navigator.loadPath(tempWps, count, endH);
-      Serial.println("[NET] A* Path generated and loaded to Navigator!");
-    } else {
-      Serial.println("[NET] GOTO Failed: No path found or goal blocked.");
+    if (!allowOnboardNavigation) {
+      Serial.println("[ARCH] Forcing hybrid mode for GOTO command");
+      setArchitectureProfile("hybrid");
+    }
+
+    GoToRequest req;
+    req.startX      = robotX;
+    req.startY      = robotY;
+    req.goalX       = doc["x"];
+    req.goalY       = doc["y"];
+    req.finalHeading = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
+
+    Serial.printf("[NET] Queuing GOTO: (%.2f,%.2f) -> (%.2f,%.2f)\n",
+                  req.startX, req.startY, req.goalX, req.goalY);
+
+    if (pathfinderQueue) {
+      // Overwrite old request in queue (xQueueOverwrite only works for depth-1 queues)
+      // For depth-2 we just try to send; if full the oldest is naturally consumed first
+      xQueueSend(pathfinderQueue, &req, 0);
     }
   }
 
@@ -173,6 +298,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     }
   }
 
+  if (doc["cmd"] == "map_request_ack") {
+    // Web xác nhận sẽ push map ngay — không cần xử lý gì thêm
+    Serial.println("[NET] Web acknowledged MAP_REQUEST — map incoming");
+  }
+
+
   if (doc["cmd"] == "pause") {
     if (allowOnboardNavigation) {
       navigator.pause();
@@ -188,6 +319,69 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
   if (doc["cmd"] == "set_arch_mode") {
     const char* profile = doc["profile"] | "hybrid";
     setArchitectureProfile(profile);
+  }
+
+  // ── Set Robot Pose (for HITL sync) ───────────────────────
+  if (doc["cmd"] == "set_pose") {
+    float newX = doc["x"] | 0.0f;
+    float newY = doc["y"] | 0.0f;
+    float newTheta = doc["theta"] | 0.0f;
+    robotX = newX;
+    robotY = newY;
+    robotTheta = newTheta;
+    gyroTheta = encoderTheta = fusedTheta = robotTheta;
+    robotDistance = 0;
+    leftTicks = rightTicks = lastTicksL = lastTicksR = 0;
+    // Reset TF and recenter grid on new position
+    tfDx = tfDy = tfDTheta = 0;
+    applyTf();
+    gridMapper.centerOnPosition(robotX, robotY);
+    gridMapper.update_pose(mapX, mapY, mapTheta);
+    Serial.printf("[NET] set_pose: (%.2f, %.2f, %.1f°)\n", robotX, robotY, robotTheta * 180.0f / M_PI);
+  }
+
+  // ── Frontier Exploration Commands ─────────────────────────
+  if (doc["cmd"] == "explore") {
+    // Force hybrid mode — exploration REQUIRES onboard navigation
+    if (!allowOnboardNavigation) {
+      setArchitectureProfile("hybrid");
+      Serial.println("[NET] explore cmd forced HYBRID profile");
+    }
+    
+    explorationRequested = true;
+    
+    // Reset map for fresh SLAM
+    gridMapper.reset();
+    gridMapper.centerOnPosition(robotX, robotY);  // Center grid around current robot pose
+    streamOccupancyGrid = true;
+    
+    // Reset TF transform for fresh SLAM session
+    tfDx = tfDy = tfDTheta = 0;
+    applyTf();
+    
+    // Reset PID controllers (odometry position is set via set_pose from Web)
+    targetLeftVel = targetRightVel = 0;
+    leftPID->reset();
+    rightPID->reset();
+    navigator.abort(); // Cancel any previous navigation
+    frontierExplorer.stop(); // Reset frontier state machine
+    
+    Serial.printf("[NET] Exploration started! pos=(%.2f,%.2f) grid_origin=(%.2f,%.2f) hitl=%d\n", 
+                  robotX, robotY, gridMapper.originX, gridMapper.originY, hitlMode);
+
+    JsonDocument ack;
+    ack["type"] = "explore_ack";
+    ack["status"] = "started";
+    static uint8_t outBuf[64];
+    size_t ackLen = serializeMsgPack(ack, outBuf, sizeof(outBuf));
+    webSocket.sendBIN(num, outBuf, ackLen);
+  }
+
+  if (doc["cmd"] == "explore_stop") {
+    explorationRequested = false;
+    frontierExplorer.stop();
+    navigator.abort();
+    Serial.println("[NET] Exploration stopped by Web");
   }
 
   if (doc["cmd"] == "recal_gyro") {
@@ -261,13 +455,14 @@ void update_network() {
 }
 
 void send_occupancy_grid() {
-  static uint8_t gridBuffer[1620];
+  // Buffer: 1(type) + 1(w) + 1(h) + 4(res) + 4(rx) + 4(ry) + 4(rh) + 4(origX) + 4(origY) + GRID_SIZE² = ~16411 bytes
+  static uint8_t gridBuffer[20000];
   int idx = 0;
   
   // Message type (1 = occupancy grid)
   gridBuffer[idx++] = 0x01;
   
-  // Grid dimensions
+  // Grid dimensions (uint8_t OK — GRID_SIZE=128 fits in 0-255)
   gridBuffer[idx++] = GRID_SIZE;
   gridBuffer[idx++] = GRID_SIZE;
   
@@ -276,13 +471,20 @@ void send_occupancy_grid() {
   memcpy(&gridBuffer[idx], &gridRes, 4);
   idx += 4;
   
-  // Robot pose
+  // Robot pose (map frame)
   float rx = robotX, ry = robotY, rh = robotTheta;
   memcpy(&gridBuffer[idx], &rx, 4);
   idx += 4;
   memcpy(&gridBuffer[idx], &ry, 4);
   idx += 4;
   memcpy(&gridBuffer[idx], &rh, 4);
+  idx += 4;
+  
+  // Grid origin (world coordinates) — new in SLAM v2
+  float ox = gridMapper.originX, oy = gridMapper.originY;
+  memcpy(&gridBuffer[idx], &ox, 4);
+  idx += 4;
+  memcpy(&gridBuffer[idx], &oy, 4);
   idx += 4;
   
   // Occupancy grid
@@ -355,6 +557,26 @@ void broadcast_telemetry() {
     telem["arch"] = architectureProfile;
     telem["grid_stream"] = streamOccupancyGrid;
     telem["onboard_nav"] = allowOnboardNavigation;
+    telem["hitl"] = hitlMode;
+    telem["explore"] = frontierExplorer.getStateName();
+    telem["explore_goals"] = frontierExplorer.exploredGoals;
+    telem["explore_frontiers"] = frontierExplorer.frontierCellCount;
+
+    // ── SLAM v2 Diagnostics ──────────────────────────────────
+    JsonObject slam = telem["slam"].to<JsonObject>();
+    slam["score"]    = (int)(slamDiag.matchScore * 100);  // 0..100%
+    slam["tfNorm"]   = slamDiag.tfNorm;                   // meters
+    slam["tfDeg"]    = slamDiag.tfAngleDeg;               // degrees
+    slam["coverage"] = slamDiag.gridCoverage;             // 0..100%
+    slam["occ"]      = slamDiag.gridOccupied;             // cell count
+    slam["free"]     = slamDiag.gridFree;                 // cell count
+    slam["rms"]      = icpRmsLast;                        // raw ICP RMS
+    slam["scans"]    = slamDiag.scanCount;                // total grid updates
+    // Map-frame pose (for dashboard to display corrected position)
+    slam["mX"]  = mapX;
+    slam["mY"]  = mapY;
+    slam["mTh"] = mapTheta * 180.0f / PI;
+
     telem["eX"] = navigator.error_x;
     telem["eY"] = navigator.error_y;
     telem["eYaw"] = navigator.error_yaw;
@@ -374,6 +596,22 @@ void broadcast_telemetry() {
         pwr["motorA"] = ina_currentA[INA_CH_MOTOR];
     }
 
+    // PATH export cho Web Dashboard vẽ
+    extern Waypoint sharedPath[];
+    extern int sharedPathLen;
+    extern SemaphoreHandle_t pathMutex;
+    if (sharedPathLen > 0 && pathMutex) {
+        if (xSemaphoreTake(pathMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            JsonArray pArr = telem["path"].to<JsonArray>();
+            for(int i = 0; i < sharedPathLen; i++) {
+                JsonObject pt = pArr.add<JsonObject>();
+                pt["x"] = sharedPath[i].x;
+                pt["y"] = sharedPath[i].y;
+            }
+            xSemaphoreGive(pathMutex);
+        }
+    }
+
     JsonArray ls = telem["lidar"].to<JsonArray>();
     bool hasObstruction = obstacleDetected && millis() - timeObstacleLastDetected < 500;
     telem["obs"] = hasObstruction;
@@ -385,17 +623,19 @@ void broadcast_telemetry() {
       }
     }
 
-    static uint8_t telemBuf[4096]; // Tăng buffer cho lidar data
+    static uint8_t telemBuf[8192]; // Tăng buffer cho lidar data + path
     telemBuf[0] = 0x02; 
-    size_t len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
-    if (len == 0 || len > sizeof(telemBuf) - 1) {
-      Serial.printf("[TELEM] WARNING: MsgPack overflow! len=%d, max=%d\n", len, sizeof(telemBuf) - 1);
-      len = 0; // Bỏ frame này, không gửi data bị cắt
+    size_t reqLen = measureMsgPack(telem);
+    size_t len = 0;
+    if (reqLen <= sizeof(telemBuf) - 1) {
+        len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
+    } else {
+        Serial.printf("[TELEM] WARNING: MsgPack overflow! reqLen=%d, max=%d\n", reqLen, sizeof(telemBuf) - 1);
     }
     if (len > 0) webSocket.broadcastBIN(telemBuf, len + 1);
     
     static unsigned long lastGridSendTime = 0;
-    if (streamOccupancyGrid && millis() - lastGridSendTime > 500) {
+    if (streamOccupancyGrid && millis() - lastGridSendTime > 200) {
       lastGridSendTime = millis();
       send_occupancy_grid();
     }

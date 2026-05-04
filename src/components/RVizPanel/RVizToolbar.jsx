@@ -93,7 +93,7 @@ const LAYERS = [
 //   COMPONENT
 // ============================================================
 
-export default function RVizToolbar({ activeTool, onToolChange, layers, onToggleLayer }) {
+export default function RVizToolbar({ activeTool, onToolChange, layers, onToggleLayer, isMapping, onToggleMapping }) {
   return (
     <div style={toolbarStyle}>
       {/* Tools */}
@@ -107,6 +107,23 @@ export default function RVizToolbar({ activeTool, onToolChange, layers, onToggle
           </button>
         </div>
       ))}
+
+      <div style={dividerStyle} />
+
+      {/* Actions */}
+      <div style={tooltipWrapStyle} title={isMapping ? "Stop Auto-Exploration (SLAM)" : "Start Auto-Exploration (SLAM)"}>
+        <button
+          style={{
+            ...toolBtnStyle(isMapping),
+            color: isMapping ? '#ef4444' : '#10b981',
+            borderColor: isMapping ? 'rgba(239, 68, 68, 0.5)' : 'rgba(16, 185, 129, 0.3)',
+            background: isMapping ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.1)',
+          }}
+          onClick={onToggleMapping}
+        >
+          🚀
+        </button>
+      </div>
 
       <div style={dividerStyle} />
 

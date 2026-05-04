@@ -49,7 +49,7 @@ export class SimEngine {
     this.lidar = new SimLidar({ numRays: 360, maxRange: 8000, noiseStdDev: 8 });
 
     // Robot state (ground truth)
-    this.pose = { x: 5.0, y: 1.5, theta: Math.PI / 2 };
+    this.pose = { x: 3.5, y: 2.0, theta: Math.PI / 2 };
 
     // Robot odometry (with drift — what the robot THINKS its position is)
     this.odom = { x: 0, y: 0, theta: 0 };

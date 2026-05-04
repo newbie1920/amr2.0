@@ -30,7 +30,7 @@ extern float lastPwmRight;
 extern float vL_meas;
 extern float vR_meas;
 
-// Pose
+// Pose (odometry frame — pure encoder + IMU fusion)
 extern float robotX;
 extern float robotY;
 extern float robotTheta;
@@ -39,6 +39,17 @@ extern float encoderTheta;
 extern float gyroTheta;
 extern float fusedTheta;
 
+// Map-frame pose (odom pose ⊕ TF correction)
+// mapPose = odomPose + tfMapOdom
+extern float mapX;
+extern float mapY;
+extern float mapTheta;
+
+// TF map→odom transform (accumulated scan matching corrections)
+extern float tfDx;
+extern float tfDy;
+extern float tfDTheta;
+
 // Battery
 extern float filteredVBatt;
 
@@ -46,5 +57,6 @@ extern float filteredVBatt;
 void init_encoders();
 void init_motors();
 void setMotor(int pinIN1, int pinIN2, int pwmCh, float u);
+void applyTf();  // Compute mapPose = odomPose ⊕ tfMapOdom
 
 #endif // ODOMETRY_H

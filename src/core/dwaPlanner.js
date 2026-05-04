@@ -381,7 +381,7 @@ function rectangularFootprintCollision(x, y, theta, grid, cfg) {
 
     if (grid.costmap) {
       const cost = grid.getCost(g.gx, g.gy);
-      if (cost >= 120) return true; // BUG #5 FIX: Match pathfinder safety (100) + margin
+      if (cost >= 253) return true; // Only 253 (Inscribed) or 254 (Lethal) is a physical collision
     } else {
       // Fallback: raw logOdds
       if (grid.getLogOdds(g.gx, g.gy) > 0.3) return true;
@@ -392,7 +392,7 @@ function rectangularFootprintCollision(x, y, theta, grid, cfg) {
   const center = grid.worldToGrid(x, y);
   if (grid.inBounds(center.gx, center.gy)) {
     if (grid.costmap) {
-      if (grid.getCost(center.gx, center.gy) >= 120) return true;
+      if (grid.getCost(center.gx, center.gy) >= 253) return true;
     } else {
       if (grid.getLogOdds(center.gx, center.gy) > 0.3) return true;
     }

@@ -23,7 +23,8 @@ export default function TelemetryChart() {
         name: timeStr,
         eX: parseFloat(activeRobot.telemetry.eX || 0).toFixed(3),
         eY: parseFloat(activeRobot.telemetry.eY || 0).toFixed(3),
-        eYaw: parseFloat(activeRobot.telemetry.eYaw || 0).toFixed(3)
+        tfNorm: parseFloat(activeRobot.telemetry.slam?.tfNorm || 0).toFixed(3),
+        score: parseInt(activeRobot.telemetry.slam?.score || 0, 10)
       };
       
       const newData = [...prev, newLine];
@@ -42,25 +43,27 @@ export default function TelemetryChart() {
     <div className="panel" style={{ marginTop: '16px' }}>
       <div className="panel__header">
         <div style={{ display: 'flex', flexDirection: 'column' }}>
-          <span className="panel__title">📈 Cross-track Error (Lyapunov)</span>
+          <span className="panel__title">📈 Navigation & SLAM Diagnostics</span>
           <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>Real-time telemetry tracking - Robot: {activeRobot.id}</span>
         </div>
       </div>
-      <div style={{ height: '220px', width: '100%', fontSize: '11px' }}>
-        <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+      <div style={{ height: '220px', width: '100%', fontSize: '11px', display: 'flex', flexDirection: 'column' }}>
+        <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
           <LineChart data={data} margin={{ top: 10, right: 10, left: -25, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
             <XAxis dataKey="name" stroke="var(--text-muted)" tick={{fontSize: 9}} tickMargin={5} />
-            <YAxis stroke="var(--text-muted)" tick={{fontSize: 9}} width={50} />
+            <YAxis yAxisId="left" stroke="var(--text-muted)" tick={{fontSize: 9}} width={50} />
+            <YAxis yAxisId="right" orientation="right" stroke="var(--text-muted)" tick={{fontSize: 9}} width={30} domain={[0, 100]} />
             <Tooltip 
               contentStyle={{ backgroundColor: 'var(--bg-dark)', borderColor: 'var(--border)', borderRadius: '6px' }}
               itemStyle={{ fontSize: '12px' }}
               labelStyle={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '4px' }}
             />
             <Legend wrapperStyle={{ fontSize: '11px', paddingTop: '10px' }} iconType="circle" />
-            <Line type="monotone" dataKey="eX" stroke="#8884d8" name="Error X (m)" dot={false} strokeWidth={2} isAnimationActive={false} />
-            <Line type="monotone" dataKey="eY" stroke="#82ca9d" name="Error Y (m)" dot={false} strokeWidth={2} isAnimationActive={false} />
-            <Line type="monotone" dataKey="eYaw" stroke="#ffc658" name="Error Yaw (rad)" dot={false} strokeWidth={2} isAnimationActive={false} />
+            <Line yAxisId="left" type="monotone" dataKey="eX" stroke="#8884d8" name="Error X (m)" dot={false} strokeWidth={2} isAnimationActive={false} />
+            <Line yAxisId="left" type="monotone" dataKey="eY" stroke="#82ca9d" name="Error Y (m)" dot={false} strokeWidth={2} isAnimationActive={false} />
+            <Line yAxisId="left" type="monotone" dataKey="tfNorm" stroke="#ff7300" name="TF Drift (m)" dot={false} strokeWidth={2} isAnimationActive={false} />
+            <Line yAxisId="right" type="monotone" dataKey="score" stroke="#00C49F" name="ICP Score (%)" dot={false} strokeWidth={2} isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
       </div>

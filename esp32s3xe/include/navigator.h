@@ -18,7 +18,7 @@
 //   NAVIGATOR CONFIG
 // ============================================================
 // Tốc độ tối đa
-#define NAV_MAX_LINEAR_VEL    0.15f
+#define NAV_MAX_LINEAR_VEL    0.40f
 #define NAV_APPROACH_VEL      0.05f
 #define NAV_SLOWDOWN_DIST     0.25f
 #define NAV_TURN_SPEED        1.2f
@@ -35,7 +35,7 @@
 #define NAV_WP_TIMEOUT_MS     15000
 
 // ── Recovery Config (Nav2-inspired) ──
-#define NAV_PROGRESS_CHECK_MS   10000   // 10s không tiến triển → trigger recovery
+#define NAV_PROGRESS_CHECK_MS   3000    // 3s không tiến triển → trigger recovery
 #define NAV_PROGRESS_DIST       0.05f   // Tối thiểu 5cm tiến triển
 #define NAV_RECOVERY_SPIN_MS    3000    // Xoay 3 giây (~180°)
 #define NAV_RECOVERY_BACKUP_MS  2000    // Lùi 2 giây (~30cm)

@@ -23,7 +23,7 @@ float ina_currentA[3] = {0, 0, 0};
 //   MPU6050 BARE-METAL FUNCTIONS
 // ============================================================
 void mpu6050_writeReg(uint8_t reg, uint8_t val) {
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   Wire.write(val);
@@ -31,33 +31,47 @@ void mpu6050_writeReg(uint8_t reg, uint8_t val) {
   xSemaphoreGive(i2cMutex);
 }
 
-int16_t mpu6050_readReg16(uint8_t reg) {
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+int16_t mpu6050_readReg16(uint8_t reg, bool* ok = nullptr) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+      if(ok) *ok = false;
+      return 0;
+  }
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
+    Wire.end();
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    Wire.setTimeout(10);
+#if defined(ESP32)
+    Wire.setTimeOut(10);
+#endif
     xSemaphoreGive(i2cMutex);
+    if(ok) *ok = false;
     return 0;
   }
   uint8_t rcv = Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)2);
   if (rcv < 2) {
     Wire.end();
-    delay(2);
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    Wire.setTimeout(10);
+#if defined(ESP32)
+    Wire.setTimeOut(10);
+#endif
     xSemaphoreGive(i2cMutex);
+    if(ok) *ok = false;
     return 0;
   }
   int16_t res = (Wire.read() << 8) | Wire.read();
   xSemaphoreGive(i2cMutex);
+  if(ok) *ok = true;
   return res;
 }
 
 bool mpu6050_init() {
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x75);
   Wire.endTransmission(false);
@@ -84,7 +98,20 @@ bool mpu6050_init() {
 }
 
 float mpu6050_readGyroZ() {
-  int16_t raw = mpu6050_readReg16(0x47);
+  static int imuFailCount = 0;
+  bool ok = true;
+  int16_t raw = mpu6050_readReg16(0x47, &ok);
+  
+  if (!ok) {
+      imuFailCount++;
+      if (imuFailCount > 20) {
+          Serial.println("[IMU] Too many I2C failures. Disabling MPU6050.");
+          imuAvailable = false;
+      }
+      return 0.0f;
+  } else {
+      imuFailCount = 0;
+  }
   return (raw / 131.0f) * (PI / 180.0f); // rad/s
 }
 
@@ -101,27 +128,47 @@ void mpu6050_calibrate(float rawZ) {
 // ============================================================
 //   INA3221 BARE-METAL FUNCTIONS
 // ============================================================
-int16_t ina3221_readReg(uint8_t reg) {
-  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) return 0; // Skip if I2C busy
+int16_t ina3221_readReg(uint8_t reg, bool* ok = nullptr) {
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+      if(ok) *ok = false;
+      return 0;
+  }
   Wire.beginTransmission(INA3221_ADDR);
   Wire.write(reg);
   uint8_t err = Wire.endTransmission();
   if (err != 0) {
+    Wire.end();
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);
+    Wire.setTimeout(10);
+#if defined(ESP32)
+    Wire.setTimeOut(10);
+#endif
     xSemaphoreGive(i2cMutex);
+    if(ok) *ok = false;
     return 0;
   }
-  Wire.requestFrom((uint8_t)INA3221_ADDR, (uint8_t)2);
-  if (Wire.available() < 2) {
+  uint8_t rcv = Wire.requestFrom((uint8_t)INA3221_ADDR, (uint8_t)2);
+  if (rcv < 2) {
+    Wire.end();
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(400000);
+    Wire.setTimeout(10);
+#if defined(ESP32)
+    Wire.setTimeOut(10);
+#endif
     xSemaphoreGive(i2cMutex);
+    if(ok) *ok = false;
     return 0;
   }
   int16_t res = (Wire.read() << 8) | Wire.read();
   xSemaphoreGive(i2cMutex);
+  if(ok) *ok = true;
   return res;
 }
 
 bool ina3221_init() {
-  xSemaphoreTake(i2cMutex, portMAX_DELAY);
+  if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
   Wire.beginTransmission(INA3221_ADDR);
   if (Wire.endTransmission() == 0) {
       Serial.println("[BOOT] INA3221 OK (0x40)");
@@ -136,9 +183,19 @@ bool ina3221_init() {
 
 void read_ina3221() {
   if (!inaAvailable) return;
+  static int inaFailCount = 0;
+  bool success = true;
+
   for (int ch = 1; ch <= 3; ch++) {
-    int16_t rawBus = ina3221_readReg(2 + (ch - 1) * 2);
-    int16_t rawShunt = ina3221_readReg(1 + (ch - 1) * 2);
+    bool ok1 = true, ok2 = true;
+    int16_t rawBus = ina3221_readReg(2 + (ch - 1) * 2, &ok1);
+    int16_t rawShunt = ina3221_readReg(1 + (ch - 1) * 2, &ok2);
+    
+    if (!ok1 || !ok2) {
+        success = false;
+        continue;
+    }
+
     // Shift right 3 bits, LSB = 8mV
     float voltage = (rawBus >> 3) * 0.008f;
     if (voltage > 1.0f) {
@@ -149,6 +206,16 @@ void read_ina3221() {
     // Shift right 3 bits, LSB = 40uV, Shunt = 0.1Ohm -> I(A) = Vshunt / 0.1 = Vshunt * 10
     // => Current = (raw >> 3) * 0.00004 * 10 = (raw >> 3) * 0.0004
     ina_currentA[ch - 1] = (rawShunt >> 3) * 0.0004f; 
+  }
+
+  if (success) {
+      inaFailCount = 0;
+  } else {
+      inaFailCount++;
+      if (inaFailCount > 20) {
+          Serial.println("[INA3221] Too many I2C failures. Disabling INA3221.");
+          inaAvailable = false;
+      }
   }
 
   // Debug INA3221 mỗi 5 giây
