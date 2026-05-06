@@ -124,7 +124,7 @@ function escalateRecovery(id, session, now, get, set) {
     // Stage 2: Clear costmap and replan
     nextMode = 'REPLAN';
     if (grid && typeof grid.clearCostmapAround === 'function') {
-      grid.clearCostmapAround(session.lastProgressPose?.x ?? 0, session.lastProgressPose?.y ?? 0, 2.0);
+      grid.clearCostmapAround(session.lastProgressPose?.x ?? 0, session.lastProgressPose?.y ?? 0, 0.8);
     }
   } else if (cycle === 2) {
     // Stage 3: Spin to scan surroundings
@@ -138,7 +138,7 @@ function escalateRecovery(id, session, now, get, set) {
     // Stage 5: Clear wider costmap and replan
     nextMode = 'REPLAN';
     if (grid && typeof grid.clearCostmapAround === 'function') {
-      const clearRadius = 3.0 + Math.floor(attempts / 5); // Expand radius each full cycle
+      const clearRadius = Math.min(1.5, 1.0 + Math.floor(attempts / 5) * 0.2); // Max 1.5m
       grid.clearCostmapAround(session.lastProgressPose?.x ?? 0, session.lastProgressPose?.y ?? 0, clearRadius);
     }
   }
@@ -444,10 +444,11 @@ const useNavStore = create((set, get) => ({
       nextSession.recoveryMode = 'REPLAN';
       nextSession.status = 'RECOVERY_REPLAN';
 
-      // Nav2-style: Clear costmap around robot before replanning
-      if (grid && typeof grid.clearCostmapAround === 'function') {
-        grid.clearCostmapAround(pose.x, pose.y, 2.0);
-        console.log(`[Recovery] Cleared costmap around robot (2m radius) before replan`);
+      // Nav2-style: Clear costmap only if we're deeply stuck (multiple attempts) to remove ghost obstacles.
+      // Reduced radius from 2.0m to 0.8m to prevent erasing real walls which causes an infinite replan loop.
+      if (grid && typeof grid.clearCostmapAround === 'function' && nextSession.recoveryAttempts > 1) {
+        grid.clearCostmapAround(pose.x, pose.y, 0.8);
+        console.log(`[Recovery] Cleared costmap around robot (0.8m radius) before replan`);
       }
 
       set((s) => ({
@@ -544,32 +545,54 @@ const useNavStore = create((set, get) => ({
         targetWp = remainingPath[remainingPath.length - 1];
       }
 
-      // ── NEXT WAYPOINT COLLISION CHECK ──
-      // Before driving toward a waypoint, verify the waypoint itself is safe.
-      // Only replan for INSCRIBED/LETHAL zones — NOT normal inflation gradient.
-      if (grid && grid.costmap) {
-        const wpG = grid.worldToGrid(targetWp.x, targetWp.y);
-        if (grid.inBounds(wpG.gx, wpG.gy)) {
-          const wpCost = grid.costmap[wpG.gy * grid.width + wpG.gx];
-          if (wpCost >= 200) {
-            // Waypoint is in inscribed/lethal zone — try skipping ahead first
-            const nextSafeIdx = nextSession.currentWaypointIndex + targetIdx + 1;
-            if (nextSafeIdx < nextSession.path.length - 1) {
-              // Skip this dangerous waypoint
-              nextSession.currentWaypointIndex = nextSafeIdx;
-              console.warn(`[AppNav] ⚠️ Skipping waypoint (cost=${wpCost}), advancing to WP #${nextSafeIdx}`);
-            } else {
-              // Near end of path, must replan
-              console.warn(`[AppNav] ⚠️ Target waypoint cost=${wpCost}, triggering replan`);
-              nextSession.recoveryMode = 'REPLAN';
-              nextSession.status = 'RECOVERY_REPLAN';
-              nextSession.lastProgressTime = now;
-              set((s) => ({
-                appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
-              }));
-              return buildAppNavOverlay(nextSession);
+      // ── LOOKAHEAD PATH COLLISION CHECK ──
+      // Scan the upcoming path (up to 2.5 meters ahead) to see if SLAM has newly discovered an obstacle.
+      // We sample along the path segments to catch obstacles intersecting long straight lines.
+      if (grid && grid.costmap && timeSinceLastReplan > replanCooldownMs) {
+        let pathDistChecked = 0;
+        let lastX = pose.x;
+        let lastY = pose.y;
+        let pathBlocked = false;
+        
+        for (let i = 0; i < remainingPath.length; i++) {
+          const wp = remainingPath[i];
+          const segDist = Math.hypot(wp.x - lastX, wp.y - lastY);
+          
+          // Sample along the segment every 0.1m
+          const steps = Math.max(1, Math.ceil(segDist / 0.1));
+          for (let s = 1; s <= steps; s++) {
+            const t = s / steps;
+            const cx = lastX + (wp.x - lastX) * t;
+            const cy = lastY + (wp.y - lastY) * t;
+            
+            const cg = grid.worldToGrid(cx, cy);
+            if (grid.inBounds(cg.gx, cg.gy)) {
+              // Only brake for INSCRIBED/LETHAL (cost >= 200).
+              const cost = grid.costmap[cg.gy * grid.width + cg.gx];
+              if (cost >= 200) { 
+                pathBlocked = true;
+                break;
+              }
             }
           }
+          
+          pathDistChecked += segDist;
+          lastX = wp.x;
+          lastY = wp.y;
+          
+          if (pathBlocked || pathDistChecked > 2.5) break;
+        }
+        
+        if (pathBlocked) {
+          console.warn(`[AppNav] ⚠️ Path blocked ahead (dist=${pathDistChecked.toFixed(2)}m), triggering early replan`);
+          nextSession.recoveryMode = 'REPLAN';
+          nextSession.status = 'RECOVERY_REPLAN';
+          nextSession.lastProgressTime = now;
+          nextSession._lastForwardBlockTime = now;
+          set((s) => ({
+            appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
+          }));
+          return buildAppNavOverlay(nextSession);
         }
       }
 

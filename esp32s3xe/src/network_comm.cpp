@@ -8,7 +8,8 @@
 #include <ArduinoOTA.h>
 #include <TelnetStream.h>
 #include <ArduinoJson.h>
-
+#include <WiFiMulti.h>
+#include <Preferences.h>
 #include "navigator.h"
 #include "odometry.h"
 #include "imu_sensor.h"
@@ -20,7 +21,7 @@
 extern WebServer server;
 extern WebSocketsServer webSocket;
 extern WiFiManager wm;
-
+WiFiMulti wifiMulti;
 extern Navigator navigator;
 extern OccupancyGridMapper gridMapper;
 extern AStarPathfinder astar;
@@ -167,13 +168,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     Serial.printf("[CMD] Odometry reset to (%.2f, %.2f, %.2f).\n", resetX, resetY, resetTheta);
   }
 
-  if (doc["cmd"] == "set_pose") {
-    if (!doc["x"].isNull()) robotX = doc["x"];
-    if (!doc["y"].isNull()) robotY = doc["y"];
-    if (!doc["theta"].isNull()) robotTheta = doc["theta"];
-    gyroTheta = encoderTheta = fusedTheta = robotTheta;
-  }
-
   if (doc["cmd"] == "hitl_mode") {
     hitlMode = doc["enable"] | false;
     Serial.printf("[HITL] Mode set to: %d\n", hitlMode);
@@ -187,6 +181,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 
   if (doc["cmd"] == "hitl_sensor") {
     if (hitlMode) {
+#if !SIMULATION_MODE
       if (!doc["x"].isNull()) robotX = doc["x"];
       if (!doc["y"].isNull()) robotY = doc["y"];
       if (!doc["theta"].isNull()) robotTheta = doc["theta"];
@@ -197,7 +192,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       obstacleDetected = false;
       
       if (streamOccupancyGrid) {
-        gridMapper.update_pose(robotX, robotY, robotTheta);
+        gridMapper.update_pose(mapX, mapY, mapTheta);
       }
 
       for (JsonVariant v : lidarArr) {
@@ -219,6 +214,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
       if (streamOccupancyGrid) {
         gridMapper.update_grid();
       }
+#endif
     }
   }
 
@@ -412,15 +408,96 @@ void init_network() {
   WiFi.mode(WIFI_STA);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setTxPower(WIFI_POWER_15dBm);
-  wm.setConnectTimeout(15);
-  wm.setConfigPortalTimeout(120);
   
-  Serial.println("[BOOT] Chay WiFiManager autoConnect...");
-  if (!wm.autoConnect(WIFI_AP_NAME)) {
-    Serial.println("[WIFI] Ket noi that bai hoac Timeout Portal!");
+  // ── 1. Đọc các mạng đã lưu từ Preferences ──
+  Preferences prefs;
+  prefs.begin("wifi_cfg", false);
+  int count = prefs.getInt("count", 0);
+  
+  Serial.printf("[WIFI] Tim thay %d mang da luu.\n", count);
+  for (int i = 0; i < count; i++) {
+    String ssid = prefs.getString(("ssid" + String(i)).c_str(), "");
+    String pass = prefs.getString(("pass" + String(i)).c_str(), "");
+    if (ssid.length() > 0) {
+      wifiMulti.addAP(ssid.c_str(), pass.c_str());
+      Serial.printf("   - Da them vao WiFiMulti: %s\n", ssid.c_str());
+    }
   }
-  Serial.printf("[BOOT] WiFi autoConnect xong, vong lap Loop bat dau! IP: %s\n", WiFi.localIP().toString().c_str());
+  
+  // Thêm mạng hiện tại đang lưu bởi SDK (nếu có)
+  String nativeSsid = WiFi.SSID();
+  String nativePass = WiFi.psk();
+  if (nativeSsid.length() > 0) {
+    wifiMulti.addAP(nativeSsid.c_str(), nativePass.c_str());
+    Serial.printf("   - NDK Native: %s\n", nativeSsid.c_str());
+  }
+
+  // ── 2. Thử kết nối bằng WiFiMulti trước ──
+  Serial.println("[BOOT] Dang thu ket noi cac mang WiFi da luu...");
+  bool connected = false;
+  unsigned long startT = millis();
+  while (millis() - startT < 15000) { // Thử tối đa 15 giây
+    if (wifiMulti.run() == WL_CONNECTED) {
+      connected = true;
+      break;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  // ── 3. Nếu thất bại, mở portal WiFiManager ──
+  if (!connected) {
+    Serial.println("[BOOT] Khong the ket noi mang da luu. Bat WiFiManager autoConnect...");
+    
+    // Ngắt WiFiMulti scan để trả lại trạng thái sạch cho WiFiManager
+    WiFi.disconnect(true, true);
+    delay(500);
+    
+    wm.setConnectTimeout(15);
+    wm.setConfigPortalTimeout(120); // Portal chờ 2 phút
+    
+    if (!wm.autoConnect(WIFI_AP_NAME)) {
+      Serial.println("[WIFI] Timeout Portal, khoi dong lai!");
+      delay(3000);
+      ESP.restart();
+    }
+    
+    // Nếu vào đây nghĩa là autoConnect thành công (người dùng vừa nhập mạng mới hoặc dùng native SDK)
+    String newSsid = WiFi.SSID();
+    String newPass = WiFi.psk();
+    if (newSsid.length() > 0) {
+      Serial.printf("[WIFI] Ket noi thanh cong: %s, luu vao Preferences neu la mang moi...\n", newSsid.c_str());
+      
+      // Kiểm tra trùng lặp trước khi lưu
+      bool exists = false;
+      for (int i = 0; i < count; i++) {
+        if (prefs.getString(("ssid" + String(i)).c_str(), "") == newSsid) {
+          exists = true;
+          prefs.putString(("pass" + String(i)).c_str(), newPass); // Update pass
+          break;
+        }
+      }
+      
+      // Nếu chưa có và còn chỗ, thêm mới
+      if (!exists && count < 10) { // Tối đa lưu 10 mạng
+        prefs.putString(("ssid" + String(count)).c_str(), newSsid);
+        prefs.putString(("pass" + String(count)).c_str(), newPass);
+        prefs.putInt("count", count + 1);
+        Serial.printf("[WIFI] Da luu mang thu %d.\n", count + 1);
+      }
+      
+      wifiMulti.addAP(newSsid.c_str(), newPass.c_str());
+    }
+  } else {
+    Serial.println("[BOOT] WiFiMulti ket noi thanh cong!");
+  }
+  
+  prefs.end();
+  
+  Serial.printf("[BOOT] WiFi san sang! IP: %s\n", WiFi.localIP().toString().c_str());
   WiFi.setSleep(false);
+  // Bật AutoReconnect của native SDK để nó tự lo vụ rớt mạng ngầm mà không làm treo mạch
   WiFi.setAutoReconnect(true);
 
   ArduinoOTA.setHostname("AMR2_S3");
@@ -449,8 +526,9 @@ void update_network() {
   static unsigned long lastWifiCheck = 0;
   if (WiFi.status() != WL_CONNECTED && millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
-    Serial.println("[WIFI] Mat ket noi! Dang thu reconnect...");
-    WiFi.reconnect();
+    Serial.println("[WIFI] Mat ket noi! Native SDK dang thu reconnect ngam...");
+    // Khong goi wifiMulti.run() o day vi no se lam treo vong lap (WDT reset)
+    // WiFi.reconnect() da duoc SDK xu ly tu dong nho setAutoReconnect(true)
   }
 }
 

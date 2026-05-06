@@ -211,6 +211,15 @@ const useMapStore = create((set, get) => ({
     const isMapping = state.mappingActive[id];
     const isLocalizing = state.localizationActive?.[id];
 
+    // Detect HITL mode — sim engine provides ground-truth pose,
+    // so scan matching (ICP/CSM) and TF correction must be DISABLED
+    // to prevent a "ghost" duplicate map from appearing at an offset.
+    const robotStore = getRobotStore();
+    const robot = robotStore.robots?.[id];
+    const isHitl = robot?.connection?.hitlEnabled || telem.hitl;
+
+    const isSim = robot?._sim;
+
     // Allow passive mapping if grid exists, even if mappingActive is false.
     // This allows A* and DWA to use the obstacle map during manual driving.
     if (state.mapperInstances[id]) {
@@ -222,11 +231,22 @@ const useMapStore = create((set, get) => ({
         const odomY = telem.y ?? 0;
         const odomTheta = headingDeg * Math.PI / 180;
 
-        const tf = state.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
-        let mapX = odomX + tf.dx;
-        let mapY = odomY + tf.dy;
-        let mapTheta = odomTheta + tf.dTheta;
-        if (simNavWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
+        let mapX, mapY, mapTheta;
+        if (isHitl || isSim) {
+          // HITL & SIM: telem pose IS ground-truth.
+          // No TF correction — applying it would create a duplicate map at an offset.
+          mapX = odomX;
+          mapY = odomY;
+          mapTheta = odomTheta;
+        } else {
+          const tf = state.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
+          mapX = odomX + tf.dx;
+          mapY = odomY + tf.dy;
+          mapTheta = odomTheta + tf.dTheta;
+        }
+
+        // Scan matching: SKIP in HITL/SIM mode (sim pose is already ground truth)
+        if (!(isHitl || isSim) && simNavWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
           set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
 
           simNavWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {

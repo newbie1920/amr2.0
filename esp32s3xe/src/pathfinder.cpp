@@ -86,7 +86,7 @@ uint8_t AStarPathfinder::getCombinedCost(int gx, int gy) const {
     if (slamMap) {
         int max_logodds = -100;
         int center_logodds = -100;
-        int check_radius = 2; // 2 cells = 0.2m inflation radius (Giảm từ 3 xuống 2 để bớt lạm phát tường)
+        int check_radius = 3; // 3 cells = 0.3m inflation radius (sync with DWA INFLATE_CELLS=4)
         
         if (gx >= 0 && gx < GRID_SIZE && gy >= 0 && gy < GRID_SIZE) {
             center_logodds = slamMap->grid[gy][gx];

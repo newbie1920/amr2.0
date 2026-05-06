@@ -187,15 +187,15 @@ public:
   // ============================================================
 
   /** World → Grid X (chuẩn, dùng origin offset) */
-  int world_to_grid_x(float x) const {
-    return (int)floorf((x - originX) / GRID_RESOLUTION);
+  int world_to_grid_x(float wx) const {
+    return (int)floorf((wx - originX) / GRID_RESOLUTION);
   }
   
-  /** World → Grid Y (chuẩn, dùng origin offset) */
-  int world_to_grid_y(float y) const {
-    return (int)floorf((y - originY) / GRID_RESOLUTION);
+  /** World → Grid Y */
+  int world_to_grid_y(float wy) const {
+    return (int)floorf((wy - originY) / GRID_RESOLUTION);
   }
-  
+
   /** Grid → World X (center of cell) */
   float grid_to_world_x(int gx) const {
     return originX + (gx + 0.5f) * GRID_RESOLUTION;

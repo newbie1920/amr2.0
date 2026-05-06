@@ -4,7 +4,7 @@
 			"path": ".."
 		},
 		{
-			"name": "esp32",
+			"name": "esp32s3xe",
 			"path": "."
 		}
 	],

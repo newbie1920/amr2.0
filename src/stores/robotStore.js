@@ -564,24 +564,24 @@ const useRobotStore = create((set, get) => ({
 
     // AUTO-CREATE MAP: Initialize OccupancyGrid immediately so navigation
     // always has a grid available for pathfinding and DWA obstacle avoidance.
-    // Without this, navigateToGoal falls back to straight-line waypoints.
-    // NOTE: We don't call startMapping() because that also starts auto-exploration
-    // which would conflict with user's manual navigation. We only create the grid
-    // and let processLidarTick populate it passively.
-    try {
-      const mapState = useMapStore.getState();
-      const grid = new OccupancyGrid(200, 200, 0.1, spawnX, spawnY);
-      mapState.updateOccupancyGrid(id, grid);
-      // Set mapperInstances directly via setState (DO NOT set mappingActive to true,
-      // otherwise the SLAM UI button turns RED and triggers auto-exploration bugs)
-      useMapStore.setState((s) => ({
-        mapperInstances: { ...s.mapperInstances, [id]: grid },
-        occupancyGrid: { ...s.occupancyGrid, [id]: grid },
-        mapToOdom: { ...s.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } },
-      }));
-      console.log(`[GazeboTDTU] 🗺️ Auto-created map for SimBot "${name}" — passive mapping enabled`);
-    } catch (e) {
-      console.warn('[GazeboTDTU] Failed to auto-create map:', e);
+    // If we already loaded a map (from sim segments or saved map), DO NOT overwrite it.
+    if (!mapLoaded && !useMapStore.getState().occupancyGrid[id]) {
+      try {
+        const mapState = useMapStore.getState();
+        const grid = new OccupancyGrid(200, 200, 0.1, spawnX, spawnY);
+        mapState.updateOccupancyGrid(id, grid);
+        // Set mapperInstances directly via setState
+        useMapStore.setState((s) => ({
+          mapperInstances: { ...s.mapperInstances, [id]: grid },
+          occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+          mapToOdom: { ...s.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } },
+        }));
+        console.log(`[GazeboTDTU] 🗺️ Auto-created map for SimBot "${name}" — passive mapping enabled`);
+      } catch (e) {
+        console.warn('[GazeboTDTU] Failed to auto-create map:', e);
+      }
+    } else {
+      console.log(`[GazeboTDTU] 🗺️ Using pre-generated or loaded map for SimBot "${name}"`);
     }
 
     console.log(`[GazeboTDTU] 🤖 SimBot "${name}" spawned at (${spawnX}, ${spawnY}) — Physics running at 50Hz`);

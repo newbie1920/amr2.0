@@ -28,8 +28,8 @@ float vL_meas = 0;
 float vR_meas = 0;
 
 // Pose (odometry frame — pure encoder + IMU)
-float robotX = 2.5;
-float robotY = 9.0;
+float robotX = 5.0;
+float robotY = 5.0;
 float robotTheta = -PI/2;
 float robotDistance = 0;
 float encoderTheta = 0;
@@ -37,8 +37,8 @@ float gyroTheta = 0;
 float fusedTheta = 0;
 
 // Map-frame pose (computed from odom + TF)
-float mapX = 2.5;
-float mapY = 9.0;
+float mapX = 5.0;
+float mapY = 5.0;
 float mapTheta = -PI/2;
 
 // TF map→odom transform (accumulated scan matching corrections)
@@ -54,11 +54,36 @@ float filteredVBatt = 12.0f;
  * Call this after odometry update or after TF update.
  */
 void applyTf() {
-    // 2D rigid transform composition:
-    // map = odom + tf (simplified — for small tf offsets, direct addition is fine)
-    mapX     = robotX + tfDx;
-    mapY     = robotY + tfDy;
+    // Proper 2D rigid-body transform: map = Rot(tfDTheta) * odom + (tfDx, tfDy)
+    float cosT = cosf(tfDTheta);
+    float sinT = sinf(tfDTheta);
+    mapX     = cosT * robotX - sinT * robotY + tfDx;
+    mapY     = sinT * robotX + cosT * robotY + tfDy;
     mapTheta = atan2f(sinf(robotTheta + tfDTheta), cosf(robotTheta + tfDTheta));
+}
+
+/**
+ * Update the TF transform given a map-frame correction (e.g. from CSM).
+ * Applies correction to map pose and back-solves for the required tf params.
+ */
+void updateTf(float dx, float dy, float dtheta, float weight) {
+    // 1. Calculate target map pose
+    float targetMapX = mapX + weight * dx;
+    float targetMapY = mapY + weight * dy;
+    float targetMapTheta = mapTheta + weight * dtheta;
+
+    // 2. Compute new TF rotation
+    tfDTheta = targetMapTheta - robotTheta;
+    tfDTheta = atan2f(sinf(tfDTheta), cosf(tfDTheta)); // Normalize
+
+    // 3. Compute new TF translation
+    float cosT = cosf(tfDTheta);
+    float sinT = sinf(tfDTheta);
+    tfDx = targetMapX - (cosT * robotX - sinT * robotY);
+    tfDy = targetMapY - (sinT * robotX + cosT * robotY);
+
+    // 4. Update map pose with new TF
+    applyTf();
 }
 
 // ============================================================

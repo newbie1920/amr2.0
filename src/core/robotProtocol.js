@@ -608,6 +608,15 @@ export class RobotConnection {
       // Override lidar with virtual lidar for UI
       if (this.hitlEngine.telemetry && this.hitlEngine.telemetry.lidar) {
          this.telemetry.lidar = this.hitlEngine.telemetry.lidar;
+         
+         // Fix Costmap Flickering: 
+         // Force UI telemetry pose to perfectly match the hitlEngine pose used to generate the lidar rays.
+         // Otherwise, the slight integration drift between ESP32 odom and UI odom causes lidar rays to erase static walls.
+         const simPose = this.hitlEngine.getPose();
+         this.telemetry.x = simPose.x;
+         this.telemetry.y = simPose.y;
+         this.telemetry.headingRad = simPose.theta;
+         this.telemetry.heading = simPose.theta * 180 / Math.PI;
       }
     }
 

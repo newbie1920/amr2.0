@@ -58,5 +58,6 @@ void init_encoders();
 void init_motors();
 void setMotor(int pinIN1, int pinIN2, int pwmCh, float u);
 void applyTf();  // Compute mapPose = odomPose ⊕ tfMapOdom
+void updateTf(float dx, float dy, float dtheta, float weight);
 
 #endif // ODOMETRY_H

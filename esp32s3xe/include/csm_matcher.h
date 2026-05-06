@@ -241,7 +241,7 @@ private:
 
         // BFS queue — capped to save RAM. With maxDist=5, typical environments
         // produce <5000 BFS entries. Cap at 4096 pairs = 8KB.
-        static const int BFS_MAX = 4096;
+        static const int BFS_MAX = 8192;
         static int16_t bfsQx[BFS_MAX];
         static int16_t bfsQy[BFS_MAX];
         static uint8_t bfsDist[BFS_MAX]; // distance of each entry

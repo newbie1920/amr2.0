@@ -626,8 +626,8 @@ export function drawFrontiers(ctx, w, h, viewport, frontierCells, grid) {
   ctx.fillStyle = COLORS.frontier;
 
   for (const f of frontierCells) {
-    const worldX = grid.originX + (f.gx + 0.5) * grid.resolution;
-    const worldY = grid.originY + (f.gy + 0.5) * grid.resolution;
+    const worldX = grid.originX + f.gx * grid.resolution;
+    const worldY = grid.originY + f.gy * grid.resolution;
     const s = worldToScreen(worldX, worldY);
     ctx.fillRect(s.x - dotSize / 2, s.y - dotSize / 2, dotSize, dotSize);
   }
@@ -714,7 +714,7 @@ const _NAV2_COSTMAP_LUT = (() => {
 })();
 
 // Cache key for offscreen canvas
-let _costmapCache = { scanCount: -1, width: 0, height: 0, canvas: null, lastRenderTime: 0, lastUpdate: 0 };
+let _costmapCache = { costmapVersion: -1, width: 0, height: 0, canvas: null, lastRenderTime: 0 };
 
 function _renderCostmapCanvas(grid) {
   const w = grid.width;
@@ -756,24 +756,20 @@ export function drawCostmapNav2(ctx, w, h, viewport, grid) {
   if (cellPx < 0.5) return; // Too zoomed out
 
   // Cache: re-render offscreen canvas when grid data changes
-  // Invalidate on: scanCount change, grid resize, grid._dirty flag,
-  // or grid.lastUpdate timestamp change (catches inflateObstacles/load)
-  const sc = grid.scanCount || 0;
-  const lu = grid.lastUpdate || 0;
+  // Invalidate on: costmapVersion change or grid resize
+  const cv = grid.costmapVersion || 0;
   const now = Date.now();
   const needsRedraw =
-    _costmapCache.scanCount !== sc ||
+    _costmapCache.costmapVersion !== cv ||
     _costmapCache.width !== grid.width ||
     _costmapCache.height !== grid.height ||
-    _costmapCache.lastUpdate !== lu ||
     (grid._dirty && now - _costmapCache.lastRenderTime > 400);
 
   if (needsRedraw) {
     _costmapCache.canvas = _renderCostmapCanvas(grid);
-    _costmapCache.scanCount = sc;
+    _costmapCache.costmapVersion = cv;
     _costmapCache.width = grid.width;
     _costmapCache.height = grid.height;
-    _costmapCache.lastUpdate = lu;
     _costmapCache.lastRenderTime = now;
   }
 

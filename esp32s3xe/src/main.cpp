@@ -23,6 +23,7 @@
 #include "icp_matcher.h"
 #include "frontier_explorer.h"
 #include "slam_diagnostics.h"
+#include "sim_task.h"
 
 // Included Modules
 #include "imu_sensor.h"
@@ -81,7 +82,7 @@ const char* architectureProfile = "hybrid";
 // ── CSM (Correlative Scan Matching) ──────────────────────────
 #include "csm_matcher.h"
 CsmMatcher csmMatcher;
-static bool csmInitialized = false;
+bool csmInitialized = false;
 // CSM activates after ICP has built enough grid data (scanCount > CSM_MIN_SCANS)
 static const int CSM_MIN_SCANS = 10;
 
@@ -288,13 +289,19 @@ void controlTask(void *pvParameters) {
       // Recompute map-frame pose after every odom update
       applyTf();
     } else {
-      // ── HITL MODE: Simulated odometry ─────────────────────
-      // Perfect motors: measured = target (no PID error)
+      // ── HITL MODE: SimTask handles pose (robotX/Y/Theta) ────
+      // We only set measured velocities for PID feedback + DWA
       vL_meas = targetLeftVel;
       vR_meas = targetRightVel;
 
-      // Compute kinematics exactly like real mode — without this,
-      // robotX/Y never change and Navigator thinks robot is stuck!
+#if SIMULATION_MODE
+      // SimTask is the sole writer of robotX/Y/Theta (with physics + collision).
+      // Do NOT compute kinematics here — it would race with simTask.
+      // Just sync encoder/gyro/fused to match simTask's injected theta.
+      encoderTheta = gyroTheta = fusedTheta = robotTheta;
+      applyTf();
+#else
+      // Legacy HITL mode (Web-based sim): controlTask computes perfect odom
       float v_sim = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
       float w_sim = (vR_meas - vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
 
@@ -306,11 +313,9 @@ void controlTask(void *pvParameters) {
       robotX += dist_sim * cosf(robotTheta);
       robotY += dist_sim * sinf(robotTheta);
 
-      // Keep encoder/gyro/fused in sync (no drift in simulation)
       encoderTheta = gyroTheta = fusedTheta = robotTheta;
-
-      // Recompute map-frame pose
       applyTf();
+#endif
     }
 
     float v_robot = (vR_meas + vL_meas) / 2.0f * WHEEL_RADIUS;
@@ -346,6 +351,8 @@ void controlTask(void *pvParameters) {
           lastDwaRunMs = millis();
           float curV = v_robot;
           float curW = w_fused;
+          // BUG #4 FIX: Pre-compute costmap ONCE before DWA sampling (~5ms vs ~180ms)
+          dwaPlanner.buildCostmap(gridMapper);
           DwaResult dwaResult = dwaPlanner.computeVelocity(
             mapX, mapY, mapTheta, curV, curW,
             navigator.waypoints + navigator.currentWpIdx,
@@ -500,6 +507,12 @@ void lidarTask(void *pvParameters) {
         float odomDy = robotY - prevOdomY;
         float odomDTheta = robotTheta - prevOdomTheta;
         
+        // Transform global displacement to prevOdom's local frame for ICP init guess
+        float cosPrev = cosf(prevOdomTheta);
+        float sinPrev = sinf(prevOdomTheta);
+        float localOdomDx = odomDx * cosPrev + odomDy * sinPrev;
+        float localOdomDy = -odomDx * sinPrev + odomDy * cosPrev;
+
         // Update grid using MAP-FRAME pose (odom + TF correction)
         applyTf();
         gridMapper.update_pose(mapX, mapY, mapTheta);
@@ -514,7 +527,7 @@ void lidarTask(void *pvParameters) {
             (fabsf(targetLeftVel) > 0.01f || fabsf(targetRightVel) > 0.01f)) {
 
             // Use odometry delta as initial guess (helps ICP converge faster)
-            IcpMatcher::Pose2D initGuess = {odomDx, odomDy, odomDTheta};
+            IcpMatcher::Pose2D initGuess = {localOdomDx, localOdomDy, odomDTheta};
             IcpMatcher::Pose2D correction;
 
             if (icpMatcher.match(
@@ -522,21 +535,26 @@ void lidarTask(void *pvParameters) {
                     icpCurrentScan, icpCurrentLen,
                     initGuess, correction)) {
 
-                // Clamp correction — tránh jump lớn do nhiễu
-                correction.x     = constrain(correction.x,     -0.05f, 0.05f);
-                correction.y     = constrain(correction.y,     -0.05f, 0.05f);
-                correction.theta = constrain(correction.theta, -0.08f, 0.08f);
+                // Calculate ICP error in local frame (Difference between matched and odom)
+                float errLocalX = correction.x - localOdomDx;
+                float errLocalY = correction.y - localOdomDy;
+                float errTheta  = correction.theta - odomDTheta;
+
+                // Clamp error — tránh jump lớn do nhiễu
+                errLocalX = constrain(errLocalX, -0.05f, 0.05f);
+                errLocalY = constrain(errLocalY, -0.05f, 0.05f);
+                errTheta  = constrain(errTheta,  -0.08f, 0.08f);
+
+                // Transform error to global map frame
+                float prevMapTheta = prevOdomTheta + tfDTheta;
+                float cosMap = cosf(prevMapTheta);
+                float sinMap = sinf(prevMapTheta);
+                float errMapX = errLocalX * cosMap - errLocalY * sinMap;
+                float errMapY = errLocalX * sinMap + errLocalY * cosMap;
 
                 // SLAM v2: Update TF map→odom transform (NOT raw odometry!)
-                // This keeps robotX/Y/Theta as pure odom values
                 const float ICP_WEIGHT = 0.4f;
-                tfDx     += ICP_WEIGHT * correction.x;
-                tfDy     += ICP_WEIGHT * correction.y;
-                tfDTheta += ICP_WEIGHT * correction.theta;
-                tfDTheta  = atan2f(sinf(tfDTheta), cosf(tfDTheta));
-
-                // Recompute map pose with updated TF
-                applyTf();
+                updateTf(errMapX, errMapY, errTheta, ICP_WEIGHT);
 
                 // Log RMS chất lượng
                 icpRmsLast = icpMatcher.computeRMS(
@@ -583,13 +601,9 @@ void lidarTask(void *pvParameters) {
                     icpCurrentScan, icpCurrentLen,
                     csmResult)) {
                 
-                // CSM correction → accumulate into TF (same as ICP)
+                // CSM correction → accumulate into TF
                 const float CSM_WEIGHT = 0.3f;  // Slightly lower than ICP to avoid overcorrection
-                tfDx     += CSM_WEIGHT * csmResult.dx;
-                tfDy     += CSM_WEIGHT * csmResult.dy;
-                tfDTheta += CSM_WEIGHT * csmResult.dTheta;
-                tfDTheta  = atan2f(sinf(tfDTheta), cosf(tfDTheta));
-                applyTf();
+                updateTf(csmResult.dx, csmResult.dy, csmResult.dTheta, CSM_WEIGHT);
 
                 static unsigned long lastCsmLog = 0;
                 if (millis() - lastCsmLog > 3000) {
@@ -693,6 +707,13 @@ void setup() {
   astar.init(GRID_SIZE, GRID_SIZE, GRID_RESOLUTION);
   astar.setSlamMap(&gridMapper);
   
+#if SIMULATION_MODE
+  // Force HITL mode ON so controlTask skips encoder/IMU/motor
+  hitlMode = true;
+  streamOccupancyGrid = true;
+  Serial.println("[SIM] SIMULATION_MODE active — hitlMode forced ON");
+#endif
+
   // Center SLAM grid on robot's spawn position
   gridMapper.centerOnPosition(robotX, robotY);
   applyTf(); // Initialize map pose = odom pose (tfDx/Dy/DTheta = 0)
@@ -828,8 +849,15 @@ void setup() {
 
   xTaskCreatePinnedToCore(pathfinderTask, "PathfinderTask", 16384, NULL, 5,  NULL, 0);
   xTaskCreatePinnedToCore(controlTask,    "ControlTask",    8192,  NULL, 10, NULL, 1);
-  xTaskCreatePinnedToCore(lidarTask,      "LidarTask",      16384, NULL, 1,  NULL, 0);
   xTaskCreatePinnedToCore(explorationTask, "ExploreTask",   16384, NULL, 2,  NULL, 0);
+
+#if SIMULATION_MODE
+  // SimTask replaces LidarTask — injects virtual lidar & pose data
+  initSimTask();
+  Serial.println("[SIM] SimTask launched (replaces LidarTask)");
+#else
+  xTaskCreatePinnedToCore(lidarTask,      "LidarTask",      16384, NULL, 1,  NULL, 0);
+#endif
 
 
   Serial.println("================================================");

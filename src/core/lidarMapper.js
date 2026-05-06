@@ -82,6 +82,7 @@ export class OccupancyGrid {
 
     // Statistics
     this.scanCount = 0;
+    this.costmapVersion = 0; // Increments only when costmap is regenerated (inflation/expansion)
     this.lastUpdate = Date.now();
     this._dirty = false;
 
@@ -227,6 +228,7 @@ export class OccupancyGrid {
     this.costmap.fill(0);
 
     this._syncDataFromLogOdds();
+    this.costmapVersion++; // Force UI redraw for the new expanded costmap
     console.log(`[Grid] Auto-expanded to ${newW}×${newH} (${this.worldWidth.toFixed(0)}×${this.worldHeight.toFixed(0)}m)`);
   }
 
@@ -375,6 +377,9 @@ export class OccupancyGrid {
         }
       }
     }
+    
+    // Bump version to notify UI layer that costmap data has changed
+    this.costmapVersion++;
   }
 
   /**
@@ -597,6 +602,7 @@ export class OccupancyGrid {
       originX: this.originX,
       originY: this.originY,
       scanCount: this.scanCount,
+      costmapVersion: this.costmapVersion,
       robotX: this.robotX,
       robotY: this.robotY,
       robotHeading: this.robotHeading,
@@ -619,6 +625,7 @@ export class OccupancyGrid {
     }
 
     grid.scanCount = json.scanCount || 0;
+    grid.costmapVersion = json.costmapVersion || 0;
     grid.robotX = json.robotX || 0;
     grid.robotY = json.robotY || 0;
     grid.robotHeading = json.robotHeading || 0;
