@@ -1,21 +1,24 @@
 /**
- * AMR 2.0 — Autonomous Exploration v8 (Greedy Nearest-First Frontier Vacuum)
+ * AMR 2.0 — Autonomous Exploration v9 (Cost-Utility Frontier + Predicted Info Gain)
  *
- * Thuật toán:
+ * Thuật toán (lấy cảm hứng từ explore_lite ROS2, DARPA SubT CMU Team Explorer):
  *   1. LiDAR quét vòng tròn → lưu vào OccupancyGrid (FREE/OCCUPIED/UNKNOWN)
  *   2. Tìm "frontier" = ô FREE nằm cạnh ô UNKNOWN
- *   3. Chọn frontier GẦN NHẤT mà clearance >= ngưỡng an toàn (greedy nearest-first)
- *      → Quét hết vùng gần trước khi đi xa → coverage rate tăng 2-3x
- *   4. Gửi điểm đó làm GOAL cho hệ thống nav (navigateToGoal)
- *   5. Nav system tự A* + Pure Pursuit + DWA + Recovery → robot đi đến đó
- *   6. Khi đến nơi (nav DONE) → quay lại bước 2, chọn frontier mới
+ *   3. Với mỗi frontier, tính:
+ *      - TravelCost: khoảng cách (grid cells) từ robot → approach point
+ *      - InfoGain: giả lập LiDAR raycasting từ approach point → đếm unknown sẽ thấy
+ *      - ClusterSize: frontier lớn = vùng mới rộng
+ *   4. Score = InfoGain × λ₁ − TravelCost × λ₂ + ClusterSize × λ₃
+ *      → Cân bằng: đi gần khi gain tương đương, đi xa khi gain áp đảo
+ *   5. Waypoint chaining: queue sẵn 2 goals, skip re-plan khi goal tiếp đã sẵn
+ *   6. Nav system A* + Pure Pursuit + DWA + Recovery → robot đi đến đó
  *   7. Hết frontier → hoàn thành ✅
  *
- * v8 improvements vs v7:
- *   - Greedy nearest-first: luôn chọn frontier gần nhất đủ an toàn
- *   - 2.5x faster tick/nav check: giảm dead-time giữa goals
- *   - Lightweight approach scoring: dùng costmap cost thay vì 8-dir raycast
- *   - Info gain tiebreaker: khi 2 frontier cùng khoảng cách → chọn cái gain cao
+ * v9 improvements vs v8:
+ *   - Cost-Utility scoring thay vì greedy nearest (cân bằng gain vs distance)
+ *   - Predicted info gain qua LiDAR raycasting (36 rays, chính xác hơn countUnknown)
+ *   - Waypoint queue: chain 2 goals → giảm dead time giữa goals
+ *   - Adaptive lambda: ưu tiên gần khi map nhỏ, ưu tiên gain khi map lớn
  */
 
 // No direct worker imports needed — v7 delegates to navStore.navigateToGoal()
@@ -42,16 +45,24 @@ function _getNavStore() {
   return _navStoreRef?.getState?.() || null;
 }
 
-// ── CONFIG (v8: tuned for speed) ──
-const TICK_MS         = 200;    // Check every 200ms (2.5x faster reaction vs v7)
+// ── CONFIG (v9: Cost-Utility tuned) ──
+const TICK_MS         = 200;    // Check every 200ms
 const MIN_FRONTIER    = 3;      // Min cells for a valid frontier cluster
-const MAX_NO_FRONT    = 12;     // Ticks without frontier before declaring map complete (more patient at fast tick)
+const MAX_NO_FRONT    = 12;     // Ticks without frontier before declaring map complete
 const CLEARANCE_SCAN_R = 6;     // Cells radius to measure clearance
-const APPROACH_SEARCH_R = 15;   // Search radius to find goal point (1.5m — tighter, faster)
-const NAV_CHECK_MS    = 300;    // How often to check nav status (2.6x faster)
-const NAV_TIMEOUT_MS  = 45000;  // Max time for one goal before giving up (faster giveup)
-const NAV_RECOVERY_MAX = 20000; // If stuck in RECOVERY modes > 20s, give up this goal (faster retry)
-const MIN_CLEARANCE_CELLS = 2;  // Minimum clearance (cells) to accept a frontier approach point
+const APPROACH_SEARCH_R = 15;   // Search radius to find goal point (1.5m)
+const NAV_CHECK_MS    = 300;    // How often to check nav status
+const NAV_TIMEOUT_MS  = 45000;  // Max time for one goal before giving up
+const NAV_RECOVERY_MAX = 20000; // If stuck in RECOVERY modes > 20s, give up
+const MIN_CLEARANCE_CELLS = 2;  // Minimum clearance to accept approach point
+
+// Cost-Utility weights (explore_lite inspired)
+const LAMBDA_GAIN    = 2.0;     // Weight for info gain
+const LAMBDA_DIST    = 1.0;     // Weight for travel cost
+const LAMBDA_SIZE    = 0.3;     // Weight for cluster size
+const LAMBDA_CLEAR   = 0.5;     // Weight for clearance bonus
+const INFO_GAIN_RAYS = 36;      // Number of rays for predicted info gain (every 10°)
+const INFO_GAIN_RANGE = 30;     // Max ray length in cells (= 3m at 0.1m resolution)
 
 // ── STATE ──
 let active = false;
@@ -68,6 +79,9 @@ let waitingForNav = false;
 let navStartTime = 0;         // When we started navigating to current goal
 let navRecoveryStart = 0;     // When recovery mode started
 
+// Waypoint queue: chain multiple goals to reduce dead time
+let waypointQueue = [];         // Array of { goalX, goalY, centroidGX, centroidGY, approachGX, approachGY }
+
 // Blacklist: failed frontier locations
 const blacklist = new Map();
 
@@ -81,11 +95,11 @@ export function startExploration(robotId, getStore) {
   active = true; _robotId = robotId; _getStore = getStore;
   noFrontierCount = 0; allClusters = [];
   currentGoalWorld = null; currentGoalGrid = null; currentGoalApproachGrid = null;
-  waitingForNav = false;
+  waitingForNav = false; waypointQueue = [];
   lastNavCheck = 0; navStartTime = 0; navRecoveryStart = 0;
   blacklist.clear();
   phase = 'selecting';
-  console.log('[Explore v7] 🚀 Started — Goal-based frontier vacuum');
+  console.log('[Explore v9] 🚀 Started — Cost-Utility Frontier with Predicted Info Gain');
   // First tick immediately, then periodic
   _tick();
   timer = setInterval(() => _tick(), TICK_MS);
@@ -101,7 +115,7 @@ export function stopExploration(robotId, getStore) {
       _navStoreRef.getState().navStopRobot(robotId || _robotId);
     }
   } catch(e) {}
-  console.log('[Explore v7] ⏹ Stopped');
+  console.log('[Explore v9] ⏹ Stopped');
 }
 
 export function isExplorationActive() { return active; }
@@ -149,7 +163,7 @@ function _tick() {
 
     // ── Case 1: Nav finished successfully (DONE or session ended) ──
     if (!session?.active) {
-      console.log('[Explore v7] ✅ Nav finished — selecting next frontier');
+      console.log('[Explore v9] ✅ Nav finished — selecting next frontier');
 
       // FIX: Permanently blacklist the frontier we just explored (radius 8 cells = 0.8m).
       // This prevents the robot from repeatedly picking "ghost" frontiers left behind 
@@ -158,19 +172,30 @@ function _tick() {
         _bl(currentGoalGrid.gx, currentGoalGrid.gy, 8);
       }
 
+      // v9: Try queued waypoint first before re-scanning
       _clearCurrentGoal();
-      // Fall through to select next
+      if (waypointQueue.length > 0) {
+        const next = waypointQueue.shift();
+        // Verify queued waypoint is still valid (not blocked)
+        const grid2 = _getGrid();
+        if (grid2 && grid2.getCost(next.approachGX, next.approachGY) < 200) {
+          console.log(`[Explore v9] ⏩ Using queued waypoint: (${next.goalX.toFixed(2)}, ${next.goalY.toFixed(2)})`);
+          _navigateToWaypoint(next);
+          return;
+        }
+        // Queued waypoint invalid, fall through to re-select
+      }
     }
     // ── Case 2: Nav ERROR → blacklist this goal, try another ──
     else if (status === 'ERROR') {
-      console.log('[Explore v7] ❌ Nav ERROR — blacklisting goal, trying next');
+      console.log('[Explore v9] ❌ Nav ERROR — blacklisting goal, trying next');
       _blacklistCurrentGoal();
       _stopNav();
       // Fall through to select next
     }
     // ── Case 3: Total timeout → this goal is unreachable ──
     else if (now - navStartTime > NAV_TIMEOUT_MS) {
-      console.log(`[Explore v7] ⏰ Nav timeout (${(NAV_TIMEOUT_MS/1000)}s) — blacklisting, trying next`);
+      console.log(`[Explore v9] ⏰ Nav timeout (${(NAV_TIMEOUT_MS/1000)}s) — blacklisting, trying next`);
       _blacklistCurrentGoal();
       _stopNav();
       // Fall through to select next
@@ -179,7 +204,7 @@ function _tick() {
     else if (status.startsWith('RECOVERY')) {
       if (navRecoveryStart === 0) navRecoveryStart = now;
       if (now - navRecoveryStart > NAV_RECOVERY_MAX) {
-        console.log(`[Explore v7] 🔄 Recovery too long (${(NAV_RECOVERY_MAX/1000)}s) — blacklisting, trying next`);
+        console.log(`[Explore v9] 🔄 Recovery too long (${(NAV_RECOVERY_MAX/1000)}s) — blacklisting, trying next`);
         _blacklistCurrentGoal();
         _stopNav();
         // Fall through to select next
@@ -238,35 +263,37 @@ async function _selectNextGoal(pose, grid) {
   }
   noFrontierCount = 0;
 
-  // ── v8: Greedy Nearest-First — prefer CLOSE + SAFE + HIGH GAIN ──
+  // ── v9: Cost-Utility Scoring — InfoGain vs TravelCost ──
   const rg = grid.worldToGrid(pose.x, pose.y);
   const scored = [];
 
+  // Adaptive lambda: when map is small (few scans), prioritize nearby frontiers.
+  // When map is large (many scans), prioritize high info gain.
+  const mapMaturity = Math.min(1.0, grid.scanCount / 50); // 0..1
+  const adaptGain = LAMBDA_GAIN * (0.5 + mapMaturity * 0.5);  // 1.0..2.0
+  const adaptDist = LAMBDA_DIST * (1.5 - mapMaturity * 0.5);  // 1.5..1.0
+
   for (const cl of clusters) {
-    // Find a SAFE approach point near the frontier centroid (lightweight version)
+    // Find a SAFE approach point near the frontier centroid
     const approach = _findWidestApproach(grid, cl.centroidGX, cl.centroidGY);
     if (!approach) continue;
 
     // Distance from robot (Euclidean in grid cells)
     const dist = Math.hypot(approach.gx - rg.gx, approach.gy - rg.gy);
 
-    // If we are already extremely close to this frontier approach point (e.g. < 5 cells = 0.5m),
-    // and it's STILL a frontier, it means our LiDAR cannot clear the unknown cells 
-    // (they are inside a wall or physically unreachable).
-    // Blacklist it so we don't get stuck in an infinite loop visiting the same spot.
+    // If we are already extremely close and it's STILL a frontier → unreachable
     if (dist < 5.0) {
-      console.log(`[Explore v8] ⚠️ Frontier too close (dist=${dist.toFixed(1)}). Blacklisting unreachable frontier.`);
+      console.log(`[Explore v9] ⚠️ Frontier too close (dist=${dist.toFixed(1)}). Blacklisting unreachable frontier.`);
       _bl(cl.centroidGX, cl.centroidGY, 8);
       continue;
     }
 
-    // Info gain: how many unknown cells nearby (smaller radius = faster)
-    const gain = _countUnknown(grid, approach.gx, approach.gy, 8);
+    // v9: Predicted info gain via LiDAR raycasting simulation
+    const gain = _predictInfoGain(grid, approach.gx, approach.gy);
 
-    // v8 SCORE: NEAREST-FIRST with gain tiebreaker
-    // Distance is 5x more important than clearance → robot vacuums nearby areas first
-    // Gain breaks ties: when 2 frontiers equally close, prefer higher info gain
-    const score = -dist * 5.0 + approach.clearance * 1.5 + gain * 0.4 + cl.size * 0.2;
+    // v9: Cost-Utility Score
+    // Score = InfoGain × λ_gain − Distance × λ_dist + Size × λ_size + Clearance × λ_clear
+    const score = gain * adaptGain - dist * adaptDist + cl.size * LAMBDA_SIZE + approach.clearance * LAMBDA_CLEAR;
 
     const worldPt = grid.gridToWorld(approach.gx, approach.gy);
     scored.push({
@@ -286,28 +313,44 @@ async function _selectNextGoal(pose, grid) {
   scored.sort((a, b) => b.score - a.score);
   const best = scored[0];
 
-  console.log(`[Explore v8] 🎯 Goal: (${best.goalX.toFixed(2)}, ${best.goalY.toFixed(2)}) ` +
-    `clearance=${best.clearance.toFixed(1)} gain=${best.gain} dist=${best.dist.toFixed(0)} ` +
-    `score=${best.score.toFixed(1)} clusters=${scored.length}`);
+  console.log(`[Explore v9] 🎯 Goal: (${best.goalX.toFixed(2)}, ${best.goalY.toFixed(2)}) ` +
+    `gain=${best.gain} dist=${best.dist.toFixed(0)} clearance=${best.clearance.toFixed(1)} ` +
+    `score=${best.score.toFixed(1)} [${scored.length} candidates, maturity=${mapMaturity.toFixed(2)}]`);
+
+  // v9: Queue second-best as waypoint chain (if valid)
+  waypointQueue = [];
+  if (scored.length >= 2) {
+    const second = scored[1];
+    // Only queue if second is in a different direction (>10 cells apart from best)
+    const chainDist = Math.hypot(second.approachGX - best.approachGX, second.approachGY - best.approachGY);
+    if (chainDist > 10) {
+      waypointQueue.push(second);
+    }
+  }
 
   // ── Send as navigation GOAL ──
-  currentGoalWorld = { x: best.goalX, y: best.goalY };
-  currentGoalGrid = { gx: best.centroidGX, gy: best.centroidGY };
-  currentGoalApproachGrid = { gx: best.approachGX, gy: best.approachGY };
+  _navigateToWaypoint({
+    goalX: best.goalX, goalY: best.goalY,
+    centroidGX: best.centroidGX, centroidGY: best.centroidGY,
+    approachGX: best.approachGX, approachGY: best.approachGY,
+  });
+}
+
+/** Navigate to a waypoint (shared between direct selection and queued chain) */
+async function _navigateToWaypoint(wp) {
+  currentGoalWorld = { x: wp.goalX, y: wp.goalY };
+  currentGoalGrid = { gx: wp.centroidGX, gy: wp.centroidGY };
+  currentGoalApproachGrid = { gx: wp.approachGX, gy: wp.approachGY };
 
   try {
-    // Use the existing goal navigation system
     const navStore = await _ensureNavStore();
     if (!navStore) { phase = 'selecting'; return; }
     const navState = navStore.getState();
 
-    // Stop any existing navigation first
     navState.navStopRobot(_robotId);
-
-    // Small delay to let nav system clean up
     await new Promise(r => setTimeout(r, 50));
 
-    const result = await navState.navigateToGoal(_robotId, best.goalX, best.goalY);
+    const result = await navState.navigateToGoal(_robotId, wp.goalX, wp.goalY);
 
     if (result.success) {
       phase = 'navigating';
@@ -315,15 +358,15 @@ async function _selectNextGoal(pose, grid) {
       lastNavCheck = Date.now();
       navStartTime = Date.now();
       navRecoveryStart = 0;
-      console.log(`[Explore v8] 📍 Nav started! Path: ${result.path?.length || '?'} waypoints`);
+      console.log(`[Explore v9] 📍 Nav started! Path: ${result.path?.length || '?'} waypoints, queue: ${waypointQueue.length}`);
     } else {
-      console.log(`[Explore v7] ❌ Nav failed: ${result.error} — blacklisting`);
-      _bl(best.centroidGX, best.centroidGY);
-      phase = 'selecting'; // Try another frontier next tick
+      console.log(`[Explore v9] ❌ Nav failed: ${result.error} — blacklisting`);
+      _bl(wp.centroidGX, wp.centroidGY);
+      phase = 'selecting';
     }
   } catch (err) {
-    console.error('[Explore v7] Nav error:', err);
-    _bl(best.centroidGX, best.centroidGY);
+    console.error('[Explore v9] Nav error:', err);
+    _bl(wp.centroidGX, wp.centroidGY);
     phase = 'selecting';
   }
 }
@@ -336,13 +379,15 @@ function _clearCurrentGoal() {
   currentGoalGrid = null;
   currentGoalApproachGrid = null;
   navRecoveryStart = 0;
+  // Note: waypointQueue is intentionally NOT cleared — it carries over for chaining
 }
 
 function _blacklistCurrentGoal() {
   if (currentGoalGrid) {
     _bl(currentGoalGrid.gx, currentGoalGrid.gy);
-    console.log(`[Explore v7] 🚫 Blacklisted frontier at (${currentGoalGrid.gx}, ${currentGoalGrid.gy})`);
+    console.log(`[Explore v9] 🚫 Blacklisted frontier at (${currentGoalGrid.gx}, ${currentGoalGrid.gy})`);
   }
+  waypointQueue = []; // Clear chain on failure
   _clearCurrentGoal();
 }
 
@@ -552,7 +597,7 @@ function _getGrid() {
   return _getMapStore().mapperInstances?.[_robotId] || null;
 }
 
-/** Count unknown cells in a circular area */
+/** Count unknown cells in a circular area (legacy fallback) */
 function _countUnknown(grid, gx, gy, radius) {
   const w = grid.width, h = grid.height;
   let count = 0;
@@ -566,6 +611,46 @@ function _countUnknown(grid, gx, gy, radius) {
     }
   }
   return count;
+}
+
+/**
+ * v9: Predict how many UNKNOWN cells LiDAR would see from a given position.
+ * Simulates raycasting in INFO_GAIN_RAYS directions up to INFO_GAIN_RANGE cells.
+ * Much more accurate than _countUnknown because it respects occlusion (rays stop at walls).
+ *
+ * Cost: INFO_GAIN_RAYS × INFO_GAIN_RANGE = 36 × 30 = ~1,080 lookups per candidate.
+ * vs _countUnknown(R=8): π×64 ≈ 201 lookups but WITHOUT occlusion awareness.
+ */
+function _predictInfoGain(grid, goalGX, goalGY) {
+  const w = grid.width, h = grid.height;
+  const logOdds = grid.logOdds;
+  let gain = 0;
+
+  for (let i = 0; i < INFO_GAIN_RAYS; i++) {
+    const angle = (i / INFO_GAIN_RAYS) * 2 * Math.PI;
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+
+    for (let step = 1; step <= INFO_GAIN_RANGE; step++) {
+      const gx = goalGX + Math.round(dx * step);
+      const gy = goalGY + Math.round(dy * step);
+
+      // Out of bounds → stop ray
+      if (gx < 0 || gx >= w || gy < 0 || gy >= h) break;
+
+      const lo = logOdds[gy * w + gx];
+
+      // Hit occupied cell → stop ray (wall blocks further view)
+      if (lo > 0.3) break;
+
+      // Unknown cell → counts as info gain
+      if (Math.abs(lo) < 0.3) gain++;
+
+      // Free cell → continue ray (LiDAR passes through)
+    }
+  }
+
+  return gain;
 }
 
 // ── BLACKLIST ──
