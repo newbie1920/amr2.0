@@ -300,15 +300,13 @@ async function _selectNextGoal(pose, grid) {
   }
   noFrontierCount = 0;
 
-  // ── v10: Cost-Utility + Anti-Ping-Pong Scoring ──
+  // ── v10.1: MULTIPLICATIVE Anti-Ping-Pong Scoring ──
+  // Previous additive heading bias (±3 pts) was negligible vs gain (±360 pts).
+  // Now: base score computed first → then MULTIPLIED by direction factors.
+  // Frontier behind robot → score × 0.3 (70% penalty). This is decisive.
   const rg = grid.worldToGrid(pose.x, pose.y);
   const scored = [];
   const now2 = Date.now();
-
-  // Adaptive lambda: prioritize nearby early, shift to gain later
-  const mapMaturity = Math.min(1.0, grid.scanCount / 50);
-  const adaptGain = LAMBDA_GAIN * (0.5 + mapMaturity * 0.5);
-  const adaptDist = LAMBDA_DIST * (1.5 - mapMaturity * 0.5);
 
   for (const cl of clusters) {
     const approach = _findWidestApproach(grid, cl.centroidGX, cl.centroidGY);
@@ -326,46 +324,49 @@ async function _selectNextGoal(pose, grid) {
     // Predicted info gain via LiDAR raycasting
     const gain = _predictInfoGain(grid, approach.gx, approach.gy);
 
-    // ── ANTI-PING-PONG: Heading Bias ──
-    // Cosine similarity between robot heading and direction to frontier
-    // +1.0 = frontier is directly ahead, -1.0 = directly behind
-    const dirToFrontier = Math.atan2(approach.gy - rg.gy, approach.gx - rg.gx);
-    const headingBias = Math.cos(pose.theta - dirToFrontier); // [-1, +1]
+    // ── BASE SCORE: gain-per-distance ratio ──
+    // Normalize gain by distance so distant frontiers don't dominate just because they see more
+    const gainPerDist = gain / Math.max(dist, 5);  // Info efficiency
+    const baseScore = gainPerDist * 30 + cl.size * LAMBDA_SIZE + approach.clearance * LAMBDA_CLEAR;
 
-    // ── ANTI-PING-PONG: Momentum Bonus ──
-    // If we just completed a goal, prefer continuing in the same general direction
-    let momentumBonus = 0;
+    // ── MULTIPLIER 1: Heading Direction ──
+    // cos(heading, dirToFrontier): +1=ahead, -1=behind
+    // Map to multiplier: ahead=1.0, side=0.65, behind=0.30
+    const dirToFrontier = Math.atan2(approach.gy - rg.gy, approach.gx - rg.gx);
+    const headingCos = Math.cos(pose.theta - dirToFrontier); // [-1, +1]
+    // Remap: cos=-1 → 0.30, cos=0 → 0.65, cos=+1 → 1.00
+    const headingMult = 0.65 + 0.35 * headingCos;
+
+    // ── MULTIPLIER 2: Momentum (continue in same direction as last goal) ──
+    let momentumMult = 1.0;
     if (lastGoalDirection !== 0) {
-      const momentumCos = Math.cos(lastGoalDirection - dirToFrontier);
-      momentumBonus = momentumCos * 1.5; // mild bonus for same direction
+      const momentumCos = Math.cos(lastGoalDirection - dirToFrontier); // [-1, +1]
+      // same dir → 1.15 bonus, opposite → 0.70 penalty
+      momentumMult = 0.925 + 0.225 * momentumCos;
     }
 
-    // ── ANTI-PING-PONG: Visited Trail Penalty ──
-    // Count how many visited trail cells are near this frontier
-    let visitedPenalty = 0;
+    // ── MULTIPLIER 3: Visited Trail Suppression ──
+    // Count nearby visited trail cells → heavy multiplier reduction
+    let visitedCount = 0;
     for (let dy = -VISITED_RADIUS; dy <= VISITED_RADIUS; dy += 3) {
       for (let dx = -VISITED_RADIUS; dx <= VISITED_RADIUS; dx += 3) {
         const ts = visitedTrail.get(`${approach.gx + dx},${approach.gy + dy}`);
-        if (ts) {
-          // Recent visits penalize more (linear decay)
-          const age = (now2 - ts) / VISITED_DECAY_MS; // 0=just visited, 1=expired
-          visitedPenalty += (1.0 - age);
+        if (ts && (now2 - ts) < VISITED_DECAY_MS) {
+          const freshness = 1.0 - (now2 - ts) / VISITED_DECAY_MS;
+          visitedCount += freshness;
         }
       }
     }
+    // Each visited hit reduces score by ~10%, capped at 0.25x minimum
+    const visitedMult = Math.max(0.25, 1.0 - visitedCount * 0.10);
 
-    // v10 FINAL SCORE:
-    const score = gain * adaptGain
-      - dist * adaptDist
-      + cl.size * LAMBDA_SIZE
-      + approach.clearance * LAMBDA_CLEAR
-      + headingBias * LAMBDA_HEADING * Math.min(dist, 30) / 30  // Scale heading by distance
-      + momentumBonus
-      - visitedPenalty * LAMBDA_VISITED;
+    // ── FINAL SCORE: base × heading × momentum × visited ──
+    const score = baseScore * headingMult * momentumMult * visitedMult;
 
     const worldPt = grid.gridToWorld(approach.gx, approach.gy);
     scored.push({
-      ...cl, score, dist, gain, headingBias, visitedPenalty,
+      ...cl, score, dist, gain,
+      headingCos, visitedMult: visitedMult,
       approachGX: approach.gx, approachGY: approach.gy,
       clearance: approach.clearance,
       goalX: worldPt.x, goalY: worldPt.y,
@@ -382,8 +383,8 @@ async function _selectNextGoal(pose, grid) {
   const best = scored[0];
 
   console.log(`[Explore v10] 🎯 Goal: (${best.goalX.toFixed(2)}, ${best.goalY.toFixed(2)}) ` +
-    `gain=${best.gain} dist=${best.dist.toFixed(0)} heading=${best.headingBias.toFixed(2)} ` +
-    `visited_pen=${best.visitedPenalty.toFixed(1)} score=${best.score.toFixed(1)} ` +
+    `gain=${best.gain} dist=${best.dist.toFixed(0)} hCos=${best.headingCos.toFixed(2)} ` +
+    `vMult=${best.visitedMult.toFixed(2)} score=${best.score.toFixed(1)} ` +
     `[${scored.length} candidates]`);
 
   // v10: Greedy TSP chain — build a sweep route through top-N frontiers
