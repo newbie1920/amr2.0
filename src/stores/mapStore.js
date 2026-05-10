@@ -220,8 +220,24 @@ const useMapStore = create((set, get) => ({
 
     const isSim = robot?._sim;
 
-    // Allow passive mapping if grid exists, even if mappingActive is false.
-    // This allows A* and DWA to use the obstacle map during manual driving.
+    // ── AUTO-CREATE passive grid for REAL robots on first lidar data ──
+    // This ensures the map starts building immediately when robot connects
+    const lidarPtsCheck = telem.lidar || [];
+    if (!state.mapperInstances[id] && !isSim && lidarPtsCheck.length > 0) {
+      const initX = telem.x ?? 0;
+      const initY = telem.y ?? 0;
+      const grid = new OccupancyGrid(200, 200, 0.1, initX, initY);
+      set((s) => ({
+        mapperInstances: { ...s.mapperInstances, [id]: grid },
+        occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+        mapToOdom: { ...s.mapToOdom, [id]: { dx: 0, dy: 0, dTheta: 0 } },
+      }));
+      console.log(`[Mapping] 🗺️ Auto-created passive grid for robot ${id} at (${initX.toFixed(2)}, ${initY.toFixed(2)})`);
+      return; // Grid will be available on next tick
+    }
+
+    // Passive mapping: always update grid when scan data arrives.
+    // isMapping flag only controls exploration auto-drive behavior.
     if (state.mapperInstances[id]) {
       const grid = state.mapperInstances[id];
       const lidarPts = telem.lidar || [];
@@ -238,7 +254,15 @@ const useMapStore = create((set, get) => ({
           mapX = odomX;
           mapY = odomY;
           mapTheta = odomTheta;
+        } else if (telem.slamMapX != null && telem.slamMapY != null && telem.slamMapTheta != null) {
+          // REAL robot with active SLAM: use firmware's ICP-corrected map pose.
+          // This matches the pose used by ESP32's send_occupancy_grid(),
+          // preventing the mismatch that causes map ghosting/drift.
+          mapX = telem.slamMapX;
+          mapY = telem.slamMapY;
+          mapTheta = telem.slamMapTheta;
         } else {
+          // REAL robot without SLAM data: fallback to odom + browser TF
           const tf = state.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
           mapX = odomX + tf.dx;
           mapY = odomY + tf.dy;
@@ -251,7 +275,7 @@ const useMapStore = create((set, get) => ({
 
           simNavWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
             const freshState = get();
-            
+
             if (matched.corrected) {
               const c = matched.correction;
               const freshTf = freshState.mapToOdom[id] || { dx: 0, dy: 0, dTheta: 0 };
@@ -274,9 +298,9 @@ const useMapStore = create((set, get) => ({
           });
         }
 
-        if (isMapping) {
-          grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
-        }
+        // Always integrate scans into grid (passive mapping)
+        // Map builds continuously — SLAM button only controls auto-exploration
+        grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
 
         if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
           set((s) => ({
@@ -370,11 +394,11 @@ const useMapStore = create((set, get) => ({
   autoLoadLatestMap: (robotId) => {
     const maps = get().savedMaps;
     if (!maps || maps.length === 0) return false;
-    
+
     // Tìm map mới nhất (sort theo createdAt giảm dần)
     const sortedMaps = [...maps].sort((a, b) => b.createdAt - a.createdAt);
     const latestMap = sortedMaps[0];
-    
+
     console.log(`[MapManager] Tự động load map mới nhất: "${latestMap.name}" cho robot ${robotId}`);
     return get().loadMap(robotId, latestMap.data);
   },
@@ -390,7 +414,7 @@ const useMapStore = create((set, get) => ({
       console.warn('[MapManager] generateSimMap: no segments');
       return false;
     }
-    
+
     const grid = OccupancyGrid.createFromSegments(segments, 0.1, 1.0);
     if (!grid) return false;
 

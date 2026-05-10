@@ -36,6 +36,7 @@ export class RobotConnection {
     this.pingTimer = null;
     this.lastPong = 0;
     this.latency = 0;
+    this.missedPongs = 0;  // Count consecutive missed pongs
 
     // --- HITL MODE ---
     this.hitlEnabled = false;
@@ -549,6 +550,7 @@ export class RobotConnection {
    */
   _processTelemetryData(data) {
     this.lastPong = Date.now(); // Telemetry is a valid heartbeat
+    this.missedPongs = 0;       // Reset miss counter — ESP32 is alive
     this.telemetry = {
       x: data.x ?? this.telemetry.x,
       y: data.y ?? this.telemetry.y,
@@ -585,6 +587,11 @@ export class RobotConnection {
       // HITL mode
       hitl: data.hitl ?? this.telemetry.hitl,
       slam: data.slam ?? this.telemetry.slam,
+      // SLAM map-frame pose (from ESP32 ICP correction)
+      // These are the corrected positions used by firmware for grid mapping
+      slamMapX: data.slam?.mX ?? this.telemetry.slamMapX,
+      slamMapY: data.slam?.mY ?? this.telemetry.slamMapY,
+      slamMapTheta: data.slam?.mTh != null ? (data.slam.mTh * Math.PI / 180) : this.telemetry.slamMapTheta,
       // Exploration (Onboard SLAM)
       explore: data.explore ?? this.telemetry.explore,
       explore_goals: data.explore_goals ?? this.telemetry.explore_goals,
@@ -594,8 +601,8 @@ export class RobotConnection {
 
     if (this.hitlEnabled) {
       // Convert wheel angular velocities (rad/s) from ESP32 to robot velocities (m/s, rad/s)
-      const WHEEL_RADIUS = 0.033;
-      const WHEEL_SEPARATION = 0.22;
+      const WHEEL_RADIUS = 0.0264;      // Must match ESP32 config.h
+      const WHEEL_SEPARATION = 0.170;   // Must match ESP32 config.h
       
       const vL_ms = (data.vL_r || 0) * WHEEL_RADIUS;
       const vR_ms = (data.vR_r || 0) * WHEEL_RADIUS;
@@ -629,16 +636,27 @@ export class RobotConnection {
 
   _startPing() {
     this._stopPing();
+    this.missedPongs = 0;
     this.pingTimer = setInterval(() => {
       this._send({ type: 'ping', ts: Date.now() });
 
-      // Kiểm tra pong timeout (2.5 giây)
-      if (Date.now() - this.lastPong > 2500 && this.connected) {
-        console.warn(`[Robot ${this.name}] Pong timeout — mất kết nối?`);
-        this.disconnect();
-        this._scheduleReconnect();
+      // Kiểm tra pong timeout (15 giây — ESP32 cần serialize
+      // telemetry 8KB + lidar JSON + grid 20KB + ICP + PID, dễ bị trễ khi lái)
+      if (Date.now() - this.lastPong > 15000 && this.connected) {
+        this.missedPongs++;
+        console.warn(`[Robot ${this.name}] Pong timeout #${this.missedPongs}`);
+        
+        // Cần 3 lần liên tiếp mất pong mới thực sự disconnect
+        // (tăng tolerance cho WiFi hiccup + ESP32 CPU-heavy khi lái)
+        if (this.missedPongs >= 3) {
+          console.error(`[Robot ${this.name}] ${this.missedPongs} consecutive pong misses → disconnecting`);
+          this.disconnect();
+          this._scheduleReconnect();
+        }
+      } else {
+        this.missedPongs = 0;  // Reset counter khi nhận được pong
       }
-    }, 1000);
+    }, 5000);  // Ping mỗi 5 giây (giảm tải cho ESP32)
   }
 
   _stopPing() {

@@ -158,7 +158,7 @@ export default function RVizPanel({ activePath }) {
   const mapperInstances = useMapStore((s) => s.mapperInstances);
   const mapToOdom = useMapStore((s) => s.mapToOdom);
   const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
-  const simWorldSegments = useRobotStore((s) => s.simWorldSegments);
+  const _simWorldSegments = useRobotStore((s) => s.simWorldSegments);
   const simInfo = useRobotStore((s) => s.simInfo);
   // Navigation from navStore
   const appNavigationSessions = useNavStore((s) => s.appNavigationSessions);
@@ -182,6 +182,16 @@ export default function RVizPanel({ activePath }) {
   const navSession = activeRobotId ? appNavigationSessions[activeRobotId] : null;
   const firstSimInfo = Object.values(simInfo)[0];
   const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
+
+  // Data source detection for mode badge
+  const dataSource = activeRobot?._sim ? 'sim'
+    : (activeRobot?.telemetry?.hitl || activeRobot?.connection?.hitlEnabled) ? 'hitl'
+    : activeRobot ? 'real' : 'none';
+
+  // Stabilize simWorldSegments: use empty array in real mode to prevent
+  // sim engine's 60Hz state updates from triggering canvas re-renders/flicker.
+  const emptySegments = useRef([]).current;
+  const simWorldSegments = dataSource === 'real' ? emptySegments : _simWorldSegments;
 
   const handleToggleMapping = useCallback(() => {
     if (!activeRobotId) return;
@@ -366,7 +376,11 @@ export default function RVizPanel({ activePath }) {
 
       // Draw layers in order (back to front)
       if (layers.grid) drawGrid(ctx, w, h, vp);
-      if (layers.walls) drawWorldSegments(ctx, w, h, vp, simWorldSegments);
+      // Sim world segments (virtual walls) — COMPLETELY skip in real mode
+      // to prevent sim engine ticks from causing ANY visual artifacts
+      if (layers.walls && dataSource !== 'real' && simWorldSegments?.length > 0) {
+        drawWorldSegments(ctx, w, h, vp, simWorldSegments);
+      }
       if (layers.map && grid) drawOccupancyMap(ctx, w, h, vp, grid);
       if (layers.costmap && grid) drawCostmapNav2(ctx, w, h, vp, grid);
       if (layers.frontier && grid && grid.frontierCells) drawFrontiers(ctx, w, h, vp, grid.frontierCells, grid);
@@ -440,7 +454,12 @@ export default function RVizPanel({ activePath }) {
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  }, [canvasSize, viewport, layers, grid, telem, activePath, simWorldSegments, tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId]);
+  // NOTE: simWorldSegments intentionally excluded when dataSource==='real'
+  // to prevent sim engine tick updates from causing canvas flicker.
+  // When dataSource changes, the effect re-runs via dataSource dep.
+  }, [canvasSize, viewport, layers, grid, telem, activePath, 
+      dataSource === 'real' ? null : simWorldSegments,
+      tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId, dataSource]);
 
   // ── JSX ───────────────────────────────────────────────────
 
@@ -449,6 +468,20 @@ export default function RVizPanel({ activePath }) {
       {/* Header */}
       <div style={headerStyle}>
         <span style={titleStyle}>📊 RVizTDTU</span>
+        <span style={{
+          fontSize: '9px', padding: '1px 8px', borderRadius: '4px', fontWeight: 600, marginLeft: '8px',
+          background: dataSource === 'sim' ? 'rgba(139,92,246,0.2)' :
+                      dataSource === 'hitl' ? 'rgba(59,130,246,0.2)' :
+                      dataSource === 'real' ? 'rgba(16,185,129,0.2)' : 'rgba(100,116,139,0.2)',
+          color: dataSource === 'sim' ? '#c4b5fd' :
+                 dataSource === 'hitl' ? '#93c5fd' :
+                 dataSource === 'real' ? '#6ee7b7' : '#94a3b8',
+        }}>
+          {dataSource === 'sim' && 'SimLidar (Browser)'}
+          {dataSource === 'hitl' && 'HITL Hybrid'}
+          {dataSource === 'real' && 'ESP32 Sensors'}
+          {dataSource === 'none' && 'No Data'}
+        </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
           {goalMarker && (
             <button
@@ -492,6 +525,7 @@ export default function RVizPanel({ activePath }) {
           onToggleLayer={toggleLayer}
           isMapping={isMapping}
           onToggleMapping={handleToggleMapping}
+          dataSource={dataSource}
         />
         <div ref={containerRef} style={canvasStyle}>
           {activeTool === 'goal' && (

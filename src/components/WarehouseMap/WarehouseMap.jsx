@@ -289,7 +289,10 @@ function RealisticShelf({ shelf, cx, cz }) {
   );
 }
 
-function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRobotId, mappingActive, layers }) {
+function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRobotId, mappingActive, layers, dataSource }) {
+  // When using a REAL robot, suppress all simulated warehouse elements
+  // Only show LiDAR-generated map data
+  const isRealMode = dataSource === 'real';
   // Center the warehouse in the world
   const cx = WAREHOUSE_WIDTH / 2;
   const cz = WAREHOUSE_HEIGHT / 2; // y in 2D is z in 3D
@@ -317,8 +320,8 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         <meshStandardMaterial color={C_FLOOR} />
       </mesh>
 
-      {/* 4 Outer Walls (Low walls for LiDAR) */}
-      {mapType === '3d' && (
+      {/* 4 Outer Walls (Low walls for LiDAR) — HIDE in real mode */}
+      {mapType === '3d' && !isRealMode && (
         <group>
           {/* Top Wall (z = -cz) */}
           <Box args={[WAREHOUSE_WIDTH, 0.5, 0.2]} position={[0, 0.25, -cz]} receiveShadow castShadow>
@@ -339,8 +342,10 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         </group>
       )}
 
-      {/* LIDAR Occupancy Grid Visualization (Chỉ ở chế độ LIDAR) */}
-      {mapType === 'lidar' && Object.entries(robots).map(([robotId, robot]) => {
+      {/* LIDAR Occupancy Grid Visualization — ONLY for selected robot to prevent Z-fighting */}
+      {mapType === 'lidar' && Object.entries(robots)
+        .filter(([robotId]) => !selectedRobotId || robotId === selectedRobotId)
+        .map(([robotId, robot]) => {
         const grid = occupancyGrid?.[robotId];
         const isThisMapping = !!mappingActive?.[robotId];
         const telem = robot.telemetry || {};
@@ -379,13 +384,13 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         );
       })}
 
-      {/* Shelves - Chỉ hiện ở chế độ 3D có sẵn */}
-      {mapType === '3d' && SHELVES.map((shelf, idx) => (
+      {/* Shelves - Chỉ hiện ở chế độ 3D SIM/HITL, ẩn khi xe thật */}
+      {mapType === '3d' && !isRealMode && SHELVES.map((shelf, idx) => (
         <RealisticShelf key={idx} shelf={shelf} cx={cx} cz={cz} />
       ))}
 
-      {/* Gates - Chỉ hiện ở chế độ 3D có sẵn */}
-      {mapType === '3d' && Object.values(GATES).map((gate, idx) => {
+      {/* Gates - Chỉ hiện ở chế độ 3D SIM/HITL, ẩn khi xe thật */}
+      {mapType === '3d' && !isRealMode && Object.values(GATES).map((gate, idx) => {
         const x = map2To3X(gate.x);
         const z = map2To3Z(gate.y);
         
@@ -426,8 +431,8 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         );
       })}
 
-      {/* Charging Stations - Chỉ hiện ở chế độ 3D có sẵn */}
-      {mapType === '3d' && CHARGING_STATIONS.map((charger, idx) => {
+      {/* Charging Stations - Chỉ hiện ở chế độ 3D SIM/HITL, ẩn khi xe thật */}
+      {mapType === '3d' && !isRealMode && CHARGING_STATIONS.map((charger, idx) => {
         const x = map2To3X(charger.x);
         const z = map2To3Z(charger.y);
         
@@ -473,10 +478,8 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         );
       })}
 
-      {/* Occupancy Grid (Lidar Map) */}
-      {mapType === 'lidar' && activeGrid && (
-        <OccupancyGridMesh grid={activeGrid} cx={cx} cz={cz} />
-      )}
+      {/* NOTE: OccupancyGridMesh removed — OccupancyGridVisualizer above already renders
+         the selected robot's grid. Having both caused Z-fighting flicker. */}
 
       {/* Active Paths for all robots */}
       {Object.values(useNavStore((s) => s.appNavigationSessions) || {}).map((session, index) => {
@@ -635,9 +638,48 @@ export default function WarehouseMap({ activePath }) {
     e.target.value = '';
   }, [activeRobotId, loadMap]);
 
+  // Determine data source for the active robot
+  const activeRobotObj = activeRobotId ? robots[activeRobotId] : null;
+  const dataSource = activeRobotObj?._sim ? 'sim'
+    : (activeRobotObj?.telemetry?.hitl || activeRobotObj?.connection?.hitlEnabled) ? 'hitl'
+    : activeRobotObj ? 'real' : 'none';
+
+  // Auto-switch mapType based on robot type:
+  // - Real robot (no HITL) → always show LIDAR map (real sensor data)
+  // - Sim robot → show 3D warehouse (sim world)
+  // User can still manually override after auto-switch
+  useEffect(() => {
+    if (dataSource === 'real') {
+      setMapType('lidar');
+    } else if (dataSource === 'sim') {
+      setMapType('3d');
+    }
+  }, [dataSource, activeRobotId]);
+
   return (
     <div className="warehouse-map" style={{ width: '100%', height: '100%', background: C_FLOOR, position: 'relative' }}>
       
+      {/* ── DATA SOURCE BADGE (top-right) ── */}
+      <div style={{
+        position: 'absolute', top: 12, right: 12, zIndex: 10,
+        padding: '4px 10px', borderRadius: '6px', fontSize: '10px', fontWeight: 600,
+        backdropFilter: 'blur(8px)',
+        background: dataSource === 'sim' ? 'rgba(139,92,246,0.2)' :
+                    dataSource === 'hitl' ? 'rgba(59,130,246,0.2)' :
+                    dataSource === 'real' ? 'rgba(16,185,129,0.2)' : 'rgba(100,116,139,0.2)',
+        color: dataSource === 'sim' ? '#c4b5fd' :
+               dataSource === 'hitl' ? '#93c5fd' :
+               dataSource === 'real' ? '#6ee7b7' : '#94a3b8',
+        border: `1px solid ${dataSource === 'sim' ? 'rgba(139,92,246,0.3)' :
+                              dataSource === 'hitl' ? 'rgba(59,130,246,0.3)' :
+                              dataSource === 'real' ? 'rgba(16,185,129,0.3)' : 'rgba(100,116,139,0.15)'}`,
+      }}>
+        {dataSource === 'sim' && '🏭 3D: SimEngine (Browser Physics)'}
+        {dataSource === 'hitl' && '🌐 3D: ESP32 + Browser Hybrid'}
+        {dataSource === 'real' && '🔌 3D: ESP32 Sensors (WebSocket)'}
+        {dataSource === 'none' && '⏳ 3D: Chờ kết nối robot...'}
+      </div>
+
       {/* ── CAMERA & MAP CONTROLS UI ── */}
       <div style={{ position: 'absolute', top: 16, left: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(15, 25, 35, 0.8)', padding: '10px', borderRadius: '8px', backdropFilter: 'blur(10px)' }}>
         
@@ -680,15 +722,17 @@ export default function WarehouseMap({ activePath }) {
                 className={`btn btn--sm ${mapType === '3d' ? 'btn--success' : 'btn--ghost'}`}
                 onClick={() => setMapType('3d')}
                 style={{ flex: 1 }}
+                title={dataSource === 'sim' ? 'Kho 3D từ SimEngine (browser)' : 'Kho 3D cố định (layout thật)'}
               >
-                🏢 Map Mô Phỏng (Có sẵn)
+                🏢 {dataSource === 'sim' ? 'Kho 3D (Sim World)' : 'Kho 3D (Layout thật)'}
               </button>
               <button 
                 className={`btn btn--sm ${mapType === 'lidar' ? 'btn--success' : 'btn--ghost'}`}
                 onClick={() => setMapType('lidar')}
                 style={{ flex: 1 }}
+                title={dataSource === 'sim' ? 'LiDAR giả lập từ SimEngine' : 'LiDAR từ ESP32 (phần cứng)'}
               >
-                🔴 Map Lidar (Point Cloud)
+                🔴 {dataSource === 'sim' ? 'Lidar (SimLidar)' : 'Lidar (ESP32)'}
               </button>
             </div>
 
@@ -864,7 +908,7 @@ export default function WarehouseMap({ activePath }) {
         <directionalLight position={[10, 15, 10]} intensity={1} castShadow />
         <pointLight position={[0, 5, 0]} intensity={0.5} />
         
-        <WarehouseScene robots={robots} activePath={activePath} mapType={mapType} occupancyGrid={occupancyGrid} selectedRobotId={activeRobotId} mappingActive={mappingActive} layers={layers} />
+        <WarehouseScene robots={robots} activePath={activePath} mapType={mapType} occupancyGrid={occupancyGrid} selectedRobotId={activeRobotId} mappingActive={mappingActive} layers={layers} dataSource={dataSource} />
         
         <CameraDirector viewMode={viewMode} />
       </Canvas>
