@@ -314,20 +314,21 @@ void init_network() {
     String nativeSsid = WiFi.SSID(), nativePass = WiFi.psk();
     if (nativeSsid.length() > 0) wifiMulti.addAP(nativeSsid.c_str(), nativePass.c_str());
 
-    // Try WiFiMulti first (15s) — feed WDT each iteration
+    // Try WiFiMulti first (8s max) — feed WDT each iteration
     bool connected = false;
     unsigned long startT = millis();
-    while (millis() - startT < 15000) {
-        esp_task_wdt_reset();  // Prevent WDT crash during blocking scan
+    while (millis() - startT < 8000) {
+        esp_task_wdt_reset();
         if (wifiMulti.run() == WL_CONNECTED) { connected = true; break; }
-        delay(500);
+        delay(200);
     }
+    LOG_I("WIFI", "Connect took %lums (connected=%d)", millis() - startT, connected);
     esp_task_wdt_reset();
 
     // Fallback: WiFiManager portal
     if (!connected) {
         WiFi.disconnect(true, true); delay(500);
-        wm.setConnectTimeout(15);
+        wm.setConnectTimeout(8);
         wm.setConfigPortalTimeout(120);
         if (!wm.autoConnect(WIFI_AP_NAME)) { ESP.restart(); }
 

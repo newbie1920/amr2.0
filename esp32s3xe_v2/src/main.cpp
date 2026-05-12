@@ -102,7 +102,7 @@ void setup() {
     tasks_create();
 
     // ── Layer 4: Network (WiFi + WebSocket + OTA) ────────────
-    init_network();  // Blocking WiFi connect (~15s max)
+    init_network();  // Blocking WiFi connect (~8s max)
 
     // ── Bump loopTask priority ──────────────────────────────
     // Default Arduino loopTask = priority 1, but lidarTask = 3 on same Core 0.
