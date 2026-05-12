@@ -374,6 +374,10 @@ void update_network() {
     }
 }
 
+void flush_network() {
+    webSocket.loop();  // Flush TX buffer — call after broadcast_telemetry()
+}
+
 // ============================================================
 //   OCCUPANCY GRID BROADCAST
 // ============================================================

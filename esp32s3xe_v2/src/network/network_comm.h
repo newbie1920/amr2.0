@@ -11,6 +11,7 @@
 
 void init_network();
 void update_network();
+void flush_network();  // Extra webSocket.loop() to flush TX immediately
 void broadcast_telemetry();
 void send_occupancy_grid();
 void setArchitectureProfile(const char* profile);

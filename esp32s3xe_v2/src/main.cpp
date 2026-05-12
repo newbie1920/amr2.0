@@ -132,10 +132,16 @@ void loop() {
     // NOTE: loopTask is NOT on WDT (see network_comm.cpp).
     // Only controlTask is WDT-monitored (safety-critical motor PID).
 
-    // ── 1. WebSocket — flush incoming pings immediately ──
+    // ── 1. WebSocket — service incoming commands FIRST ──
     update_network();
 
-    // ── 2. I2C blocking operations (OLED + INA3221 + battery) ──────
+    // ── 2. Telemetry broadcast (10Hz) — send BEFORE any I2C blocking ──
+    broadcast_telemetry();
+
+    // ── 3. Flush WebSocket TX buffer immediately after broadcast ──
+    flush_network();
+
+    // ── 4. I2C slow operations — AFTER network is serviced ──────
     static unsigned long lastSlowUpdate = 0;
     if (millis() - lastSlowUpdate > 500) {
         lastSlowUpdate = millis();
@@ -148,10 +154,7 @@ void loop() {
         }
     }
 
-    oled_update();  // I2C OLED write (~10-50ms blocking)
-
-    // ── 3. Telemetry broadcast (10Hz, lightweight without LiDAR) ────
-    broadcast_telemetry();
+    oled_update();  // I2C OLED (~30-50ms) — now AFTER telemetry, won't delay data
 
     // ── Serial status heartbeat (5s) ─────────────────────────
     static unsigned long lastHeartbeat = 0;
