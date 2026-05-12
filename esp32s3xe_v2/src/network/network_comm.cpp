@@ -17,8 +17,7 @@
 #include <ArduinoOTA.h>
 #include <TelnetStream.h>
 #include <ArduinoJson.h>
-#include <WiFiMulti.h>
-#include <Preferences.h>
+// WiFiMulti and Preferences removed — using WiFiManager only
 
 // Navigation modules
 #include "navigator.h"
@@ -43,7 +42,7 @@ extern WheelPID leftPID, rightPID;
 static WebServer server(HTTP_PORT);
 static WebSocketsServer webSocket(WEBSOCKET_PORT);
 static WiFiManager wm;
-static WiFiMulti wifiMulti;
+// WiFiMulti removed — WiFiManager handles everything
 
 static unsigned long lastTelemetryTime = 0;
 
@@ -291,66 +290,29 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 }
 
 // ============================================================
-//   WIFI INIT
+//   WIFI INIT — Simple: WiFiManager only
 // ============================================================
 void init_network() {
     LOG_I("BOOT", "Initializing WiFi...");
 
-    // loopTask is NOT on WDT yet (added at end of this function)
-
     WiFi.mode(WIFI_STA);
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);     // No power saving — max throughput
     WiFi.setTxPower(WIFI_POWER_15dBm);
 
-    // Load saved networks
-    Preferences prefs;
-    prefs.begin("wifi_cfg", false);
-    int count = prefs.getInt("count", 0);
-    for (int i = 0; i < count; i++) {
-        String ssid = prefs.getString(("ssid" + String(i)).c_str(), "");
-        String pass = prefs.getString(("pass" + String(i)).c_str(), "");
-        if (ssid.length() > 0) wifiMulti.addAP(ssid.c_str(), pass.c_str());
-    }
-    String nativeSsid = WiFi.SSID(), nativePass = WiFi.psk();
-    if (nativeSsid.length() > 0) wifiMulti.addAP(nativeSsid.c_str(), nativePass.c_str());
+    // WiFiManager: tries last known network first (~3s), opens AP portal if fails
+    wm.setConnectTimeout(8);           // Max 8s to connect to known network
+    wm.setConfigPortalTimeout(120);    // AP portal stays open 2min
 
-    // Try WiFiMulti first (8s max) — feed WDT each iteration
-    bool connected = false;
     unsigned long startT = millis();
-    while (millis() - startT < 8000) {
-        esp_task_wdt_reset();
-        if (wifiMulti.run() == WL_CONNECTED) { connected = true; break; }
-        delay(200);
-    }
-    LOG_I("WIFI", "Connect took %lums (connected=%d)", millis() - startT, connected);
     esp_task_wdt_reset();
 
-    // Fallback: WiFiManager portal
-    if (!connected) {
-        WiFi.disconnect(true, true); delay(500);
-        wm.setConnectTimeout(8);
-        wm.setConfigPortalTimeout(120);
-        if (!wm.autoConnect(WIFI_AP_NAME)) { ESP.restart(); }
-
-        String newSsid = WiFi.SSID(), newPass = WiFi.psk();
-        if (newSsid.length() > 0) {
-            bool exists = false;
-            for (int i = 0; i < count; i++) {
-                if (prefs.getString(("ssid" + String(i)).c_str(), "") == newSsid) {
-                    exists = true; prefs.putString(("pass" + String(i)).c_str(), newPass); break;
-                }
-            }
-            if (!exists && count < 10) {
-                prefs.putString(("ssid" + String(count)).c_str(), newSsid);
-                prefs.putString(("pass" + String(count)).c_str(), newPass);
-                prefs.putInt("count", count + 1);
-            }
-            wifiMulti.addAP(newSsid.c_str(), newPass.c_str());
-        }
+    if (!wm.autoConnect(WIFI_AP_NAME)) {
+        LOG_W("WIFI", "Failed to connect — restarting...");
+        ESP.restart();
     }
-    prefs.end();
 
-    LOG_I("BOOT", "WiFi ready! IP: %s", WiFi.localIP().toString().c_str());
+    LOG_I("WIFI", "Connected in %lums — IP: %s", millis() - startT,
+          WiFi.localIP().toString().c_str());
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
 
