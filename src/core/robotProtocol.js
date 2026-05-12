@@ -637,12 +637,19 @@ export class RobotConnection {
   _startPing() {
     this._stopPing();
     this.missedPongs = 0;
+    this._connectTime = Date.now(); // Grace period: ESP32 busy with MQTT+I2C after boot
     this.pingTimer = setInterval(() => {
       this._send({ type: 'ping', ts: Date.now() });
 
-      // Kiểm tra pong timeout (15 giây — ESP32 cần serialize
-      // telemetry 8KB + lidar JSON + grid 20KB + ICP + PID, dễ bị trễ khi lái)
-      if (Date.now() - this.lastPong > 15000 && this.connected) {
+      // Grace period: Skip pong checks for first 25s after connection.
+      // ESP32 main loop blocks ~2s during MQTT broker connect + I2C OLED/INA reads,
+      // starving webSocket.loop() and preventing pong responses.
+      const sinceConnect = Date.now() - this._connectTime;
+      if (sinceConnect < 25000) return;
+
+      // Kiểm tra pong timeout (20 giây — ESP32 cần serialize
+      // telemetry 8KB + lidar JSON + grid 20KB + ICP + PID + MQTT keepalive)
+      if (Date.now() - this.lastPong > 20000 && this.connected) {
         this.missedPongs++;
         console.warn(`[Robot ${this.name}] Pong timeout #${this.missedPongs}`);
         
