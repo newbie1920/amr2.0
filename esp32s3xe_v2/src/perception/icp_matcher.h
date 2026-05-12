@@ -36,12 +36,12 @@ public:
 
         float tx = initGuess.x, ty = initGuess.y, theta = initGuess.theta;
 
-        ScanPt work[ICP_MAX_PTS];
+        static ScanPt work[ICP_MAX_PTS]; // static — saves ~2.8KB stack
         memcpy(work, _qry, nQry * sizeof(ScanPt));
         applyTransform(work, nQry, tx, ty, theta);
 
         for (int iter = 0; iter < ICP_MAX_ITER; iter++) {
-            ScanPt srcPts[ICP_MAX_PTS], dstPts[ICP_MAX_PTS];
+            static ScanPt srcPts[ICP_MAX_PTS], dstPts[ICP_MAX_PTS]; // static — saves ~5.6KB stack
             int nPairs = 0;
 
             for (int i = 0; i < nQry; i++) {
@@ -82,7 +82,7 @@ public:
         toCartesian(curr, currLen, _qry, nQry);
         if (nRef < 5 || nQry < 5) return -1.0f;
 
-        ScanPt work[ICP_MAX_PTS];
+        static ScanPt work[ICP_MAX_PTS]; // static — saves ~2.8KB stack
         memcpy(work, _qry, nQry * sizeof(ScanPt));
         applyTransform(work, nQry, correction.x, correction.y, correction.theta);
 
