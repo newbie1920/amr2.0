@@ -33,7 +33,15 @@ float battery_read_raw() {
 }
 
 void battery_update() {
-    float raw = battery_read_raw();
+    float raw;
+
+    // Prefer INA3221 battery channel (accurate bus voltage measurement)
+    if (state.power.inaAvailable && state.power.busV[INA_CH_BATT] > 1.0f) {
+        raw = state.power.busV[INA_CH_BATT];
+    } else {
+        // Fallback to ADC voltage divider
+        raw = battery_read_raw();
+    }
 
     // Sanity check — ignore obviously bad readings
     if (raw < 1.0f || raw > 20.0f) return;

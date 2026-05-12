@@ -145,13 +145,14 @@ void loop() {
     static unsigned long lastSlowUpdate = 0;
     if (millis() - lastSlowUpdate > 500) {
         lastSlowUpdate = millis();
-        battery_update();
-        ina3221_read();
 
+        // Read INA3221 FIRST → then update battery from INA voltage
+        ina3221_read();
         for (int i = 0; i < 3; i++) {
             state.power.busV[i]     = ina_busV[i];
             state.power.currentA[i] = ina_currentA[i];
         }
+        battery_update();  // Now uses fresh INA3221 busV[INA_CH_BATT]
     }
 
     oled_update();  // I2C OLED (~30-50ms) — now AFTER telemetry, won't delay data
