@@ -412,11 +412,32 @@ void send_occupancy_grid() {
 }
 
 // ============================================================
-//   TELEMETRY BROADCAST
+//   TELEMETRY BROADCAST — Split fast/slow for real-time
 // ============================================================
-void broadcast_telemetry() {
-    if (millis() - lastTelemetryTime < TELEMETRY_INTERVAL) return;
-    lastTelemetryTime = millis();
+
+// Fast pose: binary 0x05 + 5 floats = 21 bytes, 20Hz
+// No JSON, no MsgPack — raw memcpy for <1ms serialize time
+static void broadcast_fast_pose() {
+    PoseSnapshot op = getOdomPose();
+    float vL = state.motor.vL_meas, vR = state.motor.vR_meas;
+    float v_robot = (vR + vL) / 2.0f * WHEEL_RADIUS;
+    float w_fused = (state.imu.available && state.imu.calibrated)
+                    ? state.imu.gyroZ_raw
+                    : (vR - vL) * WHEEL_RADIUS / WHEEL_SEPARATION;
+
+    static uint8_t poseBuf[1 + 5 * 4 + 1];  // 0x05 + 5 floats + batt% = 22 bytes
+    poseBuf[0] = 0x05;
+    float pose[5] = { op.x, op.y, op.theta, v_robot, w_fused };
+    memcpy(&poseBuf[1], pose, 20);
+    poseBuf[21] = (uint8_t)state.power.percent;  // Battery 0-100
+    webSocket.broadcastBIN(poseBuf, 22);
+}
+
+// Full telemetry: MsgPack 0x02, 2Hz (500ms) — all diagnostics
+static unsigned long lastFullTelemTime = 0;
+static void broadcast_full_telemetry() {
+    if (millis() - lastFullTelemTime < 500) return;  // 2Hz
+    lastFullTelemTime = millis();
 
     JsonDocument telem;
     telem["telem"] = true;
@@ -485,11 +506,11 @@ void broadcast_telemetry() {
         pwr["motorV"] = state.power.busV[INA_CH_MOTOR]; pwr["motorA"] = state.power.currentA[INA_CH_MOTOR];
     }
 
-    // LiDAR — obstacle flag only (LiDAR data sent as separate binary frame)
+    // LiDAR — obstacle flag only
     bool hasObs = state.lidar.obstacleDetected && millis() - state.lidar.lastObstacleTime < 500;
     telem["obs"] = hasObs;
 
-    // Send as MsgPack binary (0x02 prefix) — ~2KB without LiDAR
+    // Send as MsgPack binary (0x02 prefix)
     static uint8_t telemBuf[2048];
     telemBuf[0] = 0x02;
     size_t reqLen = measureMsgPack(telem);
@@ -498,19 +519,30 @@ void broadcast_telemetry() {
         len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
     }
     if (len > 0) webSocket.broadcastBIN(telemBuf, len + 1);
+}
 
-    // LiDAR binary broadcast (10Hz, compact: 0x04 + 360 × uint16 = 721 bytes)
-    static uint8_t lidarBuf[1 + 360 * 2];  // 721 bytes
-    lidarBuf[0] = 0x04;  // Type: LIDAR_SCAN
+void broadcast_telemetry() {
+    if (millis() - lastTelemetryTime < TELEMETRY_INTERVAL) return;
+    lastTelemetryTime = millis();
+
+    // ── FAST: Binary pose every tick (20Hz, 22 bytes, <1ms) ──
+    broadcast_fast_pose();
+
+    // ── SLOW: Full MsgPack telemetry at 2Hz (500ms) ──
+    broadcast_full_telemetry();
+
+    // ── LiDAR binary (20Hz, 721 bytes) ──
+    static uint8_t lidarBuf[1 + 360 * 2];
+    lidarBuf[0] = 0x04;
     uint16_t* lidarData = (uint16_t*)&lidarBuf[1];
     for (int i = 0; i < 360; i++) {
-        lidarData[i] = state.lidar.distances[i];  // uint16 mm, LE native
+        lidarData[i] = state.lidar.distances[i];
     }
     webSocket.broadcastBIN(lidarBuf, sizeof(lidarBuf));
 
-    // Grid broadcast (5Hz)
+    // Grid broadcast (2Hz)
     static unsigned long lastGridSendTime = 0;
-    if (state.nav.streamOccupancyGrid && millis() - lastGridSendTime > 200) {
+    if (state.nav.streamOccupancyGrid && millis() - lastGridSendTime > 500) {
         lastGridSendTime = millis();
         send_occupancy_grid();
     }

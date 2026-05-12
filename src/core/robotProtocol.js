@@ -463,6 +463,9 @@ export class RobotConnection {
     } else if (firstByte === 0x04) {
       // Compact binary LiDAR scan: 0x04 + 360 × uint16_t (LE) = 721 bytes
       this._handleBinaryLidar(buffer);
+    } else if (firstByte === 0x05) {
+      // Fast binary pose: 0x05 + 5 floats (x,y,theta,vx,wz) + batt% = 22 bytes
+      this._handleFastPose(buffer);
     } else {
       // MessagePack thuần (không có marker) hoặc legacy MsgPack
       this._handleMsgPackMessage(buffer);
@@ -561,6 +564,44 @@ export class RobotConnection {
       });
     } catch (err) {
       console.error(`[Robot ${this.name}] Error parsing binary message:`, err);
+    }
+  }
+
+  /**
+   * Handle fast binary pose (type 0x05) — ULTRA LOW LATENCY
+   * Format: 0x05 + float32[5]{x, y, theta, vx, wz} + uint8 batt = 22 bytes
+   * No MsgPack decode, no object creation — direct DataView reads
+   * Updates telemetry position fields immediately and fires onTelemetry
+   */
+  _handleFastPose(buffer) {
+    if (buffer.byteLength < 22) return;
+
+    const view = new DataView(buffer);
+    const x = view.getFloat32(1, true);
+    const y = view.getFloat32(5, true);
+    const theta = view.getFloat32(9, true);
+    const vx = view.getFloat32(13, true);
+    const wz = view.getFloat32(17, true);
+    const batt = view.getUint8(21);
+
+    // Direct telemetry patch — skip _processTelemetryData entirely
+    if (this.telemetry) {
+      this.telemetry.x = x;
+      this.telemetry.y = y;
+      this.telemetry.heading = theta * 180 / Math.PI;
+      this.telemetry.headingRad = theta;
+      this.telemetry.linearVel = vx;
+      this.telemetry.angularVel = wz;
+      this.telemetry.battery = batt;
+    }
+
+    // Heartbeat
+    this.lastPong = Date.now();
+    this.missedPongs = 0;
+
+    // Fire callback immediately — UI updates within same frame
+    if (this.onTelemetry) {
+      this.onTelemetry(this.telemetry);
     }
   }
 
