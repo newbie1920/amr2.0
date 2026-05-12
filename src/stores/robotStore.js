@@ -68,21 +68,25 @@ const useRobotStore = create((set, get) => ({
   // ============================================================
 
   loadStoredRobots: () => {
+    // Guard against React StrictMode double-mount
+    if (get()._storedRobotsLoaded) return;
+    set({ _storedRobotsLoaded: true });
+
     const saved = JSON.parse(localStorage.getItem('amr_robots') || '[]');
     saved.forEach((r) => {
       if (!get().robots[r.id]) {
         get().addRobot(r.name, r.ip, r.port, r.id);
       }
     });
-    // Auto-connect stored robots (no MQTT needed — ESP32 IP is saved in localStorage)
+    // Auto-connect stored robots
     setTimeout(() => {
       Object.values(get().robots).forEach((r) => {
-        if (r.status !== 'connected' && r.ip && !r.ip.startsWith('sim://')) {
+        if (r.status === 'disconnected' && r.ip && !r.ip.startsWith('sim://')) {
           console.log(`[robotStore] Auto-connecting stored robot: ${r.name} @ ${r.ip}:${r.port}`);
           get().connectRobot(r.id);
         }
       });
-    }, 1000); // Small delay to let UI render first
+    }, 1000);
   },
 
   // ── Navigation actions migrated to navStore.js ──

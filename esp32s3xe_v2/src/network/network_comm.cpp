@@ -73,6 +73,25 @@ void setArchitectureProfile(const char* profile) {
 
 // ── WebSocket Event Handler ─────────────────────────────────
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+    // ── Client connect/disconnect — evict stale slots from same IP ──
+    if (type == WStype_CONNECTED) {
+        IPAddress newIP = webSocket.remoteIP(num);
+        LOG_I("WS", "Client #%d connected from %s", num, newIP.toString().c_str());
+
+        // Evict any OTHER client with the same IP (stale slot from previous session)
+        for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+            if (i != num && webSocket.remoteIP(i) == newIP) {
+                LOG_W("WS", "Evicting stale client #%d (same IP: %s)", i, newIP.toString().c_str());
+                webSocket.disconnect(i);
+            }
+        }
+        return;
+    }
+    if (type == WStype_DISCONNECTED) {
+        LOG_I("WS", "Client #%d disconnected", num);
+        return;
+    }
+
     // Binary MAP_DATA frame
     if (type == WStype_BIN && length > 0 && payload[0] == 0x03) {
         const size_t HEADER_SIZE = 13;
@@ -352,7 +371,8 @@ void init_network() {
     // After abnormal disconnect (code 1006), the old client slot stays occupied
     // and blocks new connections (max 5 slots). This sends WS ping every 10s,
     // expects pong within 3s, and evicts after 2 consecutive misses.
-    webSocket.enableHeartbeat(10000, 3000, 2);
+    // Heartbeat: 5s ping, 2s pong timeout, 1 miss = evict after 7s max
+    webSocket.enableHeartbeat(5000, 2000, 1);
     server.begin();
 
     // NOTE: Do NOT add loopTask to WDT.

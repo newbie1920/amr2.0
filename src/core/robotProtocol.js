@@ -172,8 +172,12 @@ export class RobotConnection {
     this._stopPing();
 
     if (this.ws) {
+      this._suppressReconnect = true;
+      this.ws.onclose = null;  // Detach to prevent auto-reconnect
+      this.ws.onerror = null;
       this.ws.close();
       this.ws = null;
+      this._suppressReconnect = false;
     }
     this.connected = false;
   }
