@@ -525,7 +525,15 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
               label={robot.name}
               hasObs={robot.telemetry.obs || false}
             />
-            {/* WorldLidarPoints removed — LaserScanOverlay already renders lidar */}
+            {/* Lidar points in world coordinates — pass 2D coords + theta */}
+            <WorldLidarPoints
+              robotX2D={robot.telemetry.x}
+              robotY2D={robot.telemetry.y}
+              robotTheta={theta2D}
+              lidar={robot.telemetry.lidar || []}
+              warehouseCX={cx}
+              warehouseCZ={cz}
+            />
           </React.Fragment>
         );
       })}

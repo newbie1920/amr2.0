@@ -392,7 +392,7 @@ export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, r
 
   // 1. Mũi tên Odometry (xanh dương lớn)
   if (odomTheta !== null && odomTheta !== undefined) {
-    const odomScreenAngle = -odomTheta; // Y is flipped
+    const odomScreenAngle = -(odomTheta + Math.PI); // Y flipped + 180° heading correction
     const odomArrowX = s.x + Math.cos(odomScreenAngle) * arrowLen;
     const odomArrowY = s.y + Math.sin(odomScreenAngle) * arrowLen;
 
@@ -420,7 +420,7 @@ export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, r
   }
 
   // 2. Mũi tên Heading Corrected/Filtered (đỏ lớn)
-  const screenAngle = -robotTheta; // Y is flipped
+  const screenAngle = -(robotTheta + Math.PI); // Y flipped + 180° heading correction
   const arrowX = s.x + Math.cos(screenAngle) * arrowLen;
   const arrowY = s.y + Math.sin(screenAngle) * arrowLen;
 
