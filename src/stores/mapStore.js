@@ -247,6 +247,19 @@ const useMapStore = create((set, get) => ({
         const odomY = telem.y ?? 0;
         const odomTheta = headingDeg * Math.PI / 180;
 
+        // ── REAL ROBOT: ESP32 sends pre-built grid via binary WS (onLidarGrid).
+        //    Browser MUST NOT also run updateFromScan — two maps fighting = flicker + rotation.
+        //    Only SIM/HITL robots need browser-side scan integration.
+        const isRealRobot = !(isHitl || isSim);
+        if (isRealRobot) {
+          // Real robot: ESP32 grid is single source of truth.
+          // Just update robot pose on the existing grid for visualization.
+          grid.robotX = odomX;
+          grid.robotY = odomY;
+          grid.robotHeading = odomTheta;
+          return; // Skip browser scan integration entirely
+        }
+
         let mapX, mapY, mapTheta;
         if (isHitl || isSim) {
           // HITL & SIM: telem pose IS ground-truth.
@@ -256,8 +269,6 @@ const useMapStore = create((set, get) => ({
           mapTheta = odomTheta;
         } else if (telem.slamMapX != null && telem.slamMapY != null && telem.slamMapTheta != null) {
           // REAL robot with active SLAM: use firmware's ICP-corrected map pose.
-          // This matches the pose used by ESP32's send_occupancy_grid(),
-          // preventing the mismatch that causes map ghosting/drift.
           mapX = telem.slamMapX;
           mapY = telem.slamMapY;
           mapTheta = telem.slamMapTheta;
@@ -298,8 +309,7 @@ const useMapStore = create((set, get) => ({
           });
         }
 
-        // Always integrate scans into grid (passive mapping)
-        // Map builds continuously — SLAM button only controls auto-exploration
+        // SIM/HITL: integrate scans into grid (browser-side mapping)
         grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
 
         if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {

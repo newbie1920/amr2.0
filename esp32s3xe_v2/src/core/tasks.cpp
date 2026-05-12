@@ -189,6 +189,12 @@ void lidarTask(void* pvParameters) {
         icpPrevScan = (LidarPoint*)malloc(360 * sizeof(LidarPoint));
         LOG_I("SLAM", "ICP buffer allocated in SRAM");
     }
+    // Initialize ICP matcher buffers (PSRAM-backed)
+    if (icpMatcher.init()) {
+        LOG_I("SLAM", "ICP matcher initialized (PSRAM: %s)", psramFound() ? "yes" : "no");
+    } else {
+        LOG_E("SLAM", "ICP matcher init FAILED — no memory!");
+    }
 
     for (;;) {
         if (state.nav.hitlMode) {

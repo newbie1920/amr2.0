@@ -1,7 +1,7 @@
 /**
  * AMR 2.0 — ICP Scan Matcher (v2)
  * Iterative Closest Point (Point-to-Point) with closed-form 2D solution.
- * Header-only, zero malloc, static buffers.
+ * Header-only, PSRAM-backed buffers, zero heap fragmentation.
  */
 
 #ifndef ICP_MATCHER_H
@@ -24,11 +24,35 @@ public:
     struct Pose2D { float x, y, theta; };
     struct ScanPt { float x, y; };
 
+    // Must call init() before first use — allocates PSRAM buffers
+    bool init() {
+        if (_initialized) return true;
+        size_t ptSize = sizeof(ScanPt);
+        // Try PSRAM first, fallback to heap
+        if (psramFound()) {
+            _ref    = (ScanPt*)ps_malloc(ICP_MAX_PTS * ptSize);
+            _qry    = (ScanPt*)ps_malloc(ICP_MAX_PTS * ptSize);
+            _work   = (ScanPt*)ps_malloc(ICP_MAX_PTS * ptSize);
+            _srcPts = (ScanPt*)ps_malloc(ICP_MAX_PTS * ptSize);
+            _dstPts = (ScanPt*)ps_malloc(ICP_MAX_PTS * ptSize);
+        } else {
+            _ref    = (ScanPt*)malloc(ICP_MAX_PTS * ptSize);
+            _qry    = (ScanPt*)malloc(ICP_MAX_PTS * ptSize);
+            _work   = (ScanPt*)malloc(ICP_MAX_PTS * ptSize);
+            _srcPts = (ScanPt*)malloc(ICP_MAX_PTS * ptSize);
+            _dstPts = (ScanPt*)malloc(ICP_MAX_PTS * ptSize);
+        }
+        _initialized = (_ref && _qry && _work && _srcPts && _dstPts);
+        return _initialized;
+    }
+
     bool match(
         const LidarPoint* prev, int prevLen,
         const LidarPoint* curr, int currLen,
         const Pose2D& initGuess, Pose2D& result)
     {
+        if (!_initialized) return false;
+
         int nRef = 0, nQry = 0;
         toCartesian(prev, prevLen, _ref, nRef);
         toCartesian(curr, currLen, _qry, nQry);
@@ -36,28 +60,26 @@ public:
 
         float tx = initGuess.x, ty = initGuess.y, theta = initGuess.theta;
 
-        static ScanPt work[ICP_MAX_PTS]; // static — saves ~2.8KB stack
-        memcpy(work, _qry, nQry * sizeof(ScanPt));
-        applyTransform(work, nQry, tx, ty, theta);
+        memcpy(_work, _qry, nQry * sizeof(ScanPt));
+        applyTransform(_work, nQry, tx, ty, theta);
 
         for (int iter = 0; iter < ICP_MAX_ITER; iter++) {
-            static ScanPt srcPts[ICP_MAX_PTS], dstPts[ICP_MAX_PTS]; // static — saves ~5.6KB stack
             int nPairs = 0;
 
             for (int i = 0; i < nQry; i++) {
                 float minDist;
-                int j = nearestNeighbor(work[i], _ref, nRef, minDist);
+                int j = nearestNeighbor(_work[i], _ref, nRef, minDist);
                 if (j < 0 || minDist > ICP_MAX_DIST_M) continue;
-                srcPts[nPairs] = work[i];
-                dstPts[nPairs] = _ref[j];
+                _srcPts[nPairs] = _work[i];
+                _dstPts[nPairs] = _ref[j];
                 nPairs++;
             }
             if (nPairs < ICP_MIN_PAIRS) break;
 
             float dTx, dTy, dTheta;
-            if (!solveClosed2D(srcPts, dstPts, nPairs, dTx, dTy, dTheta)) break;
+            if (!solveClosed2D(_srcPts, _dstPts, nPairs, dTx, dTy, dTheta)) break;
 
-            applyTransform(work, nQry, dTx, dTy, dTheta);
+            applyTransform(_work, nQry, dTx, dTy, dTheta);
 
             float cosD = cosf(dTheta), sinD = sinf(dTheta);
             float newTx = tx * cosD - ty * sinD + dTx;
@@ -77,26 +99,32 @@ public:
         const LidarPoint* curr, int currLen,
         const Pose2D& correction)
     {
+        if (!_initialized) return -1.0f;
+
         int nRef = 0, nQry = 0;
         toCartesian(prev, prevLen, _ref, nRef);
         toCartesian(curr, currLen, _qry, nQry);
         if (nRef < 5 || nQry < 5) return -1.0f;
 
-        static ScanPt work[ICP_MAX_PTS]; // static — saves ~2.8KB stack
-        memcpy(work, _qry, nQry * sizeof(ScanPt));
-        applyTransform(work, nQry, correction.x, correction.y, correction.theta);
+        memcpy(_work, _qry, nQry * sizeof(ScanPt));
+        applyTransform(_work, nQry, correction.x, correction.y, correction.theta);
 
         float sumSq = 0; int count = 0;
         for (int i = 0; i < nQry; i++) {
             float d;
-            int j = nearestNeighbor(work[i], _ref, nRef, d);
+            int j = nearestNeighbor(_work[i], _ref, nRef, d);
             if (j >= 0 && d < ICP_MAX_DIST_M) { sumSq += d * d; count++; }
         }
         return (count > 0) ? sqrtf(sumSq / count) : -1.0f;
     }
 
 private:
-    ScanPt _ref[ICP_MAX_PTS], _qry[ICP_MAX_PTS];
+    bool _initialized = false;
+    ScanPt* _ref = nullptr;
+    ScanPt* _qry = nullptr;
+    ScanPt* _work = nullptr;
+    ScanPt* _srcPts = nullptr;
+    ScanPt* _dstPts = nullptr;
 
     static void toCartesian(const LidarPoint* scan, int len, ScanPt* out, int& outLen) {
         outLen = 0;

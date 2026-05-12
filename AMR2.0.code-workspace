@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "esp32s3xe",
+			"path": "../../Users/ADMIN/Documents/PlatformIO/Projects/esp32s3xe"
+		}
+	],
+	"settings": {}
+}
