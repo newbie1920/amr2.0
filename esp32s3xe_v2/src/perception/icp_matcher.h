@@ -14,10 +14,10 @@
 
 // ── Config ───────────────────────────────────────────────────
 #define ICP_MAX_PTS      360
-#define ICP_MAX_ITER     10
+#define ICP_MAX_ITER     15       // was 10 — more iterations for convergence
 #define ICP_EPSILON      1e-4f
-#define ICP_MAX_DIST_M   0.4f
-#define ICP_MIN_PAIRS    20
+#define ICP_MAX_DIST_M   0.25f   // was 0.4 — stricter matching, fewer outliers
+#define ICP_MIN_PAIRS    15      // was 20 — allow sparser scans
 
 class IcpMatcher {
 public:

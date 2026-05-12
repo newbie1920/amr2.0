@@ -257,12 +257,10 @@ void lidarTask(void* pvParameters) {
                 gridMapper.update_grid();
                 state.lidar.lastGridUpdateTime = millis();
 
-                // ── ICP scan matching ────────────────────
+                // ── ICP scan matching (always runs — no motor guard) ──
                 if (icpPrevScan != nullptr &&
                     !icpFirstScan &&
-                    icpPrevLen > 0 &&
-                    (fabsf(state.motor.targetLeftVel) > 0.01f ||
-                     fabsf(state.motor.targetRightVel) > 0.01f)) {
+                    icpPrevLen > 0) {
 
                     IcpMatcher::Pose2D initGuess = {localDx, localDy, odomDTheta};
                     IcpMatcher::Pose2D correction;
@@ -283,7 +281,7 @@ void lidarTask(void* pvParameters) {
                         float errMapX = errX * cosMap - errY * sinMap;
                         float errMapY = errX * sinMap + errY * cosMap;
 
-                        const float ICP_WEIGHT = 0.4f;
+                        const float ICP_WEIGHT = 0.65f;
                         updateTf(errMapX, errMapY, errT, ICP_WEIGHT);
 
                         state.slam.icpRms = icpMatcher.computeRMS(
