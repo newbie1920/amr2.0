@@ -93,8 +93,23 @@ export class RobotConnection {
   // ============================================================
 
   connect() {
+    // Cancel any pending reconnect to prevent race conditions
+    clearTimeout(this.reconnectTimer);
+    this.reconnecting = false;
+
+    // Debounce: if a WS is already CONNECTING, don't create another one
+    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) {
+      console.log(`[Robot ${this.name}] Already connecting/connected, skipping duplicate connect()`);
+      return;
+    }
+
+    // Close any stale WS (CLOSING or CLOSED state) without triggering reconnect
     if (this.ws) {
+      this._suppressReconnect = true;
+      this.ws.onclose = null; // Detach old handler to prevent reconnect loop
+      this.ws.onerror = null;
       this.ws.close();
+      this._suppressReconnect = false;
     }
 
     const url = `ws://${this.ip}:${this.port}/`;
@@ -124,13 +139,15 @@ export class RobotConnection {
 
         if (this.onDisconnect) this.onDisconnect();
 
-        // Auto reconnect
-        if (!this.reconnecting) {
+        // Auto reconnect (only if not suppressed by a new connect() call)
+        if (!this.reconnecting && !this._suppressReconnect) {
           this._scheduleReconnect();
         }
       };
 
       this.ws.onerror = (err) => {
+        // Don't log noisy errors for expected failures during reconnect
+        if (this.ws?.readyState === WebSocket.CLOSED) return;
         console.error(`[Robot ${this.name}] Lỗi WebSocket:`, err);
         if (this.onError) this.onError(err);
       };
@@ -443,6 +460,9 @@ export class RobotConnection {
     } else if (firstByte === 0x02) {
       // MessagePack telemetry với type marker — skip byte đầu
       this._handleMsgPackMessage(buffer.slice(1));
+    } else if (firstByte === 0x04) {
+      // Compact binary LiDAR scan: 0x04 + 360 × uint16_t (LE) = 721 bytes
+      this._handleBinaryLidar(buffer);
     } else {
       // MessagePack thuần (không có marker) hoặc legacy MsgPack
       this._handleMsgPackMessage(buffer);
@@ -545,6 +565,36 @@ export class RobotConnection {
   }
 
   /**
+   * Handle compact binary LiDAR scan (type 0x04)
+   * Format: 0x04 + 360 × uint16_t (Little-Endian) = 721 bytes
+   * Each uint16 = distance in mm at angle index (0°-359°)
+   * Converts to [{a, d}] array compatible with existing mapping pipeline
+   */
+  _handleBinaryLidar(buffer) {
+    const expected = 1 + 360 * 2; // 721 bytes
+    if (buffer.byteLength < expected) return;
+
+    const view = new DataView(buffer);
+    const lidarPoints = [];
+
+    for (let i = 0; i < 360; i++) {
+      const d = view.getUint16(1 + i * 2, true); // LE, offset past 0x04 byte
+      if (d > 0 && d < 6000) {
+        lidarPoints.push({ a: i, d });
+      }
+    }
+
+    // Update telemetry.lidar directly (real-time, bypasses telemetry cycle)
+    if (this.telemetry) {
+      this.telemetry.lidar = lidarPoints;
+    }
+
+    // Also count as heartbeat — we're receiving data
+    this.lastPong = Date.now();
+    this.missedPongs = 0;
+  }
+
+  /**
    * Xử lý telemetry data (shared giữa JSON và MsgPack paths)
    * DRY: Cả 2 luồng decode đều gọi hàm này.
    */
@@ -582,8 +632,9 @@ export class RobotConnection {
       motorV: data.power?.motorV ?? this.telemetry.motorV,
       motorA: data.power?.motorA ?? this.telemetry.motorA,
       obs: data.obs ?? this.telemetry.obs,
-      // Lidar scan data (raw pass-through for mapping)
-      lidar: data.lidar || [],
+      // Lidar scan data — now arrives separately via binary 0x04 frame
+      // Keep previous value; binary handler updates this field directly
+      lidar: data.lidar || this.telemetry.lidar || [],
       // HITL mode
       hitl: data.hitl ?? this.telemetry.hitl,
       slam: data.slam ?? this.telemetry.slam,
@@ -647,15 +698,15 @@ export class RobotConnection {
       const sinceConnect = Date.now() - this._connectTime;
       if (sinceConnect < 25000) return;
 
-      // Kiểm tra pong timeout (20 giây — ESP32 cần serialize
-      // telemetry 8KB + lidar JSON + grid 20KB + ICP + PID + MQTT keepalive)
-      if (Date.now() - this.lastPong > 20000 && this.connected) {
+      // Kiểm tra pong timeout (30 giây — ESP32 bị block bởi I2C OLED/INA3221,
+      // MQTT connect (2s), serialize telemetry 8KB + grid 20KB + ICP + PID)
+      if (Date.now() - this.lastPong > 30000 && this.connected) {
         this.missedPongs++;
         console.warn(`[Robot ${this.name}] Pong timeout #${this.missedPongs}`);
         
-        // Cần 3 lần liên tiếp mất pong mới thực sự disconnect
-        // (tăng tolerance cho WiFi hiccup + ESP32 CPU-heavy khi lái)
-        if (this.missedPongs >= 3) {
+        // Cần 5 lần liên tiếp mất pong mới thực sự disconnect
+        // (tăng tolerance cho WiFi hiccup + ESP32 CPU-heavy khi lái + I2C blocking)
+        if (this.missedPongs >= 5) {
           console.error(`[Robot ${this.name}] ${this.missedPongs} consecutive pong misses → disconnecting`);
           this.disconnect();
           this._scheduleReconnect();
@@ -674,13 +725,18 @@ export class RobotConnection {
   }
 
   _scheduleReconnect() {
+    // Prevent stacking multiple reconnect timers
+    clearTimeout(this.reconnectTimer);
     this.reconnecting = true;
-    console.log(`[Robot ${this.name}] Reconnect sau 1 giây...`);
+    // Fast reconnect: 1.5s (ESP32 WebSocket server recovers quickly after TCP drop)
+    const delay = 1500;
+    console.log(`[Robot ${this.name}] Reconnect sau ${delay / 1000}s...`);
     this.reconnectTimer = setTimeout(() => {
       if (this.reconnecting) {
+        this.reconnecting = false; // Reset flag so connect() can proceed
         this.connect();
       }
-    }, 1000);
+    }, delay);
   }
 }
 

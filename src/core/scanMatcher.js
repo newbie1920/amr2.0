@@ -45,12 +45,12 @@ const CSM_CONFIG = {
   likelihoodMaxDist: 0.5,     // Max distance for likelihood contribution (meters)
 
   // Thresholds
-  minTravelDist: 0.15,        // Minimum travel distance before scan matching (tham khảo: minimum_travel_distance: 0.5, nhưng giảm cho robot nhỏ)
-  minTravelHeading: 0.2,      // Minimum heading change before scan matching (rad ≈ 11°)
-  minScanPoints: 30,          // Minimum valid points to perform matching
-  minMatchScore: 0.3,         // Score threshold to accept match (0-1)
-  maxCorrectionDist: 0.25,    // Maximum correction per match (safety)
-  maxCorrectionAngle: 0.12,   // Maximum angle correction (≈7°)
+  minTravelDist: 0.25,        // Tăng: chờ robot đi xa hơn trước khi match (giảm false positive)
+  minTravelHeading: 0.25,     // Tăng: cần xoay >14° mới match lại
+  minScanPoints: 50,          // Tăng: cần đủ data mới match (91pts quá ít → dễ sai)
+  minMatchScore: 0.4,         // Tăng: reject low-quality matches
+  maxCorrectionDist: 0.15,    // Giảm: hạn chế nhảy vị trí mỗi lần match
+  maxCorrectionAngle: 0.05,   // Giảm: ≈3° max/match (was 7° → gây map xoay loạn)
 };
 
 // ============================================================

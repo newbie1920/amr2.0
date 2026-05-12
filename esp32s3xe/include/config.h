@@ -9,7 +9,7 @@
 // ============================================================
 //   SIMULATION CONFIG
 // ============================================================
-#define SIMULATION_MODE true
+#define SIMULATION_MODE false
 
 // ============================================================
 //   PIN MAP — ESP32-S3 N16R8
@@ -46,8 +46,8 @@
 // ============================================================
 //   LIDAR A1M8
 // ============================================================
-#define LIDAR_RX_PIN 16  // Gắn vào TX của Lidar
-#define LIDAR_TX_PIN 17  // Gắn vào RX của Lidar
+#define LIDAR_RX_PIN 18  // ESP32 RX (Gắn vào TX của Lidar)
+#define LIDAR_TX_PIN 3   // ESP32 TX (Gắn vào RX của Lidar)
 #define LIDAR_PWM_PIN 15 // Gắn vào chân quay Motor Lidar
 
 // ============================================================
@@ -106,6 +106,16 @@
 #define WIFI_AP_NAME "AMR_S3_AP"
 #define WEBSOCKET_PORT 81
 #define HTTP_PORT 80
+
+// ============================================================
+//   MQTT AUTO-DISCOVERY
+// ============================================================
+
+#define MQTT_BROKER "broker.hivemq.com"
+#define MQTT_PORT 1883
+#define MQTT_TOPIC_PREFIX "amr2/discovery" // Topic: amr2/discovery/{robotId}
+#define MQTT_HEARTBEAT_MS 30000            // Heartbeat every 30 seconds
+#define MQTT_ROBOT_PREFIX "AMR2_" // Robot ID = AMR2_ + last 6 chars of MAC
 
 // ============================================================
 //   MOTOR INVERSION (Đảo chiều nếu cần)

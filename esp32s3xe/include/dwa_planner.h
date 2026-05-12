@@ -33,7 +33,7 @@
 // ============================================================
 
 struct DwaConfig {
-    float maxSpeedTrans   = 0.15f;   // m/s (match NAV_MAX_LINEAR_VEL)
+    float maxSpeedTrans   = 0.30f;   // m/s (closer to NAV_MAX_LINEAR_VEL 0.40, conservative for DWA)
     float minSpeedTrans   = 0.0f;
     float maxSpeedRot     = 1.5f;    // rad/s
     float maxAccelTrans   = 0.8f;    // m/s²
@@ -89,6 +89,9 @@ static constexpr int INSCRIBED_CELLS = 2;     // 0.2m inscribed radius
 static constexpr float COST_SCALING = 3.0f;   // Exponential decay factor
 static constexpr int8_t OCC_THRESHOLD = 10;   // Log-odds occupied threshold
 
+// Safety: BFS packing uses (y << 8) | x, requires GRID_SIZE <= 256
+static_assert(GRID_SIZE <= 256, "DWA BFS packing requires GRID_SIZE <= 256");
+
 // ============================================================
 //   DWA PLANNER CLASS
 // ============================================================
@@ -119,14 +122,14 @@ public:
         static uint8_t costmapBuf[GRID_SIZE][GRID_SIZE];
         static uint8_t distMap[GRID_SIZE][GRID_SIZE];
         
-        // BFS queue — capped at 4096 to save RAM (8KB). Sufficient for typical maps.
-        static uint16_t bfsQueue[4096];
+        // BFS queue — 16384 covers full grid (GRID_SIZE²=16384)
+        static uint16_t bfsQueue[16384];
 
         memset(costmapBuf, 0, sizeof(costmapBuf));
         memset(distMap, 255, sizeof(distMap)); // 255 = infinity (unvisited)
 
         int qHead = 0, qTail = 0;
-        const int BFS_CAP = 4096;
+        const int BFS_CAP = 16384;
 
         // Seed BFS with all occupied cells
         for (int y = 0; y < GRID_SIZE; y++) {
@@ -196,6 +199,30 @@ public:
         if (millis() - lastLog > 5000) {
             lastLog = millis();
             Serial.printf("[DWA] Costmap built in %lu us, %d BFS entries\n", dt, qHead);
+        }
+    }
+
+    /**
+     * Self-clear costmap trong robot footprint.
+     * Gọi sau buildCostmap(), truyền vị trí robot hiện tại.
+     * Tránh phantom obstacle khi LiDAR phản xạ gần thân robot.
+     * (Ported from navWorker.js self-clear logic)
+     */
+    void clearRobotFootprint(float robotX, float robotY, const OccupancyGridMapper& mapper) {
+        if (!_costmapPtr) return;
+        int rgx = mapper.world_to_grid_x(robotX);
+        int rgy = mapper.world_to_grid_y(robotY);
+        // Footprint = INSCRIBED_CELLS + 1 = 3 cells = 0.3m
+        const int CLEAR_R = INSCRIBED_CELLS + 1;
+        for (int dy = -CLEAR_R; dy <= CLEAR_R; dy++) {
+            for (int dx = -CLEAR_R; dx <= CLEAR_R; dx++) {
+                int nx = rgx + dx, ny = rgy + dy;
+                if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
+                if (dx*dx + dy*dy <= CLEAR_R*CLEAR_R) {
+                    // Cast to non-const static array via pointer offset
+                    _costmapPtr[ny * GRID_SIZE + nx] = 0;
+                }
+            }
         }
     }
 
@@ -304,7 +331,7 @@ public:
 
 private:
     // Pointer to static costmap buffer (set by buildCostmap)
-    const uint8_t* _costmapPtr = nullptr;
+    uint8_t* _costmapPtr = nullptr;
 
     // ── Helpers ──────────────────────────────────────────────
 
@@ -416,31 +443,25 @@ private:
         return false;
     }
 
-    // ── Get circular clearance at position ───────────────────
-    // Uses costmap for fast nearest-obstacle estimation
+    // ── Get circular clearance at position (O(1) via costmap) ────
+    // Uses pre-computed costmap for fast nearest-obstacle estimation
+    // instead of brute-force grid scan. Cost 254=lethal(dist=0), 0=free(dist>=inflate_range)
     float getCircularClearance(float x, float y,
                                const OccupancyGridMapper& mapper) const
     {
         int cx = mapper.world_to_grid_x(x);
         int cy = mapper.world_to_grid_y(y);
-        int scanR = (int)(cfg.preferredClearance / GRID_RESOLUTION) + 1;
-        float best = cfg.preferredClearance + 0.2f;
-
-        for (int dy = -scanR; dy <= scanR; dy++) {
-            for (int dx = -scanR; dx <= scanR; dx++) {
-                int gx = cx + dx;
-                int gy = cy + dy;
-                if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE) continue;
-                // Check the ORIGINAL grid (not costmap) for actual obstacles
-                if (mapper.grid[gy][gx] >= OCC_THRESHOLD) {
-                    float cellDist = hypotf(dx, dy) * GRID_RESOLUTION;
-                    best = fminf(best, cellDist);
-                    // Early exit: if already below stop threshold, no point searching further
-                    if (best < cfg.stopOnClearance) return best;
-                }
-            }
-        }
-        return best;
+        uint8_t cost = getCostmapCost(cx, cy);
+        
+        if (cost >= 254) return 0.0f;       // On top of obstacle
+        if (cost >= 253) return 0.01f;      // Inscribed zone
+        if (cost == 0)   return cfg.preferredClearance + 0.1f; // Free space
+        
+        // Inverse exponential: cost = 252 * exp(-COST_SCALING * distM)
+        // → distM = -ln(cost/252) / COST_SCALING + inscribed_dist
+        float distM = -logf((float)cost / 252.0f) / COST_SCALING;
+        distM += (float)INSCRIBED_CELLS * GRID_RESOLUTION;
+        return distM;
     }
 
     // ── Score a single trajectory ────────────────────────────

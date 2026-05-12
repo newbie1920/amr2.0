@@ -80,7 +80,6 @@ export default function SimControlPanel() {
   const removeSimRobot = useRobotStore((s) => s.removeSimRobot);
   const simEngines = useSimStore((s) => s.simEngines);
   const simInfo = useSimStore((s) => s.simInfo);
-  const simMode = useSimStore((s) => s.simMode);
   const robots = useRobotStore((s) => s.robots);
   const toggleSimPause = useSimStore((s) => s.toggleSimPause);
   const setSimSpeed = useSimStore((s) => s.setSimSpeed);

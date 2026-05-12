@@ -12,6 +12,7 @@
 extern SemaphoreHandle_t i2cMutex;
 extern WebSocketsServer webSocket;
 extern Navigator navigator;
+extern bool lidarReceiving;
 
 #define OLED_INTERVAL 500
 
@@ -48,7 +49,7 @@ void update_oled() {
 
     display.setCursor(0, 16);
     int b_pct = (int)map(constrain(filteredVBatt, BATT_MIN_V, BATT_MAX_V), BATT_MIN_V, BATT_MAX_V, 0, 100);
-    display.printf("Bat:%d%% IMU:%s WS:%d", b_pct, imuAvailable ? "OK" : "--", webSocket.connectedClients());
+    display.printf("B:%d%% I:%s L:%s W:%d", b_pct, imuAvailable ? "OK" : "--", lidarReceiving ? "OK" : "--", webSocket.connectedClients());
 
     display.setCursor(0, 32);
     if (navigator.isNavigating()) {

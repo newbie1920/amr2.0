@@ -2,6 +2,7 @@
 #include "config.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <WiFiManager.h>
@@ -17,6 +18,7 @@
 #include "pathfinder.h"
 #include "frontier_explorer.h"
 #include "slam_diagnostics.h"
+#include "pathfinder_types.h"
 
 extern WebServer server;
 extern WebSocketsServer webSocket;
@@ -40,12 +42,7 @@ extern bool explorationRequested;
 extern SlamDiag slamDiag;
 extern float icpRmsLast;
 
-// Pathfinder task inter-process communication (defined in main.cpp)
-struct GoToRequest {
-    float startX, startY;
-    float goalX,  goalY;
-    float finalHeading;
-};
+// GoToRequest defined in pathfinder_types.h
 extern QueueHandle_t pathfinderQueue;
 
 
@@ -550,7 +547,7 @@ void send_occupancy_grid() {
   idx += 4;
   
   // Robot pose (map frame)
-  float rx = robotX, ry = robotY, rh = robotTheta;
+  float rx = mapX, ry = mapY, rh = mapTheta;
   memcpy(&gridBuffer[idx], &rx, 4);
   idx += 4;
   memcpy(&gridBuffer[idx], &ry, 4);
@@ -718,4 +715,142 @@ void broadcast_telemetry() {
       send_occupancy_grid();
     }
   }
+}
+
+// ============================================================
+//   MQTT AUTO-DISCOVERY
+//   Robot tự quảng bá IP + Port qua MQTT broker
+//   App subscribe để auto-detect + kết nối WebSocket
+// ============================================================
+
+#include <PubSubClient.h>
+
+static WiFiClient mqttWifiClient;
+static PubSubClient mqttClient(mqttWifiClient);
+
+static char mqttRobotId[20]  = "";   // "AMR2_A1B2C3"
+static char mqttTopic[64]    = "";   // "amr2/discovery/AMR2_A1B2C3"
+static char mqttLwtPayload[32] = ""; // Last Will payload
+static unsigned long lastMqttHeartbeat = 0;
+static bool mqttInitialized = false;
+
+/**
+ * Derive unique robot ID from MAC address
+ * Format: AMR2_ + last 6 hex chars of MAC (e.g. AMR2_A1B2C3)
+ */
+static void buildRobotId() {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(mqttRobotId, sizeof(mqttRobotId), "%s%02X%02X%02X",
+             MQTT_ROBOT_PREFIX, mac[3], mac[4], mac[5]);
+    snprintf(mqttTopic, sizeof(mqttTopic), "%s/%s",
+             MQTT_TOPIC_PREFIX, mqttRobotId);
+    Serial.printf("[MQTT] Robot ID: %s\n", mqttRobotId);
+    Serial.printf("[MQTT] Topic: %s\n", mqttTopic);
+}
+
+/**
+ * Publish discovery JSON (retained) so new subscribers get it immediately
+ */
+void mqtt_publish_discovery() {
+    if (!mqttClient.connected()) return;
+
+    // Read battery level for discovery info
+    extern float filteredVBatt;
+    int battPct = constrain((int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
+
+    // Build compact JSON manually (no ArduinoJson overhead for this small payload)
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"port\":%d,"
+        "\"status\":\"online\",\"battery\":%d,\"firmware\":\"2.0\"}",
+        mqttRobotId,
+        mqttRobotId,
+        WiFi.localIP().toString().c_str(),
+        WEBSOCKET_PORT,
+        battPct
+    );
+
+    mqttClient.publish(mqttTopic, payload, true); // retained = true
+}
+
+/**
+ * MQTT callback (currently unused — robot only publishes, doesn't subscribe)
+ */
+static void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    // Reserved for future: remote commands via MQTT
+}
+
+/**
+ * Initialize MQTT client — call after WiFi is connected
+ */
+void init_mqtt() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    buildRobotId();
+
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
+    mqttClient.setKeepAlive(60); // 60 second keepalive
+
+    // Build Last Will payload (offline status)
+    snprintf(mqttLwtPayload, sizeof(mqttLwtPayload),
+        "{\"id\":\"%s\",\"status\":\"offline\"}", mqttRobotId);
+
+    mqttInitialized = true;
+    Serial.printf("[MQTT] Initialized — broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
+}
+
+/**
+ * Maintain MQTT connection + heartbeat — call in loop()
+ */
+void update_mqtt() {
+    if (!mqttInitialized) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    // Reconnect if disconnected
+    if (!mqttClient.connected()) {
+        // Rate-limit reconnect attempts — check BEFORE blocking connect()
+        static unsigned long lastRetry = 0;
+        // Delay first attempt 15s after boot to let FreeRTOS tasks stabilize
+        if (lastRetry == 0 && millis() < 15000) return;
+        if (millis() - lastRetry < 10000) return; // Chờ 10s giữa các lần thử
+        lastRetry = millis();
+
+        Serial.println("[MQTT] Connecting...");
+        // Feed WDT TRƯỚC connect (connect() có thể block 2-4s)
+        esp_task_wdt_reset();
+
+        // Giới hạn TCP socket timeout = 2s (mặc định PubSubClient = 15s, gây WDT!)
+        mqttClient.setSocketTimeout(2);
+        
+        bool ok = mqttClient.connect(
+            mqttRobotId,            // Client ID
+            NULL, NULL,             // No username/password (public broker)
+            mqttTopic,              // LWT topic
+            0,                      // LWT QoS
+            true,                   // LWT retain
+            mqttLwtPayload          // LWT payload: {"id":"...","status":"offline"}
+        );
+
+        // Feed WDT SAU connect (dù thành công hay thất bại)
+        esp_task_wdt_reset();
+
+        if (ok) {
+            Serial.println("[MQTT] Connected! Publishing discovery...");
+            mqtt_publish_discovery();
+            lastMqttHeartbeat = millis();
+        } else {
+            Serial.printf("[MQTT] Connection failed, rc=%d. Retry in 10s\n", mqttClient.state());
+        }
+    }
+
+    // MQTT client loop (handles keepalive + incoming)
+    mqttClient.loop();
+
+    // Heartbeat: re-publish discovery every MQTT_HEARTBEAT_MS
+    if (mqttClient.connected() && millis() - lastMqttHeartbeat >= MQTT_HEARTBEAT_MS) {
+        lastMqttHeartbeat = millis();
+        mqtt_publish_discovery();
+    }
 }

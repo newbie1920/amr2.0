@@ -20,7 +20,7 @@ const L_OCC = 0.9;
 const L_FREE = -0.2; // Giảm sức mạnh xóa bóng ma để giữ vật cản tĩnh
 const L_MIN = -5.0;
 const L_MAX = 10.0; // Tăng giới hạn nhớ để vật cản không bị quên
-const MAX_LIDAR_RANGE_M = 3.0;
+const MAX_LIDAR_RANGE_M = 6.0;   // A1M8 max 12m — cap at 6m for stable mapping
 const MIN_LIDAR_RANGE_M = 0.12;  // Lọc noise thân robot
 
 /** Số cells cách biên khi bắt đầu auto-expand */

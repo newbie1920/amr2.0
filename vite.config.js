@@ -44,6 +44,7 @@ export default defineConfig(async () => ({
           'sim-engine': [
             './src/core/sim/simEngine.js',
             './src/core/sim/simLidar.js',
+            './src/core/sim/simWorker.js',
             './src/core/sim/simWorld.js',
           ],
         },

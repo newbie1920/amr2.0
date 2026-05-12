@@ -102,8 +102,14 @@ void setup() {
     tasks_create();
 
     // ── Layer 4: Network (WiFi + WebSocket + OTA) ────────────
-    init_network();  // Blocking WiFi connect (~15s max) — adds loopTask to WDT when done
-    init_mqtt();     // MQTT auto-discovery
+    init_network();  // Blocking WiFi connect (~15s max)
+
+    // ── Bump loopTask priority ──────────────────────────────
+    // Default Arduino loopTask = priority 1, but lidarTask = 3 on same Core 0.
+    // This starves webSocket.loop() → ESP32 can't accept TCP connections.
+    // Bump to 4 so WebSocket ALWAYS gets CPU time above LiDAR processing.
+    vTaskPrioritySet(NULL, 4);
+    LOG_I("BOOT", "loopTask priority raised to 4 (above lidarTask=3)");
 
     // ── Status LED ───────────────────────────────────────────
     if (state.imu.available && lidarOk) {
@@ -126,12 +132,10 @@ void loop() {
     // NOTE: loopTask is NOT on WDT (see network_comm.cpp).
     // Only controlTask is WDT-monitored (safety-critical motor PID).
 
-    // ── Network update (WebSocket + OTA) ─────────────────────
+    // ── 1. WebSocket — flush incoming pings immediately ──
     update_network();
-    broadcast_telemetry();  // 10Hz telemetry broadcast
-    update_mqtt();          // MQTT keepalive + heartbeat
 
-    // ── Slow driver updates (2Hz) ────────────────────────────
+    // ── 2. I2C blocking operations (OLED + INA3221 + battery) ──────
     static unsigned long lastSlowUpdate = 0;
     if (millis() - lastSlowUpdate > 500) {
         lastSlowUpdate = millis();
@@ -144,18 +148,21 @@ void loop() {
         }
     }
 
-    // ── OLED update (~2Hz) ───────────────────────────────────
-    oled_update();
+    oled_update();  // I2C OLED write (~10-50ms blocking)
+
+    // ── 3. Telemetry broadcast (10Hz, lightweight without LiDAR) ────
+    broadcast_telemetry();
 
     // ── Serial status heartbeat (5s) ─────────────────────────
     static unsigned long lastHeartbeat = 0;
     if (millis() - lastHeartbeat > 5000) {
         lastHeartbeat = millis();
-        LOG_I("LOOP", "Batt:%d%% IMU:%s LiDAR:%s WS:%d Pos:(%.2f,%.2f) h:%.0f Heap:%d",
+        LOG_I("LOOP", "Batt:%d%% IMU:%s LiDAR:%s WS:%d RSSI:%d Pos:(%.2f,%.2f) h:%.0f Heap:%d",
               state.power.percent,
               state.imu.available ? (state.imu.calibrated ? "OK" : "CAL") : "FAIL",
               state.lidar.receiving ? "RUN" : (state.lidar.running ? "WAIT" : "OFF"),
               WiFi.status() == WL_CONNECTED ? 1 : 0,
+              WiFi.RSSI(),
               state.map.x, state.map.y, state.map.theta * 180.0f / PI,
               ESP.getFreeHeap());
     }
@@ -189,5 +196,5 @@ void loop() {
         }
     }
 
-    delay(10);
+    delay(5);  // Reduced from 10ms → 5ms for faster WebSocket servicing
 }

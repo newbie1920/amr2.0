@@ -180,10 +180,38 @@ const useNavStore = create((set, get) => ({
   replanStatus: {},          // { robotId: 'idle' | 'replanning' | 'sent' }
   dwaTrajectories: {},       // { robotId: [{x,y},...] } — DWA chosen trajectory for viz
   robotTrails: {},           // { robotId: [{x,y},...] } — breadcrumb trail history
+  navModes: {},              // { robotId: 'onboard' | 'pc' } — explicit nav mode per robot
 
   // ============================================================
   //   ACTIONS
   // ============================================================
+
+  /**
+   * Set navigation mode for a robot: 'onboard' (ESP32 finds path) or 'pc' (browser A* + DWA)
+   * SimBots are always 'pc' — this is enforced in navigateToGoal.
+   */
+  setNavMode: (robotId, mode) => {
+    if (mode !== 'onboard' && mode !== 'pc') {
+      console.warn(`[NavStore] Invalid navMode: ${mode}`);
+      return;
+    }
+    console.log(`[NavStore] 🧠 NavMode set: ${robotId} → ${mode}`);
+    set((s) => ({
+      navModes: { ...s.navModes, [robotId]: mode },
+    }));
+  },
+
+  /**
+   * Get nav mode for a robot. Defaults: SimBot='pc', Real='onboard'
+   */
+  getNavMode: (robotId) => {
+    const explicit = get().navModes[robotId];
+    if (explicit) return explicit;
+    // Default: Always use PC nav (browser A* + Pure Pursuit)
+    // Browser holds the map → browser computes path → sends cmd_vel
+    // ESP32 onboard nav only when user explicitly switches via UI
+    return 'pc';
+  },
 
   /**
    * Start app-side navigation session (Nav2-style path following)
@@ -662,11 +690,13 @@ const useNavStore = create((set, get) => ({
     if (!isConnected || !path || path.length === 0) return false;
 
     const hasGrid = !!(mapState.mapperInstances[id] || mapState.occupancyGrid[id]);
-    const preferAppNav = robot.telemetry?.architecture === 'pc_slam' || hasGrid;
-    if (preferAppNav) {
+    const navMode = get().getNavMode(id);
+    
+    // Force PC nav for SimBots or explicit 'pc' mode
+    if (navMode === 'pc' || robot._sim) {
       return get().startAppNavigation(id, path, finalHeading);
     }
-    // Fallback: send path directly to ESP32
+    // Onboard: send path directly to ESP32
     if (robot.adapter) {
       robot.adapter.navigate(path, finalHeading);
     } else if (robot.connection) {
@@ -719,8 +749,46 @@ const useNavStore = create((set, get) => ({
       }
     }
 
-    // ── REAL ROBOTS: Phân tán — gửi GOTO cho ESP32 tự tìm đường ──
-    console.log(`[NavStore] 🌐 Giao nhiệm vụ cho ESP32 tự dò đường: ${goalX}, ${goalY}`);
+    // ── REAL ROBOTS: Check explicit navMode ──
+    const navMode = get().getNavMode(robotId);
+    
+    if (navMode === 'pc') {
+      // PC Navigation: Browser computes A* path + Pure Pursuit local planner
+      console.log(`[NavStore] 🖥️ PC Nav mode: browser A* + Pure Pursuit`);
+      const telem = robot.telemetry || {};
+      const startX = telem.x ?? 0;
+      const startY = telem.y ?? 0;
+      const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
+
+      if (!grid) {
+        const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
+        get().startAppNavigation(robotId, path, finalHeading);
+        return { success: true, path };
+      }
+
+      if (!navWorkerApi) {
+        return { success: false, error: 'NavWorker not available' };
+      }
+
+      try {
+        const navSessions = get().appNavigationSessions;
+        const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
+        const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
+        if (result.success && result.path.length > 1) {
+          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints`);
+          get().startAppNavigation(robotId, result.path, finalHeading);
+          return { success: true, path: result.path };
+        } else {
+          return { success: false, error: 'No path found (PC nav)' };
+        }
+      } catch (err) {
+        console.error('[NavStore] PC nav path error:', err);
+        return { success: false, error: err.message };
+      }
+    }
+
+    // Onboard Navigation: Send GOTO command, ESP32 handles A* + DWA internally
+    console.log(`[NavStore] 🌐 Onboard nav: ESP32 tự dò đường: ${goalX.toFixed(2)}, ${goalY.toFixed(2)}`);
     
     if (robot.adapter) {
         robot.adapter.goto(goalX, goalY, finalHeading);

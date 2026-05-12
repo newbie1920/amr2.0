@@ -97,6 +97,13 @@ function App() {
   const loadStoredRobots = useRobotStore((s) => s.loadStoredRobots);
   const simMode = useRobotStore((s) => s.simMode);
   const simInfo = useRobotStore((s) => s.simInfo);
+  const selectedRobotId = useRobotStore((s) => s.selectedRobotId);
+
+  // Determine type of selected robot for context-sensitive UI
+  const selectedRobot = selectedRobotId ? robots[selectedRobotId] : null;
+  const selectedType = selectedRobot?._sim ? 'sim' 
+    : (selectedRobot?.telemetry?.hitl || selectedRobot?.connection?.hitlEnabled) ? 'hitl'
+    : selectedRobot ? 'real' : 'none';
 
   useEffect(() => {
     loadStoredRobots();
@@ -138,7 +145,9 @@ function App() {
           <div>
             <div className="app-header__title">{vi.appTitle}</div>
             <div className="app-header__subtitle">
-              NavTDTU — {simMode ? 'SIM Mode' : 'REAL Mode'}
+              NavTDTU — {selectedRobot 
+                ? `${selectedRobot.name} (${selectedType === 'sim' ? '🏭 SIM' : selectedType === 'hitl' ? '🌐 HITL' : '🔌 REAL'})` 
+                : 'Chưa chọn robot'}
             </div>
           </div>
         </div>
@@ -234,7 +243,10 @@ function App() {
           📐 {vi.warehouse.dimensions}
         </div>
         <div className="app-footer__item">
-          {simMode ? '🏭 GazeboTDTU Physics' : '🔌 WebSocket Protocol'}
+          {selectedType === 'sim' ? '🏭 GazeboTDTU Physics (Browser)' :
+           selectedType === 'hitl' ? '🌐 HITL — ESP32 + Browser Physics' :
+           selectedType === 'real' ? '🔌 ESP32 WebSocket + Sensors' :
+           '⏳ Chờ kết nối robot...'}
         </div>
         {firstSimInfo && (
           <div className="app-footer__item app-footer__sim-info">

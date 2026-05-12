@@ -19,7 +19,6 @@
 #include <ArduinoJson.h>
 #include <WiFiMulti.h>
 #include <Preferences.h>
-#include <PubSubClient.h>
 
 // Navigation modules
 #include "navigator.h"
@@ -348,6 +347,11 @@ void init_network() {
     TelnetStream.begin();
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
+    // Server-side heartbeat: detect and evict stale (half-open) client connections.
+    // After abnormal disconnect (code 1006), the old client slot stays occupied
+    // and blocks new connections (max 5 slots). This sends WS ping every 10s,
+    // expects pong within 3s, and evicts after 2 consecutive misses.
+    webSocket.enableHeartbeat(10000, 3000, 2);
     server.begin();
 
     // NOTE: Do NOT add loopTask to WDT.
@@ -476,18 +480,12 @@ void broadcast_telemetry() {
         pwr["motorV"] = state.power.busV[INA_CH_MOTOR]; pwr["motorA"] = state.power.currentA[INA_CH_MOTOR];
     }
 
-    // LiDAR sparse (every 3° — A1M8 range up to 12m, cap at 6m for map quality)
+    // LiDAR — obstacle flag only (LiDAR data sent as separate binary frame)
     bool hasObs = state.lidar.obstacleDetected && millis() - state.lidar.lastObstacleTime < 500;
     telem["obs"] = hasObs;
-    JsonArray ls = telem["lidar"].to<JsonArray>();
-    for (int i = 0; i < 360; i += 3) {
-        if (state.lidar.distances[i] > 0 && state.lidar.distances[i] < 6000) {
-            JsonObject p = ls.add<JsonObject>(); p["a"] = i; p["d"] = state.lidar.distances[i];
-        }
-    }
 
-    // Send as MsgPack binary (0x02 prefix)
-    static uint8_t telemBuf[8192];
+    // Send as MsgPack binary (0x02 prefix) — ~2KB without LiDAR
+    static uint8_t telemBuf[2048];
     telemBuf[0] = 0x02;
     size_t reqLen = measureMsgPack(telem);
     size_t len = 0;
@@ -495,6 +493,15 @@ void broadcast_telemetry() {
         len = serializeMsgPack(telem, &telemBuf[1], sizeof(telemBuf) - 1);
     }
     if (len > 0) webSocket.broadcastBIN(telemBuf, len + 1);
+
+    // LiDAR binary broadcast (10Hz, compact: 0x04 + 360 × uint16 = 721 bytes)
+    static uint8_t lidarBuf[1 + 360 * 2];  // 721 bytes
+    lidarBuf[0] = 0x04;  // Type: LIDAR_SCAN
+    uint16_t* lidarData = (uint16_t*)&lidarBuf[1];
+    for (int i = 0; i < 360; i++) {
+        lidarData[i] = state.lidar.distances[i];  // uint16 mm, LE native
+    }
+    webSocket.broadcastBIN(lidarBuf, sizeof(lidarBuf));
 
     // Grid broadcast (5Hz)
     static unsigned long lastGridSendTime = 0;
@@ -504,67 +511,4 @@ void broadcast_telemetry() {
     }
 }
 
-// ============================================================
-//   MQTT AUTO-DISCOVERY
-// ============================================================
-static WiFiClient mqttWifiClient;
-static PubSubClient mqttClient(mqttWifiClient);
-static char mqttRobotId[20] = "";
-static char mqttTopic[64] = "";
-static char mqttLwtPayload[32] = "";
-static unsigned long lastMqttHeartbeat = 0;
-static bool mqttInitialized = false;
 
-static void buildRobotId() {
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(mqttRobotId, sizeof(mqttRobotId), "%s%02X%02X%02X", MQTT_ROBOT_PREFIX, mac[3], mac[4], mac[5]);
-    snprintf(mqttTopic, sizeof(mqttTopic), "%s/%s", MQTT_TOPIC_PREFIX, mqttRobotId);
-}
-
-void mqtt_publish_discovery() {
-    if (!mqttClient.connected()) return;
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-        "{\"id\":\"%s\",\"ip\":\"%s\",\"port\":%d,\"status\":\"online\",\"battery\":%d,\"firmware\":\"2.0\"}",
-        mqttRobotId, WiFi.localIP().toString().c_str(), WEBSOCKET_PORT, state.power.percent);
-    mqttClient.publish(mqttTopic, payload, true);
-}
-
-void init_mqtt() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    buildRobotId();
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setKeepAlive(60);
-    snprintf(mqttLwtPayload, sizeof(mqttLwtPayload), "{\"id\":\"%s\",\"status\":\"offline\"}", mqttRobotId);
-    mqttInitialized = true;
-    LOG_I("MQTT", "Initialized — broker: %s:%d, id: %s", MQTT_BROKER, MQTT_PORT, mqttRobotId);
-}
-
-void update_mqtt() {
-    if (!mqttInitialized || WiFi.status() != WL_CONNECTED) return;
-
-    if (!mqttClient.connected()) {
-        static unsigned long lastRetry = 0;
-        if (lastRetry == 0 && millis() < 15000) return;
-        // 30s between retries — connect() blocks up to 2s, starving WebSocket
-        if (millis() - lastRetry < 30000) return;
-        lastRetry = millis();
-        // Flush WebSocket before blocking MQTT connect to prevent pong timeout
-        webSocket.loop();
-        esp_task_wdt_reset();
-        mqttClient.setSocketTimeout(2);
-        bool ok = mqttClient.connect(mqttRobotId, NULL, NULL, mqttTopic, 0, true, mqttLwtPayload);
-        esp_task_wdt_reset();
-        // Immediately service WebSocket after blocking call
-        webSocket.loop();
-        if (ok) { mqtt_publish_discovery(); lastMqttHeartbeat = millis(); }
-    }
-
-    mqttClient.loop();
-
-    if (mqttClient.connected() && millis() - lastMqttHeartbeat >= MQTT_HEARTBEAT_MS) {
-        lastMqttHeartbeat = millis();
-        mqtt_publish_discovery();
-    }
-}

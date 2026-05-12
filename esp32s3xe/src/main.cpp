@@ -8,6 +8,7 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 #include <WiFiManager.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <RPLidar.h>
 #include <Adafruit_NeoPixel.h>
@@ -24,6 +25,7 @@
 #include "frontier_explorer.h"
 #include "slam_diagnostics.h"
 #include "sim_task.h"
+#include "pathfinder_types.h"
 
 // Included Modules
 #include "imu_sensor.h"
@@ -46,11 +48,7 @@ static bool dwaActive = false;
 static float dwaV = 0, dwaW = 0;
 
 // ─── PATHFINDER FREERTOS (decoupled from network ISR) ────────
-struct GoToRequest {
-    float startX, startY;
-    float goalX,  goalY;
-    float finalHeading;  // NAN = don't care
-};
+// GoToRequest defined in pathfinder_types.h
 QueueHandle_t      pathfinderQueue = nullptr; // Main-task sends GOTO here
 SemaphoreHandle_t  pathMutex       = nullptr; // Guards sharedPath r/w
 Waypoint           sharedPath[MAX_WAYPOINTS];
@@ -62,6 +60,7 @@ RPLidar lidar;
 OccupancyGridMapper gridMapper;  // LIDAR-based occupancy grid
 uint16_t lidarDists[360] = {0}; // Lưu khoảng cách (mm) theo từng độ
 bool lidarRunning = false;
+bool lidarReceiving = false;
 bool obstacleDetected = false;
 unsigned long timeObstacleLastDetected = 0;
 unsigned long lastGridUpdateTime = 0;
@@ -153,12 +152,6 @@ void explorationTask(void *pvParameters) {
             continue;
         }
 
-        // Chờ đủ interval
-        if (millis() - lastExploreCheckMs < EXPLORE_CHECK_INTERVAL) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            continue;
-        }
-        lastExploreCheckMs = millis();
 
         // State machine
         switch (frontierExplorer.state) {
@@ -168,8 +161,9 @@ void explorationTask(void *pvParameters) {
 
             case FrontierExplorer::EXPLORE_SCANNING: {
                 float gx, gy;
-                applyTf(); // Ensure map pose is current
-                if (frontierExplorer.findNextGoal(gridMapper, mapX, mapY, gx, gy)) {
+        // Thread-safe: get map pose snapshot instead of calling applyTf() + reading raw globals
+        PoseSnapshot mapSnap = getMapPose();
+        if (frontierExplorer.findNextGoal(gridMapper, mapSnap.x, mapSnap.y, mapSnap.theta, gx, gy)) {
                     GoToRequest req;
                     req.startX = mapX;
                     req.startY = mapY;
@@ -195,7 +189,7 @@ void explorationTask(void *pvParameters) {
                     Serial.println("[EXPLORE] Goal reached — scanning for next frontier");
                     frontierExplorer.state = FrontierExplorer::EXPLORE_SCANNING;
                 } else if (navigator.state == NAV_ERROR || 
-                          (navigator.state == NAV_IDLE && (millis() - exploreNavStartTime > 3000))) {
+                          (navigator.state == NAV_IDLE && (millis() - exploreNavStartTime > NAV_WP_TIMEOUT_MS))) {
                     Serial.println("[EXPLORE] Nav failed or timed out — blacklisting goal");
                     frontierExplorer.blacklistCurrentGoal();
                     frontierExplorer.state = FrontierExplorer::EXPLORE_SCANNING;
@@ -353,6 +347,8 @@ void controlTask(void *pvParameters) {
           float curW = w_fused;
           // BUG #4 FIX: Pre-compute costmap ONCE before DWA sampling (~5ms vs ~180ms)
           dwaPlanner.buildCostmap(gridMapper);
+          // FIX: Self-clear robot footprint to prevent phantom obstacle
+          dwaPlanner.clearRobotFootprint(mapX, mapY, gridMapper);
           DwaResult dwaResult = dwaPlanner.computeVelocity(
             mapX, mapY, mapTheta, curV, curW,
             navigator.waypoints + navigator.currentWpIdx,
@@ -470,6 +466,7 @@ void lidarTask(void *pvParameters) {
     }
 
     if (IS_OK(lidar.waitPoint())) {
+      lidarReceiving = true;
       lidarOkCount++;
       consecutiveFails = 0; // Reset fail counter when we successfully read a point
       float distance = lidar.getCurrentPoint().distance; // distance value in mm
@@ -502,10 +499,12 @@ void lidarTask(void *pvParameters) {
         memcpy(icpCurrentScan, gridMapper.points, icpCurrentLen * sizeof(LidarPoint));
         
         // Track odometry delta between scans (for ICP init guess)
+        // Thread-safe: snapshot odom pose under spinlock
         static float prevOdomX = robotX, prevOdomY = robotY, prevOdomTheta = robotTheta;
-        float odomDx = robotX - prevOdomX;
-        float odomDy = robotY - prevOdomY;
-        float odomDTheta = robotTheta - prevOdomTheta;
+        PoseSnapshot odomSnap = getOdomPose();
+        float odomDx = odomSnap.x - prevOdomX;
+        float odomDy = odomSnap.y - prevOdomY;
+        float odomDTheta = odomSnap.theta - prevOdomTheta;
         
         // Transform global displacement to prevOdom's local frame for ICP init guess
         float cosPrev = cosf(prevOdomTheta);
@@ -579,10 +578,10 @@ void lidarTask(void *pvParameters) {
             icpFirstScan = false;
         }
         
-        // Update prev odom for next delta calculation
-        prevOdomX = robotX;
-        prevOdomY = robotY;
-        prevOdomTheta = robotTheta;
+        // Update prev odom for next delta calculation (thread-safe snapshot)
+        prevOdomX = odomSnap.x;
+        prevOdomY = odomSnap.y;
+        prevOdomTheta = odomSnap.theta;
 
         // ── CSM: Correlative Scan Matching (activates after grid has data) ──
         // CSM uses the occupancy grid directly (likelihood field) → more robust
@@ -629,6 +628,7 @@ void lidarTask(void *pvParameters) {
     } else {
       lidarFailCount++;
       consecutiveFails++;
+      if (consecutiveFails > 10) lidarReceiving = false;
       
       vTaskDelay(pdMS_TO_TICKS(10)); // Tránh spam vòng lặp
       
@@ -636,10 +636,16 @@ void lidarTask(void *pvParameters) {
       if (consecutiveFails > 50) {
         Serial.println("[LIDAR] Mat tin hieu qua lau. Reset Lidar...");
         analogWrite(LIDAR_PWM_PIN, 0); 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        
+        // Stop any ongoing scan and flush buffer before requesting info
+        lidar.stop();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        while(lidarSerial.available()) lidarSerial.read();
+
+        vTaskDelay(pdMS_TO_TICKS(400));
         
         rplidar_response_device_info_t info;
-        if (IS_OK(lidar.getDeviceInfo(info, 100))) {
+        if (IS_OK(lidar.getDeviceInfo(info, 500))) {
             lidar.startScan(); 
             analogWrite(LIDAR_PWM_PIN, 200); // 80% PWM — A1M8 tối ưu
             vTaskDelay(pdMS_TO_TICKS(3000)); // QUAN TRỌNG: Phải chờ 3s để motor đạt tốc độ ổn định trước khi đọc!
@@ -667,7 +673,8 @@ void lidarTask(void *pvParameters) {
             }
             Serial.println("------------------------------------------------------\n");
 
-            lidar.begin(lidarSerial);
+            // Reset UART hardware clean (pointer đã bind từ setup)
+            lidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
             analogWrite(LIDAR_PWM_PIN, 200);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
@@ -724,12 +731,12 @@ void setup() {
   rgbLed.setPixelColor(0, rgbLed.Color(30, 80, 150));
   rgbLed.show();
 
-  // Initialize Lidar — THỨ TỰ QUAN TRỌNG:
-  // 1) Mở serial  2) Bind library  3) Bật motor  4) Chờ motor ổn định  5) startScan
+  // Initialize Lidar — THỨ TỰ:
+  // 1) Config serial pins  2) Bind library  3) Bật motor  4) Chờ ổn định  5) startScan
   pinMode(LIDAR_PWM_PIN, OUTPUT);
   lidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX_PIN, LIDAR_TX_PIN);
   delay(50); // chờ serial ổn định
-  lidar.begin(lidarSerial);
+  lidar.begin(lidarSerial); // Patched: chỉ lưu pointer, không đụng serial config
   
   // Force stop any ongoing scan from previous boot and flush buffer
   lidar.stop();
@@ -791,6 +798,8 @@ void setup() {
   analogSetPinAttenuation(BATT_PIN, ADC_11db);
   pinMode(BATT_PIN, INPUT);
 
+  pinMode(0, INPUT_PULLUP); // BOOT button for WiFi reset
+
   init_encoders();
 
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -811,6 +820,7 @@ void setup() {
   inaAvailable = ina3221_init();
 
   init_network();
+  init_mqtt();  // MQTT auto-discovery — robot broadcasts IP to app
 
   // Initialize hardware watchdog: 5 second timeout, auto-reset on hang
   esp_task_wdt_init(5, true);  // 5s timeout, panic on trigger (auto-reset)
@@ -876,7 +886,34 @@ void loop() {
   // Feed main loop watchdog
   esp_task_wdt_reset();
 
+  // ── XỬ LÝ NÚT BOOT (GPIO 0) ĐỂ RESET WIFI ──
+  if (digitalRead(0) == LOW) {
+    unsigned long startHold = millis();
+    bool resetTriggered = false;
+    while (digitalRead(0) == LOW) {
+      if (millis() - startHold > 3000) {
+        resetTriggered = true;
+        break;
+      }
+      delay(10);
+      esp_task_wdt_reset(); // Keep watchdog happy
+    }
+    
+    if (resetTriggered) {
+      Serial.println("\n[WIFI] BOOT BUTTON HELD! Xoa cau hinh WiFi...");
+      wm.resetSettings(); // Clear WiFiManager credentials
+      Preferences prefs;
+      prefs.begin("wifi_cfg", false);
+      prefs.clear(); // Clear multi-wifi preferences
+      prefs.end();
+      Serial.println("[WIFI] Xoa thanh cong! Xe se khoi dong lai vao che do Setup...");
+      delay(1000);
+      ESP.restart();
+    }
+  }
+
   update_network();
+  update_mqtt();  // MQTT heartbeat + reconnect
   broadcast_telemetry();
   update_oled();
 
@@ -889,7 +926,7 @@ void loop() {
     Serial.printf("  IP:        %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("  IMU:       %s\n", imuAvailable ? "MPU6050 OK" : "KHONG CO");
     Serial.printf("  INA3221:   %s\n", inaAvailable ? "OK" : "KHONG CO");
-    Serial.printf("  Lidar:     %s\n", lidarRunning ? "RUNNING" : "INIT...");
+    Serial.printf("  Lidar:     %s\n", lidarReceiving ? "OK" : (lidarRunning ? "RUNNING" : "INIT..."));
     Serial.printf("  WebSocket: port %d\n", WEBSOCKET_PORT);
     Serial.printf("  Arch:      %s\n", architectureProfile);
     Serial.printf("  Uptime:    %lu ms\n", millis());
@@ -901,10 +938,11 @@ void loop() {
   if(millis() - lastPrint > 10000) {
       lastPrint = millis();
       int battPct = constrain((int)((filteredVBatt - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100), 0, 100);
-      Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
+      Serial.printf("[LOOP] IP:%s | Batt:%d%% | IMU:%s | Lidar:%s | WS:%d | Pos:(%.1f,%.1f) h:%.0f\n",
           WiFi.localIP().toString().c_str(),
           battPct,
           (imuAvailable && gyroCalibrated) ? "OK" : (imuAvailable ? "CAL" : "--"),
+          lidarReceiving ? "OK" : (lidarRunning ? "RUN" : "INIT"),
           webSocket.connectedClients(),
           robotX, robotY, robotTheta * 180.0f / PI);
   }

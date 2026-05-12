@@ -3,7 +3,7 @@
  * Bản đồ kho xưởng 3D sử dụng React Three Fiber
  */
 
-import React, { useMemo, useState, useRef, useEffect, useCallback } from 'react';
+import React, { useMemo, useState, useRef, useCallback } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, Text, Box, Cylinder, Sphere, Edges, Line, Cone } from '@react-three/drei';
 import * as THREE from 'three';
@@ -306,19 +306,20 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
 
   return (
     <group>
-      {/* Floor */}
+      {/* Infinite Floor Grid */}
       <Grid
-        position={[0, 0.01, 0]}
-        args={[WAREHOUSE_WIDTH, WAREHOUSE_HEIGHT]}
+        position={[0, 0, 0]}
+        cellSize={0.5}
         sectionSize={1}
-        cellColor="#1a2533"
-        sectionColor="#243040"
-        fadeDistance={30}
+        cellColor="#2a3a4d"
+        sectionColor="#3b5068"
+        cellThickness={0.8}
+        sectionThickness={1.2}
+        fadeDistance={50}
+        fadeStrength={1.5}
+        infiniteGrid
+        followCamera
       />
-      <mesh receiveShadow position={[0, 0, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[WAREHOUSE_WIDTH, WAREHOUSE_HEIGHT]} />
-        <meshStandardMaterial color={C_FLOOR} />
-      </mesh>
 
       {/* 4 Outer Walls (Low walls for LiDAR) — HIDE in real mode */}
       {mapType === '3d' && !isRealMode && (
@@ -590,13 +591,8 @@ export default function WarehouseMap({ activePath }) {
   const stopMapping = useMapStore((s) => s.stopMapping);
   const saveMap = useMapStore((s) => s.saveMap);
   const loadMap = useMapStore((s) => s.loadMap);
-  const [viewMode, setViewMode] = useState('free'); // 'free', 'top', 'iso'
-  const [mapType, setMapType] = useState('3d'); // '3d', 'lidar'
   const [showMapManager, setShowMapManager] = useState(false);
-  const [showControls, setShowControls] = useState(true);
-  const [layers, setLayers] = useState({ grid: true, laser: true, trail: true, contours: true });
-  const fileInputRef = useRef(null);
-  const toggleLayer = (key) => setLayers(prev => ({ ...prev, [key]: !prev[key] }));
+  const layers = { grid: true, laser: true, trail: true, contours: true };
 
   // Lấy robot đầu tiên nếu chưa chọn
   const activeRobotId = selectedRobotId || Object.keys(robots)[0] || null;
@@ -644,17 +640,9 @@ export default function WarehouseMap({ activePath }) {
     : (activeRobotObj?.telemetry?.hitl || activeRobotObj?.connection?.hitlEnabled) ? 'hitl'
     : activeRobotObj ? 'real' : 'none';
 
-  // Auto-switch mapType based on robot type:
-  // - Real robot (no HITL) → always show LIDAR map (real sensor data)
-  // - Sim robot → show 3D warehouse (sim world)
-  // User can still manually override after auto-switch
-  useEffect(() => {
-    if (dataSource === 'real') {
-      setMapType('lidar');
-    } else if (dataSource === 'sim') {
-      setMapType('3d');
-    }
-  }, [dataSource, activeRobotId]);
+  // Auto mapType: SimBot → 3D warehouse, ESP32 → LiDAR map
+  const mapType = (dataSource === 'sim') ? '3d' : 'lidar';
+  const viewMode = 'free';
 
   return (
     <div className="warehouse-map" style={{ width: '100%', height: '100%', background: C_FLOOR, position: 'relative' }}>
@@ -680,223 +668,6 @@ export default function WarehouseMap({ activePath }) {
         {dataSource === 'none' && '⏳ 3D: Chờ kết nối robot...'}
       </div>
 
-      {/* ── CAMERA & MAP CONTROLS UI ── */}
-      <div style={{ position: 'absolute', top: 16, left: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: '8px', background: 'rgba(15, 25, 35, 0.8)', padding: '10px', borderRadius: '8px', backdropFilter: 'blur(10px)' }}>
-        
-        {/* Nút Ẩn/Hiện Bảng Điều Khiển */}
-        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: showControls ? '0px' : '-8px' }}>
-          <button 
-            className="btn btn--sm btn--ghost" 
-            style={{ padding: '2px 8px', fontSize: '10px', color: '#94a3b8', background: 'rgba(255,255,255,0.05)' }}
-            onClick={() => setShowControls(!showControls)}
-          >
-            {showControls ? '▲ Ẩn bớt' : '▼ Bảng Điều Khiển'}
-          </button>
-        </div>
-
-        {showControls && (
-          <>
-            <div style={{ display: 'flex', gap: '8px' }}>
-              <button 
-                className={`btn btn--sm ${viewMode === 'top' ? 'btn--primary' : 'btn--ghost'}`}
-                onClick={() => setViewMode('top')}
-              >
-                🛰️ 2D Kế hoạch
-              </button>
-              <button 
-                className={`btn btn--sm ${viewMode === 'iso' ? 'btn--primary' : 'btn--ghost'}`}
-                onClick={() => setViewMode('iso')}
-              >
-                🧩 3D Tổng quan
-              </button>
-              <button 
-                className={`btn btn--sm ${viewMode === 'free' ? 'btn--primary' : 'btn--ghost'}`}
-                onClick={() => setViewMode('free')}
-              >
-                👀 3D Tự do
-              </button>
-            </div>
-            
-            <div style={{ display: 'flex', gap: '8px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px' }}>
-               <button 
-                className={`btn btn--sm ${mapType === '3d' ? 'btn--success' : 'btn--ghost'}`}
-                onClick={() => setMapType('3d')}
-                style={{ flex: 1 }}
-                title={dataSource === 'sim' ? 'Kho 3D từ SimEngine (browser)' : 'Kho 3D cố định (layout thật)'}
-              >
-                🏢 {dataSource === 'sim' ? 'Kho 3D (Sim World)' : 'Kho 3D (Layout thật)'}
-              </button>
-              <button 
-                className={`btn btn--sm ${mapType === 'lidar' ? 'btn--success' : 'btn--ghost'}`}
-                onClick={() => setMapType('lidar')}
-                style={{ flex: 1 }}
-                title={dataSource === 'sim' ? 'LiDAR giả lập từ SimEngine' : 'LiDAR từ ESP32 (phần cứng)'}
-              >
-                🔴 {dataSource === 'sim' ? 'Lidar (SimLidar)' : 'Lidar (ESP32)'}
-              </button>
-            </div>
-
-            {/* MAPPING CONTROLS (Chỉ hiện khi ở chế độ Lidar) */}
-            {mapType === 'lidar' && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '8px', marginTop: '4px' }}>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button 
-                    className={`btn btn--sm ${isMapping ? 'btn--danger' : 'btn--primary'}`}
-                    style={{ flex: 1, fontSize: '11px' }}
-                    onClick={handleToggleMapping}
-                    disabled={!activeRobotId}
-                  >
-                    {isMapping ? '⏹ Dừng quét + Lưu map' : '🚀 Bắt đầu quét (Tự lái)'}
-                  </button>
-                </div>
-
-                {/* Exploration Phase Status */}
-                {isMapping && (
-                  <div style={{ 
-                    fontSize: '10px', padding: '4px 8px', borderRadius: '4px',
-                    background: 'rgba(34,197,94,0.15)', color: '#4ade80', 
-                    textAlign: 'center', fontWeight: 600,
-                  }}>
-                    {(() => {
-                      const robot = robots[activeRobotId];
-                      const telem = robot?.telemetry || {};
-                      const isHitl = robot?.connection?.hitlEnabled || telem.hitl;
-
-                      if (isHitl || telem.onboardNavEnabled) {
-                        // ESP32 Onboard SLAM
-                        const expState = telem.explore || 'IDLE';
-                        if (expState === 'SCAN') return `🔍 Onboard: Đang tìm frontier... (${telem.explore_frontiers || 0} ô)`;
-                        if (expState === 'NAV') return `🚗 Onboard: Lái đến frontier...`;
-                        if (expState === 'DONE') return `✅ Onboard: Đã quét xong!`;
-                        if (expState === 'FAIL') return `⚠️ Onboard: Lỗi tìm đường!`;
-                        return `⏳ Onboard: Đang khởi động... (${expState})`;
-                      } else {
-                        // PC SLAM
-                        const phase = getExplorationPhase();
-                        const info = getExplorationInfo();
-                        if (phase === 'init_spin') return '🔄 Đang xoay 360° quét xung quanh...';
-                        if (phase === 'find_frontier') return '🔍 Đang tìm frontier...';
-                        if (phase === 'navigate') return `🚗 Đang lái đến frontier (${info.clusterCount} vùng)...`;
-                        if (phase === 'arrived_scan') return '📡 Đến nơi, quét thêm...';
-                        if (phase === 'recovery_spin') return '🔄 Recovery: Xoay tìm vùng mới...';
-                        if (phase === 'recovery_backup') return '↩️ Recovery: Lùi lại...';
-                        if (phase === 'complete') return '✅ Map đã quét xong!';
-                        return '⏳ Đang khởi động...';
-                      }
-                    })()}
-                  </div>
-                )}
-                
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button 
-                    className="btn btn--sm btn--ghost"
-                    style={{ flex: 1, fontSize: '11px', background: 'rgba(59,130,246,0.15)', color: '#93c5fd', border: '1px solid rgba(59,130,246,0.3)' }}
-                    onClick={() => setShowMapManager(true)}
-                  >
-                    🗺️ Quản lý Bản đồ
-                  </button>
-                </div>
-
-                {/* Layer Toggle — RViz-style */}
-                <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', paddingTop: '6px', marginTop: '2px' }}>
-                  <div style={{ fontSize: '9px', color: '#64748b', marginBottom: '4px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                    Layers
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '3px' }}>
-                    {[
-                      { key: 'grid', icon: '🟩', label: 'Grid' },
-                      { key: 'laser', icon: '📡', label: 'Laser' },
-                      { key: 'trail', icon: '🛤️', label: 'Trail' },
-                      { key: 'contours', icon: '🔶', label: 'Tường' },
-                    ].map(l => (
-                      <button
-                        key={l.key}
-                        onClick={() => toggleLayer(l.key)}
-                        style={{
-                          background: layers[l.key] ? 'rgba(59,130,246,0.2)' : 'rgba(255,255,255,0.03)',
-                          border: layers[l.key] ? '1px solid rgba(59,130,246,0.4)' : '1px solid rgba(255,255,255,0.06)',
-                          borderRadius: '5px',
-                          padding: '3px 6px',
-                          fontSize: '10px',
-                          color: layers[l.key] ? '#93c5fd' : '#475569',
-                          cursor: 'pointer',
-                          transition: 'all 0.15s',
-                        }}
-                      >
-                        {l.icon} {l.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Mapping Stats HUD */}
-                {activeGrid && (() => {
-                  const totalCells = activeGrid.width * activeGrid.height;
-                  let knownCells = 0;
-                  let occupiedCells = 0;
-                  for (let i = 0; i < activeGrid.logOdds.length; i++) {
-                    const lo = activeGrid.logOdds[i];
-                    if (lo > 0.5) { knownCells++; occupiedCells++; }
-                    else if (lo < -0.5) { knownCells++; }
-                  }
-                  const coverage = ((knownCells / totalCells) * 100).toFixed(1);
-                  const robot = activeRobotId && robots[activeRobotId];
-                  const rx = robot?.telemetry?.x ?? 0;
-                  const ry = robot?.telemetry?.y ?? 0;
-                  const rh = robot?.telemetry?.heading ?? 0;
-
-                  return (
-                    <div style={{
-                      background: 'rgba(0,0,0,0.3)',
-                      borderRadius: '6px',
-                      padding: '6px 8px',
-                      fontSize: '10px',
-                      color: '#94a3b8',
-                      lineHeight: 1.5,
-                      fontFamily: 'monospace',
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Scans</span>
-                        <strong style={{ color: '#10b981' }}>{activeGrid.scanCount}</strong>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Coverage</span>
-                        <strong style={{ color: '#3b82f6' }}>{coverage}%</strong>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Walls</span>
-                        <strong style={{ color: '#ef4444' }}>{occupiedCells} cells</strong>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Grid</span>
-                        <span>{activeGrid.width}×{activeGrid.height} ({activeGrid.resolution}m)</span>
-                      </div>
-                      <div style={{ borderTop: '1px solid rgba(255,255,255,0.06)', marginTop: '3px', paddingTop: '3px' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>Pos</span>
-                          <span style={{ color: '#e2e8f0' }}>({rx.toFixed(2)}, {ry.toFixed(2)})</span>
-                        </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                          <span>Heading</span>
-                          <span style={{ color: '#e2e8f0' }}>{rh.toFixed(1)}°</span>
-                        </div>
-                      </div>
-                      {isMapping && (
-                        <div style={{ 
-                          color: '#ef4444', fontWeight: 'bold', textAlign: 'center', 
-                          marginTop: '4px', animation: 'pulse 1.5s ease-in-out infinite',
-                        }}>
-                          🔴 ĐANG QUÉT...
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-          </>
-        )}
-      </div>
 
       {showMapManager && (
         <MapManager onClose={() => setShowMapManager(false)} />

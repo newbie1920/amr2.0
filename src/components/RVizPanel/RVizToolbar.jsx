@@ -93,12 +93,29 @@ const LAYERS = [
 //   COMPONENT
 // ============================================================
 
-export default function RVizToolbar({ activeTool, onToolChange, layers, onToggleLayer, isMapping, onToggleMapping }) {
+export default function RVizToolbar({ activeTool, onToolChange, layers, onToggleLayer, isMapping, onToggleMapping, dataSource = 'none' }) {
+  // Mode-aware tooltips
+  const toolTips = {
+    move: 'Di chuyển / Kéo bản đồ',
+    pose: dataSource === 'sim' ? '📍 Đặt vị trí robot (SimEngine reset)' 
+        : dataSource === 'real' ? '📍 Đặt vị trí robot (gửi lệnh ESP32)'
+        : '📍 2D Pose Estimate',
+    goal: dataSource === 'sim' ? '🎯 Điểm đến (A* + DWA trên browser)'
+        : dataSource === 'real' ? '🎯 Điểm đến (tuỳ NavMode: Onboard/PC)'
+        : '🎯 2D Nav Goal',
+    measure: '📏 Đo khoảng cách',
+  };
+
+  const mappingTip = dataSource === 'sim' 
+    ? (isMapping ? 'Dừng Auto-Explore (SimLidar → Browser SLAM)' : 'Bắt đầu Auto-Explore (SimLidar)')
+    : dataSource === 'real'
+    ? (isMapping ? 'Dừng quét (ESP32 LiDAR → PC SLAM)' : 'Bắt đầu quét (ESP32 LiDAR)')
+    : (isMapping ? 'Stop Mapping' : 'Start Mapping');
   return (
     <div style={toolbarStyle}>
       {/* Tools */}
       {TOOLS.map(tool => (
-        <div key={tool.id} style={tooltipWrapStyle} title={tool.label}>
+        <div key={tool.id} style={tooltipWrapStyle} title={toolTips[tool.id] || tool.label}>
           <button
             style={toolBtnStyle(activeTool === tool.id)}
             onClick={() => onToolChange(tool.id)}
@@ -111,7 +128,7 @@ export default function RVizToolbar({ activeTool, onToolChange, layers, onToggle
       <div style={dividerStyle} />
 
       {/* Actions */}
-      <div style={tooltipWrapStyle} title={isMapping ? "Stop Auto-Exploration (SLAM)" : "Start Auto-Exploration (SLAM)"}>
+      <div style={tooltipWrapStyle} title={mappingTip}>
         <button
           style={{
             ...toolBtnStyle(isMapping),

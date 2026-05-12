@@ -1,10 +1,6 @@
-/**
- * AMR 2.0 — Connection Panel Component
- * Panel nhập IP kết nối robot ESP32-S3
- */
-
 import { useState, useEffect } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
+import useNavStore from '../../stores/navStore.js';
 import vi from '../../i18n/vi.js';
 import { CHARGING_STATIONS } from '../../core/warehouse.js';
 
@@ -17,7 +13,10 @@ export default function ConnectionPanel() {
   const { addRobot, removeRobot, connectRobot, disconnectRobot, selectRobot, selectedRobotId } = useRobotStore();
   const robots = useRobotStore((s) => s.robots);
   const explorationInfo = useRobotStore((s) => s.explorationInfo) || {};
+  const discoveredRobots = useRobotStore((s) => s.discoveredRobots);
+  const mqttConnected = useRobotStore((s) => s.mqttConnected);
   const robotList = Object.values(robots);
+  const discoveredList = Object.values(discoveredRobots);
 
   const handleAdd = () => {
     if (!name.trim() || !ip.trim()) return;
@@ -31,6 +30,12 @@ export default function ConnectionPanel() {
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter') handleAdd();
+  };
+
+  const handleConnectDiscovered = (info) => {
+    const id = addRobot(info.name, info.ip, info.port);
+    connectRobot(id);
+    selectRobot(id);
   };
 
   return (
@@ -87,6 +92,61 @@ export default function ConnectionPanel() {
         </div>
       )}
 
+      {/* ── MQTT Auto-Discovery Section ─────────────────────── */}
+      {discoveredList.length > 0 && (
+        <div style={{ marginTop: '8px' }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '6px',
+            fontSize: '11px', color: 'var(--text-muted)', marginBottom: '6px',
+          }}>
+            <span style={{
+              width: '6px', height: '6px', borderRadius: '50%',
+              background: mqttConnected ? '#10b981' : '#ef4444',
+              boxShadow: mqttConnected ? '0 0 6px #10b981' : 'none',
+              animation: mqttConnected ? 'pulse 2s infinite' : 'none',
+            }} />
+            <span>🔍 Tự động phát hiện ({discoveredList.length} robot)</span>
+          </div>
+          {discoveredList.map((info) => {
+            // Check if this robot is already added
+            const alreadyAdded = Object.values(robots).some(
+              r => r.ip === info.ip && r.port === info.port
+            );
+            return (
+              <div key={info.id} style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '6px 10px', marginBottom: '4px',
+                background: 'rgba(16, 185, 129, 0.08)',
+                border: '1px solid rgba(16, 185, 129, 0.2)',
+                borderRadius: '8px', fontSize: '11px',
+              }}>
+                <div>
+                  <div style={{ fontWeight: '600', color: 'var(--text-primary)' }}>
+                    📡 {info.name}
+                  </div>
+                  <div style={{ color: 'var(--text-muted)', fontSize: '10px' }}>
+                    {info.ip}:{info.port} • 🔋{info.battery}% • v{info.firmware}
+                  </div>
+                </div>
+                {alreadyAdded ? (
+                  <span style={{ color: '#10b981', fontSize: '10px', fontWeight: '600' }}>
+                    ✓ Đã thêm
+                  </span>
+                ) : (
+                  <button
+                    className="btn btn--success btn--sm"
+                    style={{ fontSize: '10px', padding: '2px 10px' }}
+                    onClick={() => handleConnectDiscovered(info)}
+                  >
+                    Kết nối
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Robot List */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
         {robotList.length === 0 && (
@@ -109,7 +169,30 @@ export default function ConnectionPanel() {
               onClick={() => selectRobot(robot.id)}
             >
               <div className="robot-card__header">
-                <span className="robot-card__name">{robot.name}</span>
+                <span className="robot-card__name">
+                  {robot.name}
+                  {robot._sim && (
+                    <span style={{
+                      marginLeft: '6px', fontSize: '9px', padding: '1px 6px',
+                      background: 'rgba(139, 92, 246, 0.2)', color: '#a78bfa',
+                      borderRadius: '4px', fontWeight: '600',
+                    }}>🏭 SIM</span>
+                  )}
+                  {!robot._sim && (robot.telemetry?.hitl || robot.connection?.hitlEnabled) && (
+                    <span style={{
+                      marginLeft: '6px', fontSize: '9px', padding: '1px 6px',
+                      background: 'rgba(59, 130, 246, 0.2)', color: '#93c5fd',
+                      borderRadius: '4px', fontWeight: '600',
+                    }}>🌐 HITL</span>
+                  )}
+                  {!robot._sim && !(robot.telemetry?.hitl || robot.connection?.hitlEnabled) && (
+                    <span style={{
+                      marginLeft: '6px', fontSize: '9px', padding: '1px 6px',
+                      background: 'rgba(16, 185, 129, 0.2)', color: '#6ee7b7',
+                      borderRadius: '4px', fontWeight: '600',
+                    }}>🔌 REAL</span>
+                  )}
+                </span>
                 <span className={`robot-card__status robot-card__status--${robot.status}`}>
                   {robot.status === 'connected' ? vi.connection.connected :
                    robot.status === 'connecting' ? vi.connection.connecting :
@@ -180,28 +263,90 @@ export default function ConnectionPanel() {
                     🔋 {robot.telemetry.battery}%
                   </div>
 
-                  <div style={{
-                    marginTop: '6px',
-                    padding: '6px 8px',
-                    background: 'rgba(255,255,255,0.03)',
-                    borderRadius: '6px',
-                    fontSize: '10px',
-                    color: 'var(--text-muted)',
-                    display: 'grid',
-                    gridTemplateColumns: '1fr',
-                    gap: '3px',
-                  }}>
-                    <span>
-                      Brain: <b style={{ color: 'var(--text-primary)' }}>{robot.telemetry.architecture === 'pc_slam' ? 'PC-first SLAM' : 'Hybrid'}</b>
-                    </span>
-                    <span>
-                      Streams: grid <b style={{ color: robot.telemetry.gridStreamEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
-                        {robot.telemetry.gridStreamEnabled ? 'ON' : 'OFF'}
-                      </b>, nav <b style={{ color: robot.telemetry.onboardNavEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
-                        {robot.telemetry.onboardNavEnabled ? 'ESP32' : 'PC'}
-                      </b>
-                    </span>
-                  </div>
+                  {/* Brain Info — Context-sensitive per mode */}
+                  {robot._sim ? (
+                    <div style={{
+                      marginTop: '6px', padding: '6px 8px',
+                      background: 'rgba(139, 92, 246, 0.08)',
+                      borderRadius: '6px', fontSize: '10px',
+                      color: 'var(--text-muted)',
+                    }}>
+                      <span>🧠 Brain: <b style={{ color: '#a78bfa' }}>SimEngine 50Hz (Browser)</b></span>
+                    </div>
+                  ) : (
+                    <div style={{
+                      marginTop: '6px', padding: '6px 8px',
+                      background: 'rgba(255,255,255,0.03)',
+                      borderRadius: '6px', fontSize: '10px',
+                      color: 'var(--text-muted)',
+                      display: 'grid', gridTemplateColumns: '1fr', gap: '3px',
+                    }}>
+                      <span>
+                        Brain: <b style={{ color: 'var(--text-primary)' }}>
+                          {(robot.telemetry?.hitl || robot.connection?.hitlEnabled) ? 'HITL (Hybrid)' :
+                           robot.telemetry.architecture === 'pc_slam' ? 'PC-first SLAM' : 'ESP32 Onboard'}
+                        </b>
+                      </span>
+                      <span>
+                        Streams: grid <b style={{ color: robot.telemetry.gridStreamEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
+                          {robot.telemetry.gridStreamEnabled ? 'ON' : 'OFF'}
+                        </b>, nav <b style={{ color: robot.telemetry.onboardNavEnabled ? 'var(--accent-success)' : 'var(--accent-warning)' }}>
+                          {robot.telemetry.onboardNavEnabled ? 'ESP32' : 'PC'}
+                        </b>
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Nav Mode Selector — Only for REAL robots */}
+                  {!robot._sim && isConnected && (() => {
+                    const currentNavMode = useNavStore.getState().getNavMode(robot.id);
+                    const setNavMode = useNavStore.getState().setNavMode;
+                    return (
+                      <div style={{
+                        marginTop: '6px', padding: '6px 8px',
+                        background: 'rgba(139, 92, 246, 0.06)',
+                        borderRadius: '6px', fontSize: '10px',
+                        border: '1px solid rgba(139, 92, 246, 0.15)',
+                      }}>
+                        <div style={{ color: 'var(--text-muted)', marginBottom: '4px', fontWeight: 600 }}>
+                          🧠 Chế độ Điều hướng
+                        </div>
+                        <div style={{ display: 'flex', gap: '4px' }}>
+                          <button
+                            className={`btn btn--sm`}
+                            style={{
+                              flex: 1, fontSize: '9px', padding: '4px 6px',
+                              background: currentNavMode === 'onboard' ? 'rgba(16,185,129,0.2)' : 'transparent',
+                              color: currentNavMode === 'onboard' ? '#6ee7b7' : 'var(--text-muted)',
+                              border: currentNavMode === 'onboard' ? '1px solid rgba(16,185,129,0.4)' : '1px solid var(--border-subtle)',
+                            }}
+                            onClick={(e) => { e.stopPropagation(); setNavMode(robot.id, 'onboard'); }}
+                            title="ESP32 tự tìm đường bằng A* + DWA onboard. PC chỉ hiển thị."
+                          >
+                            📡 ESP32 Onboard
+                          </button>
+                          <button
+                            className={`btn btn--sm`}
+                            style={{
+                              flex: 1, fontSize: '9px', padding: '4px 6px',
+                              background: currentNavMode === 'pc' ? 'rgba(139,92,246,0.2)' : 'transparent',
+                              color: currentNavMode === 'pc' ? '#c4b5fd' : 'var(--text-muted)',
+                              border: currentNavMode === 'pc' ? '1px solid rgba(139,92,246,0.4)' : '1px solid var(--border-subtle)',
+                            }}
+                            onClick={(e) => { e.stopPropagation(); setNavMode(robot.id, 'pc'); }}
+                            title="Browser tính đường A* + Pure Pursuit. Cần có map SLAM."
+                          >
+                            🖥️ PC (Browser)
+                          </button>
+                        </div>
+                        <div style={{ fontSize: '8px', color: '#64748b', marginTop: '3px' }}>
+                          {currentNavMode === 'onboard'
+                            ? 'Robot tự tìm đường — PC chỉ hiển thị telemetry'
+                            : 'Browser tính path A* + gửi waypoints cho ESP32'}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* INA3221 Power Monitor */}
                   {robot.telemetry.battV > 0 && (
@@ -296,8 +441,9 @@ function JoystickControl({ robotId }) {
   const { sendManualControl, stopRobot, resetOdometry, setPose, recalibrateGyro, setBrake } = useRobotStore();
   const robots = useRobotStore((s) => s.robots);
   const robot = robots[robotId];
+  const isSim = !!robot?._sim;
   const imuCalibrated = robot?.telemetry?.imuCalibrated ?? false;
-  const imuAvailable = robot?.telemetry?.imuAvailable ?? false;
+  const imuAvailable = !isSim && (robot?.telemetry?.imuAvailable ?? false);
   const [brakeOn, setBrakeOn] = useState(false);
 
   const maxLin = 0.3;
@@ -412,24 +558,26 @@ function JoystickControl({ robotId }) {
           </div>
         )}
 
-        {/* Emergency Brake Toggle */}
-        <button
-          className={`btn btn--sm btn--full`}
-          style={{
-            marginTop: '8px',
-            fontSize: '11px',
-            background: brakeOn ? 'var(--accent-danger)' : 'transparent',
-            borderColor: 'var(--accent-danger)',
-            color: brakeOn ? '#fff' : 'var(--accent-danger)',
-          }}
-          onClick={() => {
-            const next = !brakeOn;
-            setBrakeOn(next);
-            setBrake(robotId, next);
-          }}
-        >
-          {brakeOn ? '🔴 Brake ON — Nhấn để Mở' : '⛔ Khóa Phanh (Brake)'}
-        </button>
+        {/* Emergency Brake Toggle — Hardware only (hide for SimBot) */}
+        {!isSim && (
+          <button
+            className={`btn btn--sm btn--full`}
+            style={{
+              marginTop: '8px',
+              fontSize: '11px',
+              background: brakeOn ? 'var(--accent-danger)' : 'transparent',
+              borderColor: 'var(--accent-danger)',
+              color: brakeOn ? '#fff' : 'var(--accent-danger)',
+            }}
+            onClick={() => {
+              const next = !brakeOn;
+              setBrakeOn(next);
+              setBrake(robotId, next);
+            }}
+          >
+            {brakeOn ? '🔴 Brake ON — Nhấn để Mở' : '⛔ Khóa Phanh (Brake)'}
+          </button>
+        )}
       </div>
     </div>
   );

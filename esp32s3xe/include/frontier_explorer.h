@@ -33,7 +33,7 @@
 //   CONFIG
 // ============================================================
 
-#define FRONTIER_MAX_CELLS    512    // Max frontier cells phát hiện được
+#define FRONTIER_MAX_CELLS    1024   // Max frontier cells phát hiện được (tăng từ 512 để tránh BFS queue tràn)
 #define FRONTIER_MAX_CLUSTERS 20     // Max clusters
 #define FRONTIER_MIN_CLUSTER_SIZE 3  // Bỏ qua clusters < 3 cells (nhiễu)
 #define FRONTIER_SAFE_DIST_CELLS 3   // Đích phải cách obstacle ít nhất 3 cells (0.3m)
@@ -113,16 +113,17 @@ public:
     /**
      * Quét grid, tìm frontier, chọn goal tốt nhất.
      *
-     * @param mapper  Occupancy grid mapper (để đọc grid[][] + coordinate helpers)
-     * @param robotX  Vị trí robot hiện tại (meters, world frame)
-     * @param robotY  Vị trí robot hiện tại (meters, world frame)
-     * @param outGoalX [OUT] X của goal tốt nhất (meters, world frame)
-     * @param outGoalY [OUT] Y của goal tốt nhất (meters, world frame)
+     * @param mapper     Occupancy grid mapper (để đọc grid[][] + coordinate helpers)
+     * @param robotX     Vị trí robot hiện tại (meters, world frame)
+     * @param robotY     Vị trí robot hiện tại (meters, world frame)
+     * @param robotTheta Hướng robot hiện tại (radians, world frame) — dùng cho heading bias
+     * @param outGoalX   [OUT] X của goal tốt nhất (meters, world frame)
+     * @param outGoalY   [OUT] Y của goal tốt nhất (meters, world frame)
      * @return true nếu tìm được goal, false nếu không còn frontier
      */
     bool findNextGoal(
         const OccupancyGridMapper& mapper,
-        float robotX, float robotY,
+        float robotX, float robotY, float robotTheta,
         float& outGoalX, float& outGoalY
     ) {
         // 1. Tìm tất cả frontier cells
@@ -144,8 +145,8 @@ public:
             return false;
         }
 
-        // 3. Chọn cluster tốt nhất (score = size / distance)
-        int bestIdx = selectBestCluster(robotX, robotY);
+        // 3. Chọn cluster tốt nhất (score = size / distance × headingMult)
+        int bestIdx = selectBestCluster(robotX, robotY, robotTheta);
         if (bestIdx < 0) {
             state = EXPLORE_FAILED;
             Serial.println("[EXPLORE] All clusters blacklisted or too close — FAILED");
@@ -186,7 +187,6 @@ private:
     // ── Internal buffers ──────────────────────────────────────
     FrontierCell   _cells[FRONTIER_MAX_CELLS];
     FrontierCluster _clusters[FRONTIER_MAX_CLUSTERS];
-    bool           _visited[GRID_SIZE][GRID_SIZE];  // BFS visited map
 
     // ── Step 1: Detect frontier cells ─────────────────────────
     // Frontier = cell FREE (logodds < -5) với ≥1 neighbor UNKNOWN (logodds == 0)
@@ -219,28 +219,29 @@ private:
     void clusterFrontiers(const OccupancyGridMapper& mapper, float robotX, float robotY) {
         clusterCount = 0;
 
-        // Mark tất cả frontier cells trong visited map
+        // Bit arrays to save DRAM (each uses (GRID_SIZE * GRID_SIZE) / 8 bytes)
+        static uint8_t _visited[GRID_SIZE][(GRID_SIZE + 7) / 8];
         memset(_visited, 0, sizeof(_visited));
 
-        // Tạo lookup nhanh: cell nào là frontier
-        static bool isFrontier[GRID_SIZE][GRID_SIZE];
+        static uint8_t isFrontier[GRID_SIZE][(GRID_SIZE + 7) / 8];
         memset(isFrontier, 0, sizeof(isFrontier));
+        
         for (int i = 0; i < frontierCellCount; i++) {
-            isFrontier[_cells[i].gy][_cells[i].gx] = true;
+            isFrontier[_cells[i].gy][_cells[i].gx >> 3] |= (1 << (_cells[i].gx & 7));
         }
 
         // BFS cluster mỗi frontier cell chưa visited
         for (int i = 0; i < frontierCellCount; i++) {
             int sx = _cells[i].gx;
             int sy = _cells[i].gy;
-            if (_visited[sy][sx]) continue;
+            if (_visited[sy][sx >> 3] & (1 << (sx & 7))) continue;
             if (clusterCount >= FRONTIER_MAX_CLUSTERS) break;
 
             // BFS flood-fill từ cell này
             static FrontierCell queue[FRONTIER_MAX_CELLS];
             int qHead = 0, qTail = 0;
             queue[qTail++] = {(int16_t)sx, (int16_t)sy};
-            _visited[sy][sx] = true;
+            _visited[sy][sx >> 3] |= (1 << (sx & 7));
 
             float sumGx = 0, sumGy = 0;
             int count = 0;
@@ -258,9 +259,11 @@ private:
                     int nx = c.gx + dx[d];
                     int ny = c.gy + dy[d];
                     if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
-                    if (_visited[ny][nx]) continue;
-                    if (!isFrontier[ny][nx]) continue;
-                    _visited[ny][nx] = true;
+                    
+                    if (_visited[ny][nx >> 3] & (1 << (nx & 7))) continue;
+                    if (!(isFrontier[ny][nx >> 3] & (1 << (nx & 7)))) continue;
+                    
+                    _visited[ny][nx >> 3] |= (1 << (nx & 7));
                     if (qTail < FRONTIER_MAX_CELLS) {
                         queue[qTail++] = {(int16_t)nx, (int16_t)ny};
                     }
@@ -285,8 +288,9 @@ private:
     }
 
     // ── Step 3: Select best cluster ───────────────────────────
-    // Score = size × (1 / distance) — ưu tiên clusters lớn + gần
-    int selectBestCluster(float robotX, float robotY) {
+    // Score = size × (1/distance) × headingMult — anti-ping-pong heading bias
+    // headingMult: frontier phía trước = 1.0, phía sau = 0.35 (65% penalty)
+    int selectBestCluster(float robotX, float robotY, float robotTheta = 0.0f) {
         float bestScore = -1.0f;
         int   bestIdx   = -1;
 
@@ -297,8 +301,18 @@ private:
             // Skip blacklisted goals
             if (isBlacklisted(_clusters[i].centroidX, _clusters[i].centroidY)) continue;
 
-            // Score: size weighted by proximity
-            float score = (float)_clusters[i].size / fmaxf(0.5f, _clusters[i].distToRobot);
+            // ── Heading Bias (Anti-Ping-Pong) ──
+            // cos(heading, dir-to-frontier): +1=ahead, -1=behind
+            // headingMult: ahead=1.0, side=0.675, behind=0.35
+            float dirToFrontier = atan2f(_clusters[i].centroidY - robotY,
+                                          _clusters[i].centroidX - robotX);
+            float headingCos = cosf(robotTheta - dirToFrontier);
+            float headingMult = 0.675f + 0.325f * headingCos; // [0.35, 1.0]
+
+            // Base score: size weighted by proximity
+            float baseScore = (float)_clusters[i].size / fmaxf(0.5f, _clusters[i].distToRobot);
+            float score = baseScore * headingMult;
+
             if (score > bestScore) {
                 bestScore = score;
                 bestIdx = i;
@@ -330,7 +344,7 @@ private:
             bool tooClose = false;
             for (int dy = -FRONTIER_SAFE_DIST_CELLS; dy <= FRONTIER_SAFE_DIST_CELLS && !tooClose; dy++) {
                 for (int dx = -FRONTIER_SAFE_DIST_CELLS; dx <= FRONTIER_SAFE_DIST_CELLS && !tooClose; dx++) {
-                    if (mapper.grid[gy + dy][gx + dx] > 30) tooClose = true;
+                    if (mapper.grid[gy + dy][gx + dx] > 10) tooClose = true;  // OCC_THRESHOLD
                 }
             }
             if (!tooClose) return;  // Safe
@@ -350,7 +364,7 @@ private:
                 bool safe = true;
                 for (int dy = -2; dy <= 2 && safe; dy++) {
                     for (int dx = -2; dx <= 2 && safe; dx++) {
-                        if (mapper.grid[cy + dy][cx + dx] > 30) safe = false;
+                        if (mapper.grid[cy + dy][cx + dx] > 10) safe = false;  // OCC_THRESHOLD
                     }
                 }
                 if (!safe) continue;

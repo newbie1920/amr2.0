@@ -6,6 +6,10 @@
 		{
 			"name": "esp32s3xe",
 			"path": "."
+		},
+		{
+			"name": "esp32s3xe",
+			"path": "../../../Users/ADMIN/OneDrive/Documents/PlatformIO/Projects/esp32s3xe"
 		}
 	],
 	"settings": {}

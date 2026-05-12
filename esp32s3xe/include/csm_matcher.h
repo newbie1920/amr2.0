@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <esp_heap_caps.h>
 #include "lidar_mapper.h"
 
 struct CsmConfig {

@@ -12,6 +12,7 @@ import useMapStore from './mapStore.js';
 import useDWAStore from './dwaStore.js';
 import useSimStore from './simStore.js';
 import { registerStore, getNavStoreState } from './storeRegistry.js';
+import mqttDiscovery from '../core/mqttDiscovery.js';
 
 
 function saveRobotsToStorage(robots) {
@@ -56,6 +57,10 @@ const useRobotStore = create((set, get) => ({
   simInfo: {},             // { robotId: { running, simTime, rtf, ... } }
   simWorldSegments: [],    // Cached world segments for 3D visualization
 
+  // ── MQTT AUTO-DISCOVERY ───────────────────────────────────
+  discoveredRobots: {},     // { mqttId: { id, name, ip, port, battery, firmware, lastSeen } }
+  mqttConnected: false,     // MQTT broker connection status
+
 
 
   // ============================================================
@@ -69,6 +74,15 @@ const useRobotStore = create((set, get) => ({
         get().addRobot(r.name, r.ip, r.port, r.id);
       }
     });
+    // Auto-connect stored robots (no MQTT needed — ESP32 IP is saved in localStorage)
+    setTimeout(() => {
+      Object.values(get().robots).forEach((r) => {
+        if (r.status !== 'connected' && r.ip && !r.ip.startsWith('sim://')) {
+          console.log(`[robotStore] Auto-connecting stored robot: ${r.name} @ ${r.ip}:${r.port}`);
+          get().connectRobot(r.id);
+        }
+      });
+    }, 1000); // Small delay to let UI render first
   },
 
   // ── Navigation actions migrated to navStore.js ──
@@ -79,6 +93,12 @@ const useRobotStore = create((set, get) => ({
    * Thêm robot mới
    */
   addRobot: (name, ip, port = 81, forcedId = null) => {
+    // Prevent duplicate: check if any existing robot has same ip:port
+    const existing = Object.values(get().robots).find(r => r.ip === ip && r.port === port);
+    if (existing) {
+      console.log(`[robotStore] Robot already exists at ${ip}:${port} (${existing.id})`);
+      return existing.id;
+    }
     const id = forcedId || `robot_${Date.now()}`;
     const connection = new RobotConnection(ip, port, name);
     // Gắn id robot để các callback có thể truy cập store
@@ -103,7 +123,7 @@ const useRobotStore = create((set, get) => ({
     // Lắng nghe telemetry
     connection.onTelemetry = (telem) => {
       const now = Date.now();
-      
+
       // Transient state update (For Canvas/3D without rendering UI)
       const currentState = get();
       if (!currentState.transientRobots) currentState.transientRobots = {};
@@ -112,7 +132,7 @@ const useRobotStore = create((set, get) => ({
       // === LIDAR MAPPING: Delegate to mapStore ===
       try {
         useMapStore.getState().processLidarTick(id, telem, now, () => get());
-      } catch(e) {
+      } catch (e) {
         // mapStore not ready
       }
 
@@ -130,7 +150,7 @@ const useRobotStore = create((set, get) => ({
         telem.nav_wp = effectiveTelem.nav_wp;
         telem.nav_total = effectiveTelem.nav_total;
       }
-      
+
       // Throttle UI update to ~5Hz (200ms) for smooth robot position display
       if (now - lastUpdate > 200) {
         lastUpdate = now;
@@ -156,29 +176,36 @@ const useRobotStore = create((set, get) => ({
 
       // Sync Navigation Status with Task System (replaces older setInterval in UI)
       if (effectiveTelem.nav === 'ERROR' || effectiveTelem.nav === 'DONE' || effectiveTelem.nav === 'PAUSED') {
-         // Dynamically import to avoid circular dependency issues at boot
-         import('./taskStore.js').then(module => {
-            const useTaskStore = module.default;
-            const state = useTaskStore.getState();
-            const activeTasks = state.tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId === id && !t.dbUpdated);
-            
-            if (activeTasks.length > 0) {
-              const taskId = activeTasks[0].id;
-              if (effectiveTelem.nav === 'PAUSED') {
-                 state.pauseTask(taskId, 'Người dùng tạm dừng hoặc Kẹt vật cản');
-              } else {
-                 state.processTaskCompletion(taskId, telem.nav, 'Robot bị lỗi điều hướng (Kẹt hoặc Quá thời gian)');
-              }
+        // Dynamically import to avoid circular dependency issues at boot
+        import('./taskStore.js').then(module => {
+          const useTaskStore = module.default;
+          const state = useTaskStore.getState();
+          const activeTasks = state.tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId === id && !t.dbUpdated);
+
+          if (activeTasks.length > 0) {
+            const taskId = activeTasks[0].id;
+            if (effectiveTelem.nav === 'PAUSED') {
+              state.pauseTask(taskId, 'Người dùng tạm dừng hoặc Kẹt vật cản');
+            } else {
+              state.processTaskCompletion(taskId, telem.nav, 'Robot bị lỗi điều hướng (Kẹt hoặc Quá thời gian)');
             }
-         });
+          }
+        });
       }
     };
 
-    // Handle LIDAR occupancy grid updates
+    // Handle LIDAR occupancy grid updates from ESP32 binary stream.
+    // CRITICAL: Must update BOTH occupancyGrid AND mapperInstances to prevent
+    // the browser-side mapper (processLidarTick) from overwriting with stale data
+    // that has a different origin, which causes map stacking/overlapping.
     connection.onLidarGrid = (grid) => {
       try {
-        useMapStore.getState().updateOccupancyGrid(id, grid);
-      } catch(e) {}
+        const mapStore = useMapStore.getState();
+        useMapStore.setState((s) => ({
+          occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+          mapperInstances: { ...s.mapperInstances, [id]: grid },
+        }));
+      } catch (e) { }
     };
 
     connection.onConnect = () => {
@@ -191,8 +218,17 @@ const useRobotStore = create((set, get) => ({
           },
         }
       });
-      // Tự động load map nếu có
-      useMapStore.getState().autoLoadLatestMap(id);
+      // Real robots build map from ESP32 LiDAR (onLidarGrid / processLidarTick).
+      // Clear any stale map data (e.g. SimBot warehouse map) so LiDAR starts fresh.
+      const mapState = useMapStore.getState();
+      if (mapState.mapperInstances[id] || mapState.occupancyGrid[id]) {
+        useMapStore.setState((s) => {
+          const { [id]: _m, ...restMapper } = s.mapperInstances;
+          const { [id]: _g, ...restGrid } = s.occupancyGrid;
+          return { mapperInstances: restMapper, occupancyGrid: restGrid };
+        });
+        console.log(`[robotStore] Cleared stale map for real robot ${id}`);
+      }
     };
 
     connection.onDisconnect = () => {
@@ -239,7 +275,7 @@ const useRobotStore = create((set, get) => ({
   removeRobot: (id) => {
     const robot = get().robots[id];
     if (robot) {
-      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch(e) {}
+      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch (e) { }
       robot.connection.disconnect();
       // FIX Bug #10: Cleanup muxTimer
       if (get()._muxTimers?.[id]) {
@@ -276,7 +312,7 @@ const useRobotStore = create((set, get) => ({
   disconnectRobot: (id) => {
     const robot = get().robots[id];
     if (robot) {
-      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch(e) {}
+      try { getNavStoreState().stopAppNavigation(id, 'IDLE', false); } catch (e) { }
       robot.connection.disconnect();
       set((state) => ({
         robots: {
@@ -357,10 +393,10 @@ const useRobotStore = create((set, get) => ({
   },
 
   // ── Nav control delegated to navStore ──
-  navigateRobot: (id, path, fh) => { try { return getNavStoreState().navigateRobot(id, path, fh); } catch(e) { return false; } },
-  navStopRobot: (id) => { try { getNavStoreState().navStopRobot(id); } catch(e) {} },
-  pauseRobot: (id) => { try { getNavStoreState().pauseNav(id); } catch(e) {} },
-  resumeRobot: (id) => { try { getNavStoreState().resumeNav(id); } catch(e) {} },
+  navigateRobot: (id, path, fh) => { try { return getNavStoreState().navigateRobot(id, path, fh); } catch (e) { return false; } },
+  navStopRobot: (id) => { try { getNavStoreState().navStopRobot(id); } catch (e) { } },
+  pauseRobot: (id) => { try { getNavStoreState().pauseNav(id); } catch (e) { } },
+  resumeRobot: (id) => { try { getNavStoreState().resumeNav(id); } catch (e) { } },
 
 
   /**
@@ -399,6 +435,79 @@ const useRobotStore = create((set, get) => ({
   getConnectedRobots: () => Object.values(get().robots).filter(r => r.status === 'connected'),
   getRobotList: () => Object.values(get().robots),
 
+  /**
+   * Context-sensitive helper — returns the TYPE of the currently selected robot
+   * Used by UI components to show/hide mode-specific controls
+   * @returns {'sim'|'hitl'|'real'|'none'}
+   */
+  getSelectedRobotType: () => {
+    const { robots, selectedRobotId } = get();
+    const robot = robots[selectedRobotId];
+    if (!robot) return 'none';
+    if (robot._sim) return 'sim';
+    if (robot.connection?.hitlEnabled || robot.telemetry?.hitl) return 'hitl';
+    return 'real';
+  },
+
+  // ============================================================
+  //   MQTT AUTO-DISCOVERY ACTIONS
+  // ============================================================
+
+  /**
+   * Start MQTT discovery service — auto-detect robots on the network
+   */
+  startMqttDiscovery: () => {
+    if (mqttDiscovery.isConnected()) return;
+
+    mqttDiscovery.onRobotDiscovered = (info, isNew) => {
+      // Update discovered robots list
+      set((s) => ({
+        discoveredRobots: {
+          ...s.discoveredRobots,
+          [info.id]: info,
+        },
+        mqttConnected: true,
+      }));
+
+      // Auto-add and connect if this is a NEW robot
+      if (isNew) {
+        const existingRobot = Object.values(get().robots).find(
+          r => r.ip === info.ip && r.port === info.port
+        );
+
+        if (!existingRobot) {
+          // Brand new robot — add + auto-connect
+          console.log(`[MQTT] Auto-adding robot: ${info.name} @ ${info.ip}:${info.port}`);
+          const id = get().addRobot(info.name, info.ip, info.port);
+          get().connectRobot(id);
+          get().selectRobot(id);
+        } else if (existingRobot.status !== 'connected') {
+          // Known robot came back online — auto-reconnect
+          console.log(`[MQTT] Auto-reconnecting: ${existingRobot.name}`);
+          get().connectRobot(existingRobot.id);
+        }
+      }
+    };
+
+    mqttDiscovery.onRobotOffline = (mqttId) => {
+      set((s) => {
+        const { [mqttId]: removed, ...rest } = s.discoveredRobots;
+        return { discoveredRobots: rest };
+      });
+    };
+
+    mqttDiscovery.start();
+    console.log('[MQTT] Discovery service started');
+  },
+
+  /**
+   * Stop MQTT discovery
+   */
+  stopMqttDiscovery: () => {
+    mqttDiscovery.stop();
+    set({ discoveredRobots: {}, mqttConnected: false });
+  },
+
   // ============================================================
   //   GAZEBO TDTU — SIM MODE ACTIONS
   // ============================================================
@@ -410,7 +519,7 @@ const useRobotStore = create((set, get) => ({
   addSimRobot: (name = 'SimBot', spawnX = undefined, spawnY = undefined, spawnTheta = Math.PI / 2) => {
     const id = `sim_${Date.now()}`;
     const engine = new SimEngine();
-    
+
     // Offset spawn position if multiple robots are running to avoid them spawning on top of each other
     const numSims = Object.keys(get().simEngines).length;
     const finalX = spawnX !== undefined ? spawnX : 3.5;
@@ -436,7 +545,7 @@ const useRobotStore = create((set, get) => ({
       if (!engine.running) return;
       const telem = engine.telemetry;
       if (!telem) return;
-      
+
       const now = Date.now();
 
       // Transient update (cho Canvas/3D)
@@ -447,7 +556,7 @@ const useRobotStore = create((set, get) => ({
       // === LIDAR MAPPING: Delegate to mapStore ===
       try {
         useMapStore.getState().processLidarTick(id, telem, now, () => get());
-      } catch(e) {}
+      } catch (e) { }
 
       // Delegate nav tick to navStore
       let appNavOverlay = null;
@@ -475,7 +584,7 @@ const useRobotStore = create((set, get) => ({
           const useTaskStore = module.default;
           const taskState = useTaskStore.getState();
           const activeTasks = taskState.tasks.filter(t => t.status === 'in_progress' && t.assignedRobotId === id && !t.dbUpdated);
-          
+
           if (activeTasks.length > 0) {
             const taskId = activeTasks[0].id;
             if (effectiveTelem.nav === 'PAUSED') {
@@ -521,14 +630,14 @@ const useRobotStore = create((set, get) => ({
         sendStop: () => engine.setVelocity(0, 0),
         navStop: () => engine.setVelocity(0, 0),
         pause: () => engine.setVelocity(0, 0),
-        resume: () => {},
+        resume: () => { },
         disconnect: () => engine.stop(),
         resetOdometry: () => engine.reset(),
         setPose: (x, y, theta) => engine.reset(x, y, theta),
-        setArchitectureProfile: () => {},
-        recalibrateGyro: () => {},
-        setBrake: () => {},
-        navigate: () => {},
+        setArchitectureProfile: () => { },
+        recalibrateGyro: () => { },
+        setBrake: () => { },
+        navigate: () => { },
       },
       status: 'connected',
       telemetry: engine.telemetry,

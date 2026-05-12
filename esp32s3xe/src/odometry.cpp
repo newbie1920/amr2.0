@@ -1,6 +1,9 @@
 #include "odometry.h"
 #include "config.h"
 
+// Spinlock for multi-core pose protection (see odometry.h for PoseSnapshot API)
+portMUX_TYPE poseMux = portMUX_INITIALIZER_UNLOCKED;
+
 // Encoders
 volatile long leftTicks = 0;
 volatile long rightTicks = 0;
@@ -54,12 +57,14 @@ float filteredVBatt = 12.0f;
  * Call this after odometry update or after TF update.
  */
 void applyTf() {
+    portENTER_CRITICAL(&poseMux);
     // Proper 2D rigid-body transform: map = Rot(tfDTheta) * odom + (tfDx, tfDy)
     float cosT = cosf(tfDTheta);
     float sinT = sinf(tfDTheta);
     mapX     = cosT * robotX - sinT * robotY + tfDx;
     mapY     = sinT * robotX + cosT * robotY + tfDy;
     mapTheta = atan2f(sinf(robotTheta + tfDTheta), cosf(robotTheta + tfDTheta));
+    portEXIT_CRITICAL(&poseMux);
 }
 
 /**
@@ -67,6 +72,7 @@ void applyTf() {
  * Applies correction to map pose and back-solves for the required tf params.
  */
 void updateTf(float dx, float dy, float dtheta, float weight) {
+    portENTER_CRITICAL(&poseMux);
     // 1. Calculate target map pose
     float targetMapX = mapX + weight * dx;
     float targetMapY = mapY + weight * dy;
@@ -82,8 +88,11 @@ void updateTf(float dx, float dy, float dtheta, float weight) {
     tfDx = targetMapX - (cosT * robotX - sinT * robotY);
     tfDy = targetMapY - (sinT * robotX + cosT * robotY);
 
-    // 4. Update map pose with new TF
-    applyTf();
+    // 4. Update map pose with new TF (already inside critical section)
+    mapX     = cosT * robotX - sinT * robotY + tfDx;
+    mapY     = sinT * robotX + cosT * robotY + tfDy;
+    mapTheta = atan2f(sinf(robotTheta + tfDTheta), cosf(robotTheta + tfDTheta));
+    portEXIT_CRITICAL(&poseMux);
 }
 
 // ============================================================

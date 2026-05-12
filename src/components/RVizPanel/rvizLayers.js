@@ -113,7 +113,7 @@ export function drawGrid(ctx, w, h, viewport) {
 // ============================================================
 
 // Cache for occupancy map offscreen canvas
-let _occMapCache = { scanCount: -1, width: 0, height: 0, canvas: null, lastUpdate: 0 };
+let _occMapCache = { scanCount: -1, width: 0, height: 0, canvas: null, lastUpdate: 0, originX: NaN, originY: NaN };
 
 function _renderOccMapCanvas(grid) {
   const w = grid.width;
@@ -163,20 +163,24 @@ export function drawOccupancyMap(ctx, w, h, viewport, grid) {
   const cellPx = grid.resolution * scale;
   if (cellPx < 0.5) return; // Too zoomed out
 
-  // Cache: re-render when grid changes
+  // Cache: re-render when grid changes (including origin shifts from auto-expand)
   const sc = grid.scanCount || 0;
   const lu = grid.lastUpdate || 0;
   if (
     _occMapCache.scanCount !== sc ||
     _occMapCache.width !== grid.width ||
     _occMapCache.height !== grid.height ||
-    _occMapCache.lastUpdate !== lu
+    _occMapCache.lastUpdate !== lu ||
+    _occMapCache.originX !== grid.originX ||
+    _occMapCache.originY !== grid.originY
   ) {
     _occMapCache.canvas = _renderOccMapCanvas(grid);
     _occMapCache.scanCount = sc;
     _occMapCache.width = grid.width;
     _occMapCache.height = grid.height;
     _occMapCache.lastUpdate = lu;
+    _occMapCache.originX = grid.originX;
+    _occMapCache.originY = grid.originY;
   }
 
   if (!_occMapCache.canvas) return;
@@ -714,7 +718,7 @@ const _NAV2_COSTMAP_LUT = (() => {
 })();
 
 // Cache key for offscreen canvas
-let _costmapCache = { costmapVersion: -1, width: 0, height: 0, canvas: null, lastRenderTime: 0 };
+let _costmapCache = { costmapVersion: -1, width: 0, height: 0, canvas: null, lastRenderTime: 0, originX: NaN, originY: NaN };
 
 function _renderCostmapCanvas(grid) {
   const w = grid.width;
@@ -756,13 +760,15 @@ export function drawCostmapNav2(ctx, w, h, viewport, grid) {
   if (cellPx < 0.5) return; // Too zoomed out
 
   // Cache: re-render offscreen canvas when grid data changes
-  // Invalidate on: costmapVersion change or grid resize
+  // Invalidate on: costmapVersion change, grid resize, or origin shift (auto-expand)
   const cv = grid.costmapVersion || 0;
   const now = Date.now();
   const needsRedraw =
     _costmapCache.costmapVersion !== cv ||
     _costmapCache.width !== grid.width ||
     _costmapCache.height !== grid.height ||
+    _costmapCache.originX !== grid.originX ||
+    _costmapCache.originY !== grid.originY ||
     (grid._dirty && now - _costmapCache.lastRenderTime > 400);
 
   if (needsRedraw) {
@@ -771,6 +777,8 @@ export function drawCostmapNav2(ctx, w, h, viewport, grid) {
     _costmapCache.width = grid.width;
     _costmapCache.height = grid.height;
     _costmapCache.lastRenderTime = now;
+    _costmapCache.originX = grid.originX;
+    _costmapCache.originY = grid.originY;
   }
 
   if (!_costmapCache.canvas) return;

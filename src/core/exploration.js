@@ -64,7 +64,7 @@ const INFO_GAIN_RANGE = 30;     // Max ray length in cells
 // Anti-ping-pong weights
 const LAMBDA_HEADING = 3.0;     // Bonus for frontier in FORWARD direction (cosine similarity)
 const LAMBDA_VISITED = 4.0;     // Penalty for frontier near recently-visited trail
-const VISITED_DECAY_MS = 60000; // Trail memory: 60 seconds before forgetting
+const VISITED_DECAY_MS = 300000; // Trail memory: 5 MINUTES (prevents returning to ghost frontiers)
 const VISITED_RADIUS = 12;      // Cells radius to check visited trail
 const COMPLETION_BL_RADIUS = 12; // Larger blacklist on goal completion (was 8)
 const TSP_CHAIN_SIZE = 4;       // Number of goals to chain in greedy TSP
@@ -200,13 +200,6 @@ function _tick() {
       // inside walls or unreachable corners, stopping it from revisiting the same spot.
       if (currentGoalGrid) {
         _bl(currentGoalGrid.gx, currentGoalGrid.gy, COMPLETION_BL_RADIUS);
-        // Record direction toward this completed goal for momentum
-        if (currentGoalWorld) {
-          lastGoalDirection = Math.atan2(
-            currentGoalWorld.y - pose.y,
-            currentGoalWorld.x - pose.x
-          );
-        }
       }
 
       // v9: Try queued waypoint first before re-scanning
@@ -360,8 +353,14 @@ async function _selectNextGoal(pose, grid) {
     // Each visited hit reduces score by ~10%, capped at 0.25x minimum
     const visitedMult = Math.max(0.25, 1.0 - visitedCount * 0.10);
 
-    // ── FINAL SCORE: base × heading × momentum × visited ──
-    const score = baseScore * headingMult * momentumMult * visitedMult;
+    // ── MULTIPLIER 4: Wall-Following Bias (Theo ý User) ──
+    // Nếu frontier nằm gần tường (clearance < 6 cells = 0.6m), cho thêm 15% bonus.
+    // Điều này giúp robot men theo vách tường trước, tạo thành vòng bao (perimeter sweep).
+    // Sau khi quét xong tường, các frontier ở giữa sẽ tự động được ưu tiên (do Momentum & Visited đẩy nó vào).
+    const wallFollowMult = approach.clearance < 6 ? 1.15 : 1.0;
+
+    // ── FINAL SCORE: base × heading × momentum × visited × wall_follow ──
+    const score = baseScore * headingMult * momentumMult * visitedMult * wallFollowMult;
 
     const worldPt = grid.gridToWorld(approach.gx, approach.gy);
     scored.push({
@@ -406,6 +405,13 @@ async function _navigateToWaypoint(wp) {
   currentGoalWorld = { x: wp.goalX, y: wp.goalY };
   currentGoalGrid = { gx: wp.centroidGX, gy: wp.centroidGY };
   currentGoalApproachGrid = { gx: wp.approachGX, gy: wp.approachGY };
+
+  const pose = _getPose();
+  if (pose) {
+    // FIX: Record intended travel direction for momentum logic HERE.
+    // If recorded at the end of nav, minor overshoots cause the angle to be random noise.
+    lastGoalDirection = Math.atan2(wp.goalY - pose.y, wp.goalX - pose.x);
+  }
 
   try {
     const navStore = await _ensureNavStore();

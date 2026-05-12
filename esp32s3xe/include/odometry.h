@@ -4,6 +4,46 @@
 #include <Arduino.h>
 #include "wheel_pid.h"
 
+// ============================================================
+//   THREAD-SAFE POSE SNAPSHOT (Multi-core protection)
+//   controlTask (Core 1) writes → lidarTask/explorationTask (Core 0) reads
+//   Uses portMUX spinlock (fastest sync primitive on ESP32)
+// ============================================================
+
+struct PoseSnapshot {
+    float x;
+    float y;
+    float theta;
+};
+
+extern portMUX_TYPE poseMux;  // Protects robotX/Y/Theta + mapX/Y/Theta + tfDx/Dy/DTheta
+
+// Thread-safe pose read/write helpers
+inline PoseSnapshot getOdomPose() {
+    PoseSnapshot p;
+    portENTER_CRITICAL(&poseMux);
+    extern float robotX, robotY, robotTheta;
+    p.x = robotX; p.y = robotY; p.theta = robotTheta;
+    portEXIT_CRITICAL(&poseMux);
+    return p;
+}
+
+inline PoseSnapshot getMapPose() {
+    PoseSnapshot p;
+    portENTER_CRITICAL(&poseMux);
+    extern float mapX, mapY, mapTheta;
+    p.x = mapX; p.y = mapY; p.theta = mapTheta;
+    portEXIT_CRITICAL(&poseMux);
+    return p;
+}
+
+inline void getTfCorrection(float& dx, float& dy, float& dtheta) {
+    portENTER_CRITICAL(&poseMux);
+    extern float tfDx, tfDy, tfDTheta;
+    dx = tfDx; dy = tfDy; dtheta = tfDTheta;
+    portEXIT_CRITICAL(&poseMux);
+}
+
 // Encoders
 extern volatile long leftTicks;
 extern volatile long rightTicks;

@@ -73,3 +73,15 @@ pub const INVERT_RIGHT_MOTOR: bool = false;
 // ── INA3221 ─────────────────────────────────────────────────
 pub const INA_CH_BATT: usize = 1;
 pub const INA_CH_MOTOR: usize = 2;
+
+// ── Navigation / Mapping ─────────────────────────────────────
+pub const MAP_RESOLUTION: f32 = 0.05; // 5cm per cell
+pub const MAP_WIDTH: usize = 400;     // 20 meters
+pub const MAP_HEIGHT: usize = 400;    // 20 meters
+pub const MAP_ORIGIN_X: f32 = 10.0;   // meters (center of grid)
+pub const MAP_ORIGIN_Y: f32 = 10.0;   // meters
+pub const INFLATION_RADIUS: f32 = 0.15; // 15cm
+pub const MAX_LOG_ODDS: f32 = 5.0;
+pub const MIN_LOG_ODDS: f32 = -5.0;
+pub const LOG_ODDS_HIT: f32 = 0.85;
+pub const LOG_ODDS_MISS: f32 = -0.4;

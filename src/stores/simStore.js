@@ -7,8 +7,7 @@
 import { create } from 'zustand';
 
 const useSimStore = create((set, get) => ({
-  // State
-  simMode: false,
+  // State (simMode is managed by robotStore as single source of truth)
   simEngines: {},          // { robotId: SimEngine reference }
   simInfo: {},             // { robotId: { running, simTime, rtf, ... } }
   simWorldSegments: [],    // Cached world segments for 3D visualization
@@ -22,7 +21,6 @@ const useSimStore = create((set, get) => ({
    */
   registerSimEngine: (id, engine) => {
     set((s) => ({
-      simMode: true,
       simEngines: { ...s.simEngines, [id]: engine },
       simWorldSegments: engine.getWorldSegments(),
     }));
@@ -41,7 +39,6 @@ const useSimStore = create((set, get) => ({
       return {
         simEngines: restEngines,
         simInfo: restInfo,
-        simMode: Object.keys(restEngines).length > 0,
       };
     });
   },

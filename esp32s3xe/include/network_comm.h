@@ -9,4 +9,9 @@ void broadcast_telemetry();
 void send_occupancy_grid();
 void setArchitectureProfile(const char* profile);
 
+// MQTT Auto-Discovery
+void init_mqtt();
+void update_mqtt();
+void mqtt_publish_discovery();
+
 #endif // NETWORK_COMM_H
