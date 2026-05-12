@@ -625,8 +625,7 @@ export class RobotConnection {
     for (let i = 0; i < 360; i++) {
       const d = view.getUint16(1 + i * 2, true); // LE, offset past 0x04 byte
       if (d > 0 && d < 6000) {
-        // Mirror angles: LiDAR mounted with scan direction flipped
-        lidarPoints.push({ a: (360 - i) % 360, d });
+        lidarPoints.push({ a: i, d });
       }
     }
 
