@@ -14,7 +14,7 @@
 
 extern SemaphoreHandle_t i2cMutex;
 
-#define OLED_INTERVAL 500
+#define OLED_INTERVAL 2000  // 0.5Hz — informational only, no need for fast refresh
 
 static Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 static unsigned long lastOledTime = 0;

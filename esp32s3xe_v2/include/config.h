@@ -68,7 +68,7 @@
 #define KI_VEL         1.5f
 #define CMD_TIMEOUT_MS    1000
 #define CONTROL_FREQ_HZ   50     // 50Hz control loop
-#define TELEMETRY_INTERVAL 100   // ~10Hz telemetry
+#define TELEMETRY_INTERVAL 50    // ~20Hz telemetry (fast real-time)
 
 // ============================================================
 //   IMU FUSION

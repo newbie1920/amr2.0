@@ -347,6 +347,7 @@ void init_network() {
     TelnetStream.begin();
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
+    // NOTE: TCP_NODELAY is already set by WebSocketsServer on each client connect.
     // Server-side heartbeat: detect and evict stale (half-open) client connections.
     // After abnormal disconnect (code 1006), the old client slot stays occupied
     // and blocks new connections (max 5 slots). This sends WS ping every 10s,

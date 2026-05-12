@@ -151,8 +151,8 @@ const useRobotStore = create((set, get) => ({
         telem.nav_total = effectiveTelem.nav_total;
       }
 
-      // Throttle UI update to ~5Hz (200ms) for smooth robot position display
-      if (now - lastUpdate > 200) {
+      // Throttle UI update to ~20Hz (50ms) to match ESP32 telemetry rate
+      if (now - lastUpdate > 50) {
         lastUpdate = now;
         set((state) => {
           if (!state.robots[id]) return state;
