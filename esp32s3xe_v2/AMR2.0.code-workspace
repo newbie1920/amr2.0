@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "esp32s3xe_v2",
+			"path": "."
+		}
+	],
+	"settings": {}
+}

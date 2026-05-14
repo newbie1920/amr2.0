@@ -153,9 +153,8 @@ void loop() {
             state.power.currentA[i] = ina_currentA[i];
         }
         battery_update();  // Now uses fresh INA3221 busV[INA_CH_BATT]
+        oled_update();     // I2C OLED (~30-50ms) — rate-limited to 2Hz with INA/battery
     }
-
-    oled_update();  // I2C OLED (~30-50ms) — now AFTER telemetry, won't delay data
 
     // ── Serial status heartbeat (5s) ─────────────────────────
     static unsigned long lastHeartbeat = 0;

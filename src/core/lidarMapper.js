@@ -646,59 +646,82 @@ export class OccupancyGrid {
     return grid;
   }
 
-  static fromBinary(buffer) {
+  static updateFromRLEWindow(buffer, existingGrid = null) {
     const view = new DataView(buffer);
     const messageType = view.getUint8(0);
     if (messageType !== 0x01) {
       throw new Error(`Unsupported occupancy grid message type: ${messageType}`);
     }
 
-    const width = view.getUint8(1);
-    const height = view.getUint8(2);
-    const resolution = view.getFloat32(3, true);
-    const robotX = view.getFloat32(7, true);
-    const robotY = view.getFloat32(11, true);
-    const robotHeading = view.getFloat32(15, true);
-    
-    // SLAM v2: dynamic origin appended to header
-    let offset = 19;
-    let originX = 0;
-    let originY = 0;
-    
-    // Check if buffer is large enough for the v2 header (27 bytes)
-    if (buffer.byteLength >= 27 + width * height) {
-      originX = view.getFloat32(19, true);
-      originY = view.getFloat32(23, true);
-      offset = 27;
+    // New Windowed RLE format header (35 bytes)
+    const viewW = view.getUint16(1, true);
+    const viewH = view.getUint16(3, true);
+    const resolution = view.getFloat32(5, true);
+    const robotX = view.getFloat32(9, true);
+    const robotY = view.getFloat32(13, true);
+    const robotHeading = view.getFloat32(17, true);
+    const originX = view.getFloat32(21, true);
+    const originY = view.getFloat32(25, true);
+    const viewStartX = view.getUint16(29, true);
+    const viewStartY = view.getUint16(31, true);
+    const fullSize = view.getUint16(33, true);
+
+    let grid = existingGrid;
+    if (!grid || grid.width !== fullSize || grid.height !== fullSize || Math.abs(grid.resolution - resolution) > 0.001) {
+      grid = new OccupancyGrid(fullSize, fullSize, resolution, 0, 0);
+      console.log(`[OccupancyGrid] Created new ${fullSize}x${fullSize} grid from RLE frame`);
     }
 
-    const expectedBytes = offset + width * height;
-
-    if (buffer.byteLength < expectedBytes) {
-      throw new Error(`Occupancy grid buffer too short: ${buffer.byteLength} < ${expectedBytes}`);
-    }
-
-    const grid = new OccupancyGrid(width, height, resolution, 0, 0);
-    // Use dynamic origin from ESP32
     grid.originX = originX;
     grid.originY = originY;
     grid.robotX = robotX;
     grid.robotY = robotY;
     grid.robotHeading = robotHeading;
 
-    for (let gy = 0; gy < height; gy++) {
-      for (let gx = 0; gx < width; gx++) {
-        const occupancy100 = view.getUint8(offset++);
-        const probability = Math.max(0.001, Math.min(0.999, occupancy100 / 100.0));
-        const logOdds = Math.log(probability / (1 - probability));
-        const idx = gy * width + gx;
-        grid.logOdds[idx] = Math.max(L_MIN, Math.min(L_MAX, logOdds));
+    let offset = 35;
+    let decodedCount = 0;
+    const expectedCount = viewW * viewH;
+    
+    // RLE Decode
+    let cx = 0;
+    let cy = 0;
+
+    while (offset < buffer.byteLength && decodedCount < expectedCount) {
+      const val = view.getUint8(offset++);
+      const run = view.getUint8(offset++);
+
+      for (let i = 0; i < run; i++) {
+        if (decodedCount >= expectedCount) break;
+        
+        const gx = viewStartX + cx;
+        const gy = viewStartY + cy;
+        
+        if (grid.inBounds(gx, gy)) {
+          // ESP32 sends 0-100 probability (50 = unknown)
+          let logOdds;
+          if (val === 50) {
+            logOdds = L_PRIOR;
+          } else {
+            const probability = Math.max(0.001, Math.min(0.999, val / 100.0));
+            logOdds = Math.log(probability / (1 - probability));
+          }
+          const idx = gy * grid.width + gx;
+          grid.logOdds[idx] = Math.max(L_MIN, Math.min(L_MAX, logOdds));
+        }
+        
+        decodedCount++;
+        cx++;
+        if (cx >= viewW) {
+          cx = 0;
+          cy++;
+        }
       }
     }
 
     grid._syncDataFromLogOdds();
 
-    // Re-inflate costmap on load
+    // Re-inflate costmap 
+    // Todo: optimize to only inflate view window for performance
     const inflCells = Math.ceil(INFLATION_RADIUS_M / grid.resolution);
     grid.inflateObstacles(inflCells);
 

@@ -112,6 +112,8 @@ const statusBarStyle = {
   flexShrink: 0,
 };
 
+import useUIStore from '../../stores/uiStore.js';
+
 // ============================================================
 //   COMPONENT
 // ============================================================
@@ -121,7 +123,8 @@ export default function RVizPanel({ activePath }) {
   const containerRef = useRef(null);
   const animFrameRef = useRef(null);
   const [canvasSize, setCanvasSize] = useState({ w: 400, h: 300 });
-  const [activeTool, setActiveTool] = useState('move');
+  const activeTool = useUIStore((s) => s.activeTool);
+  const setActiveTool = useUIStore((s) => s.setActiveTool);
   const [followRobot, setFollowRobot] = useState(false);
   const [cursorWorld, setCursorWorld] = useState({ x: 0, y: 0 });
   const [measurePoints, setMeasurePoints] = useState({ p1: null, p2: null });
@@ -129,11 +132,11 @@ export default function RVizPanel({ activePath }) {
   const [navPath, setNavPath] = useState(null); // planned path [{x,y}, ...]
   const [isNavLoading, setIsNavLoading] = useState(false); // pathfinding in progress
 
-  // Layer visibility — costmap ON by default for Nav2 experience
+  // Layer visibility — clean defaults, user can toggle from toolbar
   const [layers, setLayers] = useState({
-    grid: true, map: true, costmap: true, walls: true,
-    laser: true, path: true, robot: true, tf: false, frontier: true,
-    footprint: true, localCostmap: true, dwaPreview: true, trail: true,
+    grid: true, map: true, costmap: false, walls: true,
+    laser: true, path: true, robot: true, tf: false, frontier: false,
+    footprint: true, localCostmap: false, dwaPreview: false, trail: false,
   });
 
   const toggleLayer = useCallback((id) => {
@@ -164,6 +167,7 @@ export default function RVizPanel({ activePath }) {
   const appNavigationSessions = useNavStore((s) => s.appNavigationSessions);
   const navigateToGoal = useNavStore((s) => s.navigateToGoal);
   const stopAppNavigation = useNavStore((s) => s.stopAppNavigation);
+  const navStopRobot = useNavStore((s) => s.navStopRobot);
   const dwaTrajectories = useNavStore((s) => s.dwaTrajectories);
 
   // Robot trail tracking
@@ -182,11 +186,12 @@ export default function RVizPanel({ activePath }) {
   const navSession = activeRobotId ? appNavigationSessions[activeRobotId] : null;
   const firstSimInfo = Object.values(simInfo)[0];
   const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
+  const hasCancelableGoal = !!goalMarker || !!navSession?.active || ['TRACK', 'F_TURN', 'RECOVERY_SPIN', 'RECOVERY_BACKUP', 'RECOVERY_REPLAN', 'PAUSED'].includes(telem.nav);
 
   // Data source detection for mode badge
   const dataSource = activeRobot?._sim ? 'sim'
     : (activeRobot?.telemetry?.hitl || activeRobot?.connection?.hitlEnabled) ? 'hitl'
-    : activeRobot ? 'real' : 'none';
+      : activeRobot ? 'real' : 'none';
 
   // Stabilize simWorldSegments: use empty array in real mode to prevent
   // sim engine's 60Hz state updates from triggering canvas re-renders/flicker.
@@ -235,8 +240,28 @@ export default function RVizPanel({ activePath }) {
     prevNavActive.current = isActive;
   }, [navSession?.active]);
 
+  // ── Auto-Clear Goal for Onboard mode (ESP32 manages nav) ──
+  // When ESP32 telemetry reports DONE or ERROR, clear the goal marker
+  const prevNavStatus = useRef(null);
+  useEffect(() => {
+    const navStatus = telem.nav;
+    if (prevNavStatus.current && prevNavStatus.current !== 'IDLE' && prevNavStatus.current !== 'DONE' && prevNavStatus.current !== 'ERROR') {
+      // Was navigating, now finished
+      if (navStatus === 'DONE' || navStatus === 'ERROR' || navStatus === 'IDLE') {
+        if (goalMarker && !navSession?.active) {
+          // Onboard mode: clear goal after ESP32 finishes
+          setTimeout(() => {
+            setGoalMarker(null);
+            setNavPath(null);
+          }, 2000); // Show goal for 2s after completion for visual feedback
+        }
+      }
+    }
+    prevNavStatus.current = navStatus;
+  }, [telem.nav, goalMarker, navSession?.active]);
+
   // ── Wheel Event (Non-Passive) ─────────────────────────────
-  
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -296,7 +321,10 @@ export default function RVizPanel({ activePath }) {
         .then((result) => {
           setIsNavLoading(false);
           if (result.success) {
-            setNavPath(result.path);
+            // Onboard mode returns empty path (ESP32 manages it) — keep goal marker visible
+            if (result.path && result.path.length > 0) {
+              setNavPath(result.path);
+            }
           } else {
             console.warn(`[RVizTDTU] ❌ ${result.error}`);
             setGoalMarker(null);
@@ -333,12 +361,15 @@ export default function RVizPanel({ activePath }) {
   }, [activeTool, measurePoints, viewport, activeRobotId, telem, robots, navigateToGoal]);
 
   const handleClearGoal = useCallback(() => {
-    if (activeRobotId && navSession?.active) {
-      stopAppNavigation(activeRobotId, 'CANCELED', true);
+    if (activeRobotId) {
+      navStopRobot(activeRobotId);
+      if (navSession?.active) {
+        stopAppNavigation(activeRobotId, 'CANCELED', true);
+      }
     }
     setGoalMarker(null);
     setNavPath(null);
-  }, [activeRobotId, navSession, stopAppNavigation]);
+  }, [activeRobotId, navSession, navStopRobot, stopAppNavigation]);
 
   // Right-click to clear measurements & goal
   const handleContextMenu = useCallback((e) => {
@@ -432,10 +463,11 @@ export default function RVizPanel({ activePath }) {
         if (layers.tf) drawTFFrames(ctx, w, h, vp, { x: telem.x, y: telem.y, theta: headingRad }, tf);
       }
 
-      // Goal marker — use enhanced version during nav
+      // Goal marker — show enhanced version during active nav, simple marker otherwise
       if (goalMarker && navSession?.active && telem.x !== undefined) {
         drawGoalPoseArrow(ctx, vp, goalMarker, telem.x, telem.y);
       } else if (goalMarker) {
+        // Also show for Onboard mode where there's no browser navSession
         drawGoalMarker(ctx, vp, goalMarker);
       }
 
@@ -454,12 +486,12 @@ export default function RVizPanel({ activePath }) {
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
-  // NOTE: simWorldSegments intentionally excluded when dataSource==='real'
-  // to prevent sim engine tick updates from causing canvas flicker.
-  // When dataSource changes, the effect re-runs via dataSource dep.
-  }, [canvasSize, viewport, layers, grid, telem, activePath, 
-      dataSource === 'real' ? null : simWorldSegments,
-      tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId, dataSource]);
+    // NOTE: simWorldSegments intentionally excluded when dataSource==='real'
+    // to prevent sim engine tick updates from causing canvas flicker.
+    // When dataSource changes, the effect re-runs via dataSource dep.
+  }, [canvasSize, viewport, layers, grid, telem, activePath,
+    dataSource === 'real' ? null : simWorldSegments,
+    tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId, dataSource]);
 
   // ── JSX ───────────────────────────────────────────────────
 
@@ -471,11 +503,11 @@ export default function RVizPanel({ activePath }) {
         <span style={{
           fontSize: '9px', padding: '1px 8px', borderRadius: '4px', fontWeight: 600, marginLeft: '8px',
           background: dataSource === 'sim' ? 'rgba(139,92,246,0.2)' :
-                      dataSource === 'hitl' ? 'rgba(59,130,246,0.2)' :
-                      dataSource === 'real' ? 'rgba(16,185,129,0.2)' : 'rgba(100,116,139,0.2)',
+            dataSource === 'hitl' ? 'rgba(59,130,246,0.2)' :
+              dataSource === 'real' ? 'rgba(16,185,129,0.2)' : 'rgba(100,116,139,0.2)',
           color: dataSource === 'sim' ? '#c4b5fd' :
-                 dataSource === 'hitl' ? '#93c5fd' :
-                 dataSource === 'real' ? '#6ee7b7' : '#94a3b8',
+            dataSource === 'hitl' ? '#93c5fd' :
+              dataSource === 'real' ? '#6ee7b7' : '#94a3b8',
         }}>
           {dataSource === 'sim' && 'SimLidar (Browser)'}
           {dataSource === 'hitl' && 'HITL Hybrid'}
@@ -483,13 +515,13 @@ export default function RVizPanel({ activePath }) {
           {dataSource === 'none' && 'No Data'}
         </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
-          {goalMarker && (
+          {hasCancelableGoal && (
             <button
               style={{ ...headerBtnStyle(false), color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.4)' }}
               onClick={handleClearGoal}
               title="Clear Goal & Cancel Navigation"
             >
-              ❌ Clear Goal
+              Cancel Goal
             </button>
           )}
           <button

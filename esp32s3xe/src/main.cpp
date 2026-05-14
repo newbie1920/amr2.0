@@ -492,13 +492,16 @@ void lidarTask(void *pvParameters) {
           millis() - lastGridUpdateTime > GRID_UPDATE_INTERVAL &&
           gridMapper.point_count > 180) {
 
-        // ── SLAM v2: Copy scan buffer BEFORE update_grid clears it ──
-        // This fixes the race condition where ICP was comparing against an empty buffer
+        // ── SLAM v3: ICP-FIRST PIPELINE ──
+        // Order: Copy scan → ICP correct TF → THEN update grid with corrected pose
+        // This ensures map always uses the best-available pose estimate.
+
+        // Step 1: Copy scan buffer BEFORE update_grid clears it
         static LidarPoint icpCurrentScan[360];
         int icpCurrentLen = gridMapper.point_count;
         memcpy(icpCurrentScan, gridMapper.points, icpCurrentLen * sizeof(LidarPoint));
         
-        // Track odometry delta between scans (for ICP init guess)
+        // Step 2: Track odometry delta between scans (for ICP init guess)
         // Thread-safe: snapshot odom pose under spinlock
         static float prevOdomX = robotX, prevOdomY = robotY, prevOdomTheta = robotTheta;
         PoseSnapshot odomSnap = getOdomPose();
@@ -512,20 +515,17 @@ void lidarTask(void *pvParameters) {
         float localOdomDx = odomDx * cosPrev + odomDy * sinPrev;
         float localOdomDy = -odomDx * sinPrev + odomDy * cosPrev;
 
-        // Update grid using MAP-FRAME pose (odom + TF correction)
+        // Keep map pose in sync with latest encoder pose ⊕ TF (motor task also calls applyTf)
         applyTf();
-        gridMapper.update_pose(mapX, mapY, mapTheta);
-        gridMapper.update_grid();  // This clears gridMapper.points!
-        lastGridUpdateTime = millis();
 
-        // ── ICP Pose Correction → updates TF, NOT odom ──────────────
+        // ── Step 3: ICP Pose Correction FIRST → fix TF BEFORE grid update ──
+        // This is the key change: correct pose BEFORE writing to map
         if (!hitlMode &&
             icpPrevScan != nullptr &&
             !icpFirstScan &&
             icpPrevLen > 0 &&
             (fabsf(targetLeftVel) > 0.01f || fabsf(targetRightVel) > 0.01f)) {
 
-            // Use odometry delta as initial guess (helps ICP converge faster)
             IcpMatcher::Pose2D initGuess = {localOdomDx, localOdomDy, odomDTheta};
             IcpMatcher::Pose2D correction;
 
@@ -534,39 +534,43 @@ void lidarTask(void *pvParameters) {
                     icpCurrentScan, icpCurrentLen,
                     initGuess, correction)) {
 
-                // Calculate ICP error in local frame (Difference between matched and odom)
-                float errLocalX = correction.x - localOdomDx;
-                float errLocalY = correction.y - localOdomDy;
-                float errTheta  = correction.theta - odomDTheta;
-
-                // Clamp error — tránh jump lớn do nhiễu
-                errLocalX = constrain(errLocalX, -0.05f, 0.05f);
-                errLocalY = constrain(errLocalY, -0.05f, 0.05f);
-                errTheta  = constrain(errTheta,  -0.08f, 0.08f);
-
-                // Transform error to global map frame
-                float prevMapTheta = prevOdomTheta + tfDTheta;
-                float cosMap = cosf(prevMapTheta);
-                float sinMap = sinf(prevMapTheta);
-                float errMapX = errLocalX * cosMap - errLocalY * sinMap;
-                float errMapY = errLocalX * sinMap + errLocalY * cosMap;
-
-                // SLAM v2: Update TF map→odom transform (NOT raw odometry!)
-                const float ICP_WEIGHT = 0.4f;
-                updateTf(errMapX, errMapY, errTheta, ICP_WEIGHT);
-
-                // Log RMS chất lượng
+                // A3: Quality gate — reject poor matches
                 icpRmsLast = icpMatcher.computeRMS(
                     icpPrevScan, icpPrevLen,
                     icpCurrentScan, icpCurrentLen,
                     correction);
 
+                // Only apply correction if RMS is good (< 0.08m)
+                if (icpRmsLast >= 0.0f && icpRmsLast < 0.08f) {
+                    // Calculate ICP error in local frame
+                    float errLocalX = correction.x - localOdomDx;
+                    float errLocalY = correction.y - localOdomDy;
+                    float errTheta  = correction.theta - odomDTheta;
+
+                    // Clamp error — tránh jump lớn do nhiễu
+                    errLocalX = constrain(errLocalX, -0.03f, 0.03f);
+                    errLocalY = constrain(errLocalY, -0.03f, 0.03f);
+                    errTheta  = constrain(errTheta,  -0.05f, 0.05f);
+
+                    // Transform error to global map frame
+                    float prevMapTheta = prevOdomTheta + tfDTheta;
+                    float cosMap = cosf(prevMapTheta);
+                    float sinMap = sinf(prevMapTheta);
+                    float errMapX = errLocalX * cosMap - errLocalY * sinMap;
+                    float errMapY = errLocalX * sinMap + errLocalY * cosMap;
+
+                    // Update TF (NOT raw odometry!)
+                    const float ICP_WEIGHT = 0.5f;
+                    updateTf(errMapX, errMapY, errTheta, ICP_WEIGHT);
+                }
+
                 static unsigned long lastIcpLog = 0;
                 if (millis() - lastIcpLog > 2000) {
                     lastIcpLog = millis();
-                    Serial.printf("[ICP] dx=%.3f dy=%.3f dth=%.3f rms=%.4f tf=(%.3f,%.3f,%.3f)\n",
+                    Serial.printf("[ICP] dx=%.3f dy=%.3f dth=%.3f rms=%.4f tf=(%.3f,%.3f,%.3f)%s\n",
                         correction.x, correction.y, correction.theta, icpRmsLast,
-                        tfDx, tfDy, tfDTheta);
+                        tfDx, tfDy, tfDTheta,
+                        (icpRmsLast >= 0.08f) ? " REJECTED" : "");
                 }
             }
         }
@@ -578,31 +582,29 @@ void lidarTask(void *pvParameters) {
             icpFirstScan = false;
         }
         
-        // Update prev odom for next delta calculation (thread-safe snapshot)
+        // Update prev odom for next delta calculation
         prevOdomX = odomSnap.x;
         prevOdomY = odomSnap.y;
         prevOdomTheta = odomSnap.theta;
 
-        // ── CSM: Correlative Scan Matching (activates after grid has data) ──
-        // CSM uses the occupancy grid directly (likelihood field) → more robust
-        // than ICP point-to-point for structured environments.
-        // Strategy: ICP runs always (fast, incremental). CSM runs additionally
-        // when grid is mature, providing higher-quality corrections.
-        if (csmInitialized && 
+        // ── Step 3b: CSM scan-to-map (safe here: grid does NOT yet contain icpCurrentScan) ──
+        // Lets the robot re-localize when nearly stopped (no ICP motion gate) and
+        // avoids the old "self match" failure mode that happened when CSM ran after update_grid.
+        if (csmInitialized &&
             !hitlMode &&
-            gridMapper.scanCount > CSM_MIN_SCANS &&
-            icpCurrentLen > 30 &&
-            (fabsf(targetLeftVel) > 0.01f || fabsf(targetRightVel) > 0.01f)) {
-            
+            gridMapper.scanCount >= CSM_MIN_SCANS &&
+            icpCurrentLen > 30) {
+
+            PoseSnapshot mapForCsm = getMapPose();
             CsmResult csmResult;
             if (csmMatcher.matchScan(
-                    gridMapper, mapX, mapY, mapTheta,
+                    gridMapper, mapForCsm.x, mapForCsm.y, mapForCsm.theta,
                     icpCurrentScan, icpCurrentLen,
                     csmResult)) {
-                
-                // CSM correction → accumulate into TF
-                const float CSM_WEIGHT = 0.3f;  // Slightly lower than ICP to avoid overcorrection
+
+                const float CSM_WEIGHT = 0.25f;
                 updateTf(csmResult.dx, csmResult.dy, csmResult.dTheta, CSM_WEIGHT);
+                applyTf();
 
                 static unsigned long lastCsmLog = 0;
                 if (millis() - lastCsmLog > 3000) {
@@ -614,6 +616,12 @@ void lidarTask(void *pvParameters) {
             }
             slamDiag.scanMatchMs = csmMatcher.lastMatchMs;
         }
+
+        // ── Step 4: Update grid with CORRECTED pose (A1 fix: thread-safe) ──
+        PoseSnapshot correctedPose = getMapPose();
+        gridMapper.update_pose(correctedPose.x, correctedPose.y, correctedPose.theta);
+        gridMapper.update_grid();  // This clears gridMapper.points!
+        lastGridUpdateTime = millis();
 
         // ── SLAM Diagnostics update ──────────────────────────────
         slamDiag.updateMatchScore(icpRmsLast);

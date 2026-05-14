@@ -43,7 +43,7 @@ struct LidarPoint {
 // ── Occupancy Grid Mapper ────────────────────────────────────
 class OccupancyGridMapper {
 public:
-    int8_t grid[GRID_SIZE][GRID_SIZE];
+    int8_t* grid;
     float originX, originY;
     float robot_x, robot_y, robot_heading;
 
@@ -53,14 +53,33 @@ public:
     int scanCount;
 
     OccupancyGridMapper()
-        : originX(-6.4f), originY(-6.4f),
+        : originX(-GRID_WIDTH_M / 2.0f), originY(-GRID_HEIGHT_M / 2.0f),
           robot_x(0), robot_y(0), robot_heading(0),
           point_count(0), scanCount(0) {
-        memset(grid, LOGODDS_UNKNOWN, sizeof(grid));
+        
+        // Allocate 1MB grid on PSRAM!
+        grid = (int8_t*)heap_caps_malloc(GRID_SIZE * GRID_SIZE, MALLOC_CAP_SPIRAM);
+        if (grid) {
+            memset(grid, LOGODDS_UNKNOWN, GRID_SIZE * GRID_SIZE);
+        } else {
+            Serial.println("[ERROR] Failed to allocate OccupancyGrid in PSRAM!");
+        }
+    }
+
+    ~OccupancyGridMapper() {
+        if (grid) heap_caps_free(grid);
+    }
+
+    inline int8_t& grid_cell(int gx, int gy) {
+        return grid[gy * GRID_SIZE + gx];
+    }
+
+    inline const int8_t& grid_cell_const(int gx, int gy) const {
+        return grid[gy * GRID_SIZE + gx];
     }
 
     void reset() {
-        memset(grid, LOGODDS_UNKNOWN, sizeof(grid));
+        if (grid) memset(grid, LOGODDS_UNKNOWN, GRID_SIZE * GRID_SIZE);
         point_count = 0;
         scanCount = 0;
     }
@@ -84,6 +103,7 @@ public:
     }
 
     void update_grid() {
+        if (!grid) return;
         for (int i = 0; i < point_count; i++) {
             const LidarPoint& pt = points[i];
             if (!pt.quality) continue;
@@ -99,7 +119,7 @@ public:
                 int gx = world_to_grid_x(end_x);
                 int gy = world_to_grid_y(end_y);
                 if (in_bounds(gx, gy)) {
-                    grid[gy][gx] = constrain_logodds(grid[gy][gx] + LOGODDS_OCC);
+                    grid_cell(gx, gy) = constrain_logodds(grid_cell(gx, gy) + LOGODDS_OCC);
                 }
             }
         }
@@ -108,8 +128,8 @@ public:
     }
 
     uint8_t get_occupancy(int gx, int gy) const {
-        if (!in_bounds(gx, gy)) return 50;
-        int8_t logodds = grid[gy][gx];
+        if (!in_bounds(gx, gy) || !grid) return 50;
+        int8_t logodds = grid_cell_const(gx, gy);
         float prob = 50.0f + (logodds * 0.625f);
         return (uint8_t)constrain(prob, 0.0f, 100.0f);
     }
@@ -123,6 +143,9 @@ public:
 
     // ── Serialize for WebSocket ──────────────────────────────
     void serialize_grid(uint8_t* buffer, int& len) {
+        // Warning: with 1024x1024, serializing the whole grid is 1MB.
+        // It must be windowed/compressed before sending.
+        // For now, this is kept as is, but be cautious with large grids.
         len = 0;
         for (int y = 0; y < GRID_SIZE; y++)
             for (int x = 0; x < GRID_SIZE; x++)
@@ -137,6 +160,7 @@ private:
     }
 
     void raycast_free(float x0, float y0, float x1, float y1) {
+        if (!grid) return;
         int gx0 = world_to_grid_x(x0), gy0 = world_to_grid_y(y0);
         int gx1 = world_to_grid_x(x1), gy1 = world_to_grid_y(y1);
 
@@ -149,7 +173,7 @@ private:
         while (true) {
             if (x == gx1 && y == gy1) break;
             if (in_bounds(x, y)) {
-                grid[y][x] = constrain_logodds(grid[y][x] + LOGODDS_FREE);
+                grid_cell(x, y) = constrain_logodds(grid_cell(x, y) + LOGODDS_FREE);
             }
             int e2 = 2 * err;
             if (e2 > -dy) { err -= dy; x += sx; }

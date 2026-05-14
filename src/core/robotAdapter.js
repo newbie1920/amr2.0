@@ -28,6 +28,7 @@ class BaseRobotAdapter {
     this.onError = null;
     this.onNavAck = null;
     this.onLidarGrid = null;
+    this.onRawLidar = null;
   }
 
   // — Connection —
@@ -48,6 +49,7 @@ class BaseRobotAdapter {
   recalibrateGyro() { throw new Error('Not implemented'); }
   setBrake(enabled) { throw new Error('Not implemented'); }
   setArchitectureProfile(profile) { throw new Error('Not implemented'); }
+  setDualMode(mode) { throw new Error('Not implemented'); }
   sendConfig(config) { /* optional */ }
 
   // — Cleanup —
@@ -94,6 +96,9 @@ export class RealRobotAdapter extends BaseRobotAdapter {
     this._conn.onLidarGrid = (grid) => {
       if (this.onLidarGrid) this.onLidarGrid(grid);
     };
+    this._conn.onRawLidar = (points) => {
+      if (this.onRawLidar) this.onRawLidar(points);
+    };
   }
 
   connect() { this._conn.connect(); }
@@ -112,6 +117,7 @@ export class RealRobotAdapter extends BaseRobotAdapter {
   recalibrateGyro() { this._conn.recalibrateGyro(); }
   setBrake(enabled) { this._conn.setBrake(enabled); }
   setArchitectureProfile(profile) { this._conn.setArchitectureProfile(profile); }
+  setDualMode(mode) { this.architectureProfile = mode === 'pc_browser' ? 'pc_slam' : 'hybrid'; this._conn.setDualMode(mode); }
   sendConfig(config) { this._conn.sendConfig(config); }
   sendMapData(grid) { return this._conn.sendMapData(grid); }
 
@@ -186,6 +192,7 @@ export class SimRobotAdapter extends BaseRobotAdapter {
   recalibrateGyro() { /* no-op for sim */ }
   setBrake(enabled) { if (enabled) this.engine.setVelocity(0, 0); }
   setArchitectureProfile(profile) { /* no-op */ }
+  setDualMode(mode) { /* no-op for sim */ }
   sendMapData(grid) { /* no-op */ return true; }
 
   /** Get SimEngine info for UI */

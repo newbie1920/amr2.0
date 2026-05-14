@@ -199,16 +199,31 @@ const useRobotStore = create((set, get) => ({
     };
 
     // Handle LIDAR occupancy grid updates from ESP32 binary stream.
-    // CRITICAL: Must update BOTH occupancyGrid AND mapperInstances to prevent
-    // the browser-side mapper (processLidarTick) from overwriting with stale data
-    // that has a different origin, which causes map stacking/overlapping.
-    connection.onLidarGrid = (grid) => {
+    connection.onLidarGrid = (bufferOrGrid) => {
       try {
+        // Skip ESP32 grid in PC SLAM mode — browser builds its own map from raw 0x06 scans.
+        // Without this guard, two mapping pipelines fight → map smears ("bết").
+        if (connection.architectureProfile === 'pc_slam') return;
+
         const mapStore = useMapStore.getState();
-        useMapStore.setState((s) => ({
-          occupancyGrid: { ...s.occupancyGrid, [id]: grid },
-          mapperInstances: { ...s.mapperInstances, [id]: grid },
-        }));
+        if (bufferOrGrid instanceof ArrayBuffer) {
+           const existingGrid = mapStore.occupancyGrid[id];
+           import('../core/lidarMapper.js').then(module => {
+             const OccupancyGrid = module.default;
+             const updatedGrid = OccupancyGrid.updateFromRLEWindow(bufferOrGrid, existingGrid);
+             
+             useMapStore.setState((s) => ({
+               occupancyGrid: { ...s.occupancyGrid, [id]: updatedGrid },
+               mapperInstances: { ...s.mapperInstances, [id]: updatedGrid },
+             }));
+           }).catch(err => console.error(`[RobotStore] Error parsing RLE grid:`, err));
+        } else {
+           // legacy grid object
+           useMapStore.setState((s) => ({
+             occupancyGrid: { ...s.occupancyGrid, [id]: bufferOrGrid },
+             mapperInstances: { ...s.mapperInstances, [id]: bufferOrGrid },
+           }));
+        }
       } catch (e) { }
     };
 

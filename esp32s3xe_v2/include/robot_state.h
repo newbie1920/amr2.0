@@ -94,12 +94,15 @@ struct RobotState {
     } power;
 
     // ── Navigation ──
+    enum NavMode { MODE_ONBOARD, MODE_PC_BROWSER };
+    
     struct {
         bool hitlMode = false;
         bool explorationRequested = false;
         bool streamOccupancyGrid = true;
         bool allowOnboardNav = true;
         const char* archProfile = "hybrid";
+        NavMode mode = MODE_ONBOARD;
     } nav;
 
     // ── ICP/SLAM diagnostics ──
@@ -145,10 +148,10 @@ inline PoseSnapshot getMapPose() {
 
 // Apply TF: map = odom ⊕ tf
 inline void applyTf() {
-    float cosT = cosf(state.tf.dTheta);
-    float sinT = sinf(state.tf.dTheta);
-    state.map.x     = state.odom.x * cosT - state.odom.y * sinT + state.tf.dx;
-    state.map.y     = state.odom.x * sinT + state.odom.y * cosT + state.tf.dy;
+    // Keep translation in the fixed map frame. Rotating absolute odom around
+    // the world origin makes the displayed map jump when dTheta changes.
+    state.map.x     = state.odom.x + state.tf.dx;
+    state.map.y     = state.odom.y + state.tf.dy;
     state.map.theta = state.odom.theta + state.tf.dTheta;
     // Normalize angle
     state.map.theta = atan2f(sinf(state.map.theta), cosf(state.map.theta));
@@ -156,10 +159,17 @@ inline void applyTf() {
 
 // Weighted TF update (from ICP/CSM corrections)
 inline void updateTf(float dx, float dy, float dtheta, float weight) {
+    const float maxStepXY = 0.03f;      // meters per scan update
+    const float maxStepTheta = 0.035f;  // about 2 deg per scan update
+    const float stepX = constrain(dx * weight, -maxStepXY, maxStepXY);
+    const float stepY = constrain(dy * weight, -maxStepXY, maxStepXY);
+    const float stepTheta = constrain(dtheta * weight, -maxStepTheta, maxStepTheta);
+
     portENTER_CRITICAL(&stateMux);
-    state.tf.dx     += dx * weight;
-    state.tf.dy     += dy * weight;
-    state.tf.dTheta += dtheta * weight;
+    state.tf.dx     += stepX;
+    state.tf.dy     += stepY;
+    state.tf.dTheta += stepTheta;
+    state.tf.dTheta = atan2f(sinf(state.tf.dTheta), cosf(state.tf.dTheta));
     applyTf();
     portEXIT_CRITICAL(&stateMux);
 }

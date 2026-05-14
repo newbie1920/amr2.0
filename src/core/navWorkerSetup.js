@@ -16,10 +16,14 @@
 
 import * as Comlink from 'comlink';
 import NavWorker from './navWorker.js?worker';
+import PcSlamWorker from './pcSlamWorker.js?worker';
 
 let _workerApi = null;
+let _pcSlamWorkerApi = null;
+
 if (typeof Worker !== 'undefined') {
   _workerApi = Comlink.wrap(new NavWorker());
+  _pcSlamWorkerApi = Comlink.wrap(new PcSlamWorker());
 }
 
 // Primary export — simulation/SLAM worker
@@ -27,3 +31,6 @@ export const simNavWorkerApi = _workerApi;
 
 // Backward-compatible alias — will be deprecated
 export const navWorkerApi = _workerApi;
+
+// PC SLAM WebWorker
+export const pcSlamWorkerApi = _pcSlamWorkerApi;

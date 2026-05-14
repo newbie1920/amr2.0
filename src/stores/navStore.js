@@ -196,6 +196,19 @@ const useNavStore = create((set, get) => ({
       return;
     }
     console.log(`[NavStore] 🧠 NavMode set: ${robotId} → ${mode}`);
+    
+    // Also notify the robot to update its dual-mode state
+    const robotState = getRobotStore();
+    const robot = robotState.robots[robotId];
+    if (robot) {
+      const modeString = mode === 'pc' ? 'pc_browser' : 'onboard';
+      if (robot.adapter?.connected) {
+        robot.adapter.setDualMode(modeString);
+      } else if (robot.connection?.connected) {
+        robot.connection.setDualMode(modeString);
+      }
+    }
+
     set((s) => ({
       navModes: { ...s.navModes, [robotId]: mode },
     }));
@@ -215,8 +228,12 @@ const useNavStore = create((set, get) => ({
 
   /**
    * Start app-side navigation session (Nav2-style path following)
+   * @param {string} id - Robot ID
+   * @param {Array} path - Path to follow
+   * @param {number|null} finalHeading - Optional final heading
+   * @param {boolean} offloaded - If true, delegates execution to ESP32 and only syncs UI state
    */
-  startAppNavigation: (id, path, finalHeading = null) => {
+  startAppNavigation: (id, path, finalHeading = null, offloaded = false) => {
     const robotState = getRobotStore();
     const robot = robotState.robots[id];
     if (!robot || path?.length === 0) {
@@ -233,7 +250,8 @@ const useNavStore = create((set, get) => ({
 
     setRobotArchitectureProfile(robot, 'pc_slam');
     const session = createAppNavigationSession(path, finalHeading);
-    console.log('[AppNav] ✅ startAppNavigation SUCCESS', { id, pathLen: path.length, goal: session.goal, active: session.active });
+    session.offloaded = offloaded; // Track offloaded state
+    console.log(`[AppNav] ✅ startAppNavigation SUCCESS (offloaded: ${offloaded})`, { id, pathLen: path.length, goal: session.goal, active: session.active });
     set((state) => ({
       appNavigationSessions: {
         ...state.appNavigationSessions,
@@ -497,6 +515,22 @@ const useNavStore = create((set, get) => ({
       // ── PURE PURSUIT PATH FOLLOWER (main-thread, zero-latency) ──
       // The pre-computed path avoids known obstacles,
       // but we ALSO check live costmap to catch dynamic obstacles and drift.
+      
+      if (nextSession.offloaded) {
+          // Offloaded mode: ESP32 runs DWA. We just sync the UI state.
+          if (telem.nav === 'DONE') {
+              get().stopAppNavigation(id, 'DONE', true);
+              return { nav: 'DONE', nav_wp: nextSession.path.length, nav_total: nextSession.path.length };
+          }
+          nextSession.currentWaypointIndex = telem.navWp || 0;
+          nextSession.status = telem.nav || 'TRACK';
+          
+          set((s) => ({
+            appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
+          }));
+          return buildAppNavOverlay(nextSession);
+      }
+      
       const remainingPath = nextSession.path.slice(nextSession.currentWaypointIndex);
       if (remainingPath.length === 0) {
         if (mux) mux.release(VEL_SOURCE.NAVIGATION);
@@ -760,30 +794,58 @@ const useNavStore = create((set, get) => ({
       const startY = telem.y ?? 0;
       const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
 
-      if (!grid) {
+      // Helper: send direct path (fallback when A* fails or no grid)
+      const sendDirectPath = (reason) => {
+        console.log(`[NavStore] 📍 PC Nav fallback (${reason}): direct path to goal`);
         const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
-        get().startAppNavigation(robotId, path, finalHeading);
+        get().startAppNavigation(robotId, path, finalHeading, true);
+        // Also send to ESP32 as waypoints
+        if (robot.adapter) {
+          robot.adapter.navigate(path, finalHeading);
+        } else if (robot.connection) {
+          robot.connection.navigate(path, finalHeading);
+        }
         return { success: true, path };
+      };
+
+      if (!grid) {
+        return sendDirectPath('no grid available');
       }
 
       if (!navWorkerApi) {
-        return { success: false, error: 'NavWorker not available' };
+        return sendDirectPath('NavWorker not available');
       }
 
       try {
+        // Check if grid has serialize method (ESP32 RLE grid = OccupancyGrid instance)
+        if (typeof grid.serialize !== 'function') {
+          return sendDirectPath('grid has no serialize method');
+        }
+
         const navSessions = get().appNavigationSessions;
         const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
         const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
         if (result.success && result.path.length > 1) {
-          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints`);
-          get().startAppNavigation(robotId, result.path, finalHeading);
+          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints. Offloading execution to ESP32.`);
+            
+          // Start UI tracking session but mark as offloaded
+          get().startAppNavigation(robotId, result.path, finalHeading, true);
+          
+          // Inject ext_waypoints to ESP32 via binary protocol
+          if (robot.adapter) {
+              robot.adapter.navigate(result.path, finalHeading);
+          } else if (robot.connection) {
+              robot.connection.navigate(result.path, finalHeading);
+          }
+
           return { success: true, path: result.path };
         } else {
-          return { success: false, error: 'No path found (PC nav)' };
+          // A* failed to find path — fallback to direct
+          return sendDirectPath(`A* found no path`);
         }
       } catch (err) {
         console.error('[NavStore] PC nav path error:', err);
-        return { success: false, error: err.message };
+        return sendDirectPath(`A* error: ${err.message}`);
       }
     }
 

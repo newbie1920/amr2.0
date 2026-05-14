@@ -10,10 +10,11 @@ import { create } from 'zustand';
 import { OccupancyGrid } from '../core/lidarMapper.js';
 import { ScanMatcher } from '../core/scanMatcher.js';
 import { startExploration, stopExploration, getExplorationInfo, _setMapStoreGetter } from '../core/exploration.js';
-import { simNavWorkerApi } from '../core/navWorkerSetup.js';
+import { simNavWorkerApi, pcSlamWorkerApi } from '../core/navWorkerSetup.js';
 import { getRobotStoreState } from './storeRegistry.js';
 
 const MAP_STORAGE_KEY = 'amr_saved_maps';
+const MAP_STORAGE_WARN_BYTES = 4 * 1024 * 1024;
 
 function loadSavedMapsFromStorage() {
   try {
@@ -27,7 +28,11 @@ function loadSavedMapsFromStorage() {
 
 function saveMapsToStorage(maps) {
   try {
-    localStorage.setItem(MAP_STORAGE_KEY, JSON.stringify(maps));
+    const payload = JSON.stringify(maps);
+    if (payload.length > MAP_STORAGE_WARN_BYTES) {
+      console.warn(`[MapStorage] Saved maps are ${(payload.length / 1024 / 1024).toFixed(1)}MB; consider exporting old maps before browser storage fills up.`);
+    }
+    localStorage.setItem(MAP_STORAGE_KEY, payload);
   } catch (e) {
     console.error('[MapStorage] Error saving maps:', e);
   }
@@ -77,6 +82,9 @@ const useMapStore = create((set, get) => ({
     }
 
     const grid = new OccupancyGrid(200, 200, 0.1, rx, ry);
+    if (pcSlamWorkerApi) {
+      pcSlamWorkerApi.init(id, 200, 200, 0.1, rx, ry);
+    }
     set((state) => ({
       mappingActive: { ...state.mappingActive, [id]: true },
       mapperInstances: { ...state.mapperInstances, [id]: grid },
@@ -88,17 +96,16 @@ const useMapStore = create((set, get) => ({
     if (isHitl || telem.onboardNavEnabled) {
       // ESP32 Onboard SLAM: Send 'explore' command
       if (robot?.connection?.connected) {
-        // 1. Reset hitlEngine to safe spawn position FIRST
-        const spawnX = 3.5, spawnY = 2.0, spawnTheta = Math.PI / 2;
+        // HITL uses a simulated world with a known spawn. Real robots must keep
+        // their current odom pose; forcing a fixed pose makes SLAM/costmap drift.
         if (isHitl && robot.connection.hitlEngine) {
+          const spawnX = 3.5, spawnY = 2.0, spawnTheta = Math.PI / 2;
           robot.connection.hitlEngine.reset(spawnX, spawnY, spawnTheta);
           console.log(`[Mapping] HITL engine reset to (${spawnX}, ${spawnY})`);
+          robot.connection._send({ cmd: 'set_pose', x: spawnX, y: spawnY, theta: spawnTheta });
         }
 
-        // 2. Sync ESP32 pose to match hitlEngine spawn (so odometry + grid mapper align)
-        robot.connection._send({ cmd: 'set_pose', x: spawnX, y: spawnY, theta: spawnTheta });
-
-        // 3. Small delay to let architecture profile and pose propagate, then send explore
+        // Small delay to let architecture profile propagate, then send explore.
         setTimeout(() => {
           robot.connection._send({ cmd: "explore" });
           console.log(`[Mapping] Đã gửi lệnh 'explore' cho ESP32 (Onboard SLAM)`);
@@ -250,9 +257,12 @@ const useMapStore = create((set, get) => ({
         // ── REAL ROBOT: ESP32 sends pre-built grid via binary WS (onLidarGrid).
         //    Browser MUST NOT also run updateFromScan — two maps fighting = flicker + rotation.
         //    Only SIM/HITL robots need browser-side scan integration.
+        //    UNLESS we are in PC SLAM mode (Phase 3), where ESP32 only sends raw 0x06 and we must build it here.
         const isRealRobot = !(isHitl || isSim);
-        if (isRealRobot) {
-          // Real robot: ESP32 grid is single source of truth.
+        const isPcSlamMode = robot?.connection?.architectureProfile === 'pc_slam' || robot?.adapter?.architectureProfile === 'pc_slam' || telem.architecture === 'pc_slam';
+
+        if (isRealRobot && !isPcSlamMode) {
+          // Real robot ONBOARD mode: ESP32 grid is single source of truth.
           // Just update robot pose on the existing grid for visualization.
           grid.robotX = odomX;
           grid.robotY = odomY;
@@ -281,11 +291,15 @@ const useMapStore = create((set, get) => ({
         }
 
         // Scan matching: SKIP in HITL/SIM mode (sim pose is already ground truth)
-        if (!(isHitl || isSim) && simNavWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
+        // Also ensure we have a valid worker and enough scans to match against.
+        if (isPcSlamMode && simNavWorkerApi && (grid.scanCount >= 3 || isLocalizing) && !state.isMatching[id]) {
           set((s) => ({ isMatching: { ...s.isMatching, [id]: true } }));
 
           simNavWorkerApi.matchScan(id, grid.serialize(), mapX, mapY, mapTheta, lidarPts).then(matched => {
             const freshState = get();
+            let finalX = mapX;
+            let finalY = mapY;
+            let finalTheta = mapTheta;
 
             if (matched.corrected) {
               const c = matched.correction;
@@ -295,6 +309,10 @@ const useMapStore = create((set, get) => ({
                 dy: freshTf.dy + c.dy,
                 dTheta: freshTf.dTheta + c.dTheta,
               };
+              
+              finalX = odomX + newTf.dx;
+              finalY = odomY + newTf.dy;
+              finalTheta = odomTheta + newTf.dTheta;
 
               set((s) => ({
                 mapToOdom: { ...s.mapToOdom, [id]: newTf },
@@ -303,20 +321,95 @@ const useMapStore = create((set, get) => ({
             } else {
               set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
             }
+
+            // PC SLAM: integrate scans into grid ONLY AFTER we have the corrected pose!
+            // This prevents "smudging" (bết bét) the map with uncorrected drifting odometry.
+            if (isPcSlamMode && pcSlamWorkerApi) {
+              pcSlamWorkerApi.processScan(id, finalX, finalY, finalTheta, lidarPts).then(serializedGrid => {
+                if (serializedGrid) {
+                  grid.scanCount = serializedGrid.scanCount;
+                  grid.logOdds.set(serializedGrid.logOdds);
+                  grid.costmap.set(serializedGrid.costmap);
+                  
+                  if (!freshState._lastGridUpdate || now - freshState._lastGridUpdate > 500) {
+                    set((s) => ({
+                      _lastGridUpdate: now,
+                      occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+                    }));
+                  }
+                }
+              }).catch(e => console.error("pcSlamWorker processScan error:", e));
+            } else {
+              grid.updateFromScan(finalX, finalY, finalTheta, lidarPts);
+
+              if (!freshState._lastGridUpdate || now - freshState._lastGridUpdate > 500) {
+                set((s) => ({
+                  _lastGridUpdate: now,
+                  occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+                }));
+              }
+            }
           }).catch(e => {
             console.error("[SLAM] Worker Error:", e);
             set((s) => ({ isMatching: { ...s.isMatching, [id]: false } }));
+            
+            // Fallback: integrate with uncorrected pose if matcher fails
+            if (isPcSlamMode && pcSlamWorkerApi) {
+              pcSlamWorkerApi.processScan(id, mapX, mapY, mapTheta, lidarPts).then(serializedGrid => {
+                if (serializedGrid) {
+                  grid.scanCount = serializedGrid.scanCount;
+                  grid.logOdds.set(serializedGrid.logOdds);
+                  grid.costmap.set(serializedGrid.costmap);
+                  
+                  if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
+                    set((s) => ({
+                      _lastGridUpdate: now,
+                      occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+                    }));
+                  }
+                }
+              }).catch(err => console.error("pcSlamWorker fallback error:", err));
+            } else {
+              grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
+            }
           });
-        }
+        } else if (isHitl || isSim) {
+          // SIM/HITL: ground truth is known, integrate immediately
+          grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
 
-        // SIM/HITL: integrate scans into grid (browser-side mapping)
-        grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
+          if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
+            set((s) => ({
+              _lastGridUpdate: now,
+              occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+            }));
+          }
+        } else if (isPcSlamMode && grid.scanCount < 3) {
+          // PC SLAM (First 3 scans): just map directly to seed the grid for matching
+          if (pcSlamWorkerApi) {
+            pcSlamWorkerApi.processScan(id, mapX, mapY, mapTheta, lidarPts).then(serializedGrid => {
+              if (serializedGrid) {
+                grid.scanCount = serializedGrid.scanCount;
+                grid.logOdds.set(serializedGrid.logOdds);
+                grid.costmap.set(serializedGrid.costmap);
+                
+                if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
+                  set((s) => ({
+                    _lastGridUpdate: now,
+                    occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+                  }));
+                }
+              }
+            }).catch(e => console.error("pcSlamWorker processScan init error:", e));
+          } else {
+            grid.updateFromScan(mapX, mapY, mapTheta, lidarPts);
 
-        if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
-          set((s) => ({
-            _lastGridUpdate: now,
-            occupancyGrid: { ...s.occupancyGrid, [id]: grid },
-          }));
+            if (!state._lastGridUpdate || now - state._lastGridUpdate > 500) {
+              set((s) => ({
+                _lastGridUpdate: now,
+                occupancyGrid: { ...s.occupancyGrid, [id]: grid },
+              }));
+            }
+          }
         }
       }
     }

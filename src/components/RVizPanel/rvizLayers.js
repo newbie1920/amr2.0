@@ -138,13 +138,13 @@ function _renderOccMapCanvas(grid) {
         // Occupied — red with intensity
         const intensity = Math.min(1.0, (lo - 0.5) / 3.5);
         const alpha = Math.round((0.4 + 0.6 * intensity) * 255);
-        data[pxIdx]     = 239;
+        data[pxIdx] = 239;
         data[pxIdx + 1] = 68;
         data[pxIdx + 2] = 68;
         data[pxIdx + 3] = alpha;
       } else if (lo < -0.5) {
         // Free — dark gray
-        data[pxIdx]     = 20;
+        data[pxIdx] = 20;
         data[pxIdx + 1] = 24;
         data[pxIdx + 2] = 30;
         data[pxIdx + 3] = 120;
@@ -219,7 +219,7 @@ export function drawCostmap(ctx, w, h, viewport, grid) {
       const worldX = grid.originX + gx * grid.resolution;
       const worldY = grid.originY + gy * grid.resolution;
       const s = worldToScreen(worldX, worldY + grid.resolution);
-      
+
       const intensity = Math.min(1.0, lo / 5.0);
       const r = Math.round(59 + 180 * intensity);
       const g = Math.round(130 - 100 * intensity);
@@ -316,7 +316,7 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
   ctx.fillStyle = 'rgba(250, 204, 21, 0.08)'; // Vàng nhạt
   ctx.beginPath();
   ctx.moveTo(rScreen.x, rScreen.y);
-  
+
   // Sắp xếp góc để vẽ polygon liên tục
   const sortedPts = [...lidarPts].sort((a, b) => a.a - b.a);
   for (const pt of sortedPts) {
@@ -470,18 +470,18 @@ export function drawTFFrames(ctx, w, h, viewport, odomPose, mapToOdom) {
   const axisLen = Math.max(15, Math.min(40, scale * 0.4));
 
   // ── Frame positions (world coords) ──────────────────────
-  const mapFrame   = { x: 0, y: 0, theta: 0 };
-  const odomFrame  = { x: tf.dx, y: tf.dy, theta: tf.dTheta };
+  const mapFrame = { x: 0, y: 0, theta: 0 };
+  const odomFrame = { x: tf.dx, y: tf.dy, theta: tf.dTheta };
   const cosO = Math.cos(odomFrame.theta);
   const sinO = Math.sin(odomFrame.theta);
-  const baseFrame  = {
+  const baseFrame = {
     x: odomFrame.x + cosO * odomPose.x - sinO * odomPose.y,
     y: odomFrame.y + sinO * odomPose.x + cosO * odomPose.y,
     theta: odomFrame.theta + odomPose.theta,
   };
 
   // ── Screen positions ────────────────────────────────────
-  const mapS  = worldToScreen(mapFrame.x, mapFrame.y);
+  const mapS = worldToScreen(mapFrame.x, mapFrame.y);
   const odomS = worldToScreen(odomFrame.x, odomFrame.y);
   const baseS = worldToScreen(baseFrame.x, baseFrame.y);
 
@@ -522,9 +522,9 @@ export function drawTFFrames(ctx, w, h, viewport, odomPose, mapToOdom) {
   _tfDot(ctx, baseS);
 
   // ── 5. Frame axes (X=red, Y=green) + labels ────────────
-  _tfAxes(ctx, mapS,  0,                  axisLen, 'map',       '#f59e0b');
-  _tfAxes(ctx, odomS, -odomFrame.theta,   axisLen, 'odom',      '#4ade80');
-  _tfAxes(ctx, baseS, -baseFrame.theta,   axisLen, 'base_link', '#f1f5f9');
+  _tfAxes(ctx, mapS, 0, axisLen, 'map', '#f59e0b');
+  _tfAxes(ctx, odomS, -odomFrame.theta, axisLen, 'odom', '#4ade80');
+  _tfAxes(ctx, baseS, -baseFrame.theta, axisLen, 'base_link', '#f1f5f9');
 }
 
 /* Smooth quadratic bezier arrow between two points */
@@ -535,7 +535,7 @@ function _tfCurve(ctx, from, to, color, lineW) {
   if (dist < 2) return;
 
   const perpX = -dy / dist;
-  const perpY =  dx / dist;
+  const perpY = dx / dist;
   const bulge = Math.min(dist * 0.18, 28);
   const cpx = (from.x + to.x) / 2 + perpX * bulge;
   const cpy = (from.y + to.y) / 2 + perpY * bulge;
@@ -550,15 +550,15 @@ function _tfCurve(ctx, from, to, color, lineW) {
 
   // arrowhead
   const t = 0.92;
-  const ax = (1-t)*(1-t)*from.x + 2*(1-t)*t*cpx + t*t*to.x;
-  const ay = (1-t)*(1-t)*from.y + 2*(1-t)*t*cpy + t*t*to.y;
+  const ax = (1 - t) * (1 - t) * from.x + 2 * (1 - t) * t * cpx + t * t * to.x;
+  const ay = (1 - t) * (1 - t) * from.y + 2 * (1 - t) * t * cpy + t * t * to.y;
   const ang = Math.atan2(to.y - ay, to.x - ax);
   const hl = 7;
   ctx.beginPath();
   ctx.moveTo(to.x, to.y);
-  ctx.lineTo(to.x - hl*Math.cos(ang-0.45), to.y - hl*Math.sin(ang-0.45));
+  ctx.lineTo(to.x - hl * Math.cos(ang - 0.45), to.y - hl * Math.sin(ang - 0.45));
   ctx.moveTo(to.x, to.y);
-  ctx.lineTo(to.x - hl*Math.cos(ang+0.45), to.y - hl*Math.sin(ang+0.45));
+  ctx.lineTo(to.x - hl * Math.cos(ang + 0.45), to.y - hl * Math.sin(ang + 0.45));
   ctx.stroke();
 }
 
@@ -611,9 +611,9 @@ function _miniArrow(ctx, tip, angle, color) {
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(tip.x, tip.y);
-  ctx.lineTo(tip.x - hl*Math.cos(angle-0.5), tip.y - hl*Math.sin(angle-0.5));
+  ctx.lineTo(tip.x - hl * Math.cos(angle - 0.5), tip.y - hl * Math.sin(angle - 0.5));
   ctx.moveTo(tip.x, tip.y);
-  ctx.lineTo(tip.x - hl*Math.cos(angle+0.5), tip.y - hl*Math.sin(angle+0.5));
+  ctx.lineTo(tip.x - hl * Math.cos(angle + 0.5), tip.y - hl * Math.sin(angle + 0.5));
   ctx.stroke();
 }
 
@@ -694,23 +694,23 @@ const _NAV2_COSTMAP_LUT = (() => {
     let r, g, b, a;
     if (i >= 253) {
       // LETHAL — dark purple/black (obstacle cell itself)
-      r = 100; g = 0; b = 50; a = 240;
+      r = 100; g = 0; b = 50; a = 180;
     } else if (i >= 200) {
       // INSCRIBED — hot magenta/pink (robot WILL collide)
       const t = (i - 200) / 53;
-      r = 255; g = Math.round(20 * (1 - t)); b = Math.round(100 + 60 * t); a = 210;
+      r = 255; g = Math.round(20 * (1 - t)); b = Math.round(100 + 60 * t); a = 140;
     } else if (i >= 128) {
       // HIGH INFLATION — magenta → deep pink
       const t = (i - 128) / 72;
-      r = Math.round(180 + 75 * t); g = Math.round(30 * (1 - t)); b = Math.round(180 + 30 * t); a = Math.round(130 + 70 * t);
+      r = Math.round(180 + 75 * t); g = Math.round(30 * (1 - t)); b = Math.round(180 + 30 * t); a = Math.round(80 + 40 * t);
     } else if (i >= 50) {
-      // MID INFLATION — cyan → magenta (the most visible gradient band)
+      // MID INFLATION — cyan → magenta
       const t = (i - 50) / 78;
-      r = Math.round(t * 180); g = Math.round(220 * (1 - t * 0.85)); b = Math.round(255 - 55 * t); a = Math.round(70 + 60 * t);
+      r = Math.round(t * 180); g = Math.round(220 * (1 - t * 0.85)); b = Math.round(255 - 55 * t); a = Math.round(40 + 40 * t);
     } else {
-      // LOW INFLATION — light cyan, semi-transparent
+      // LOW INFLATION — light cyan, very subtle
       const t = i / 50;
-      r = 0; g = Math.round(180 + 40 * t); b = 255; a = Math.round(20 + 50 * t);
+      r = 0; g = Math.round(180 + 40 * t); b = 255; a = Math.round(10 + 30 * t);
     }
     lut.push([r, g, b, a]);
   }
@@ -741,7 +741,7 @@ function _renderCostmapCanvas(grid) {
       // Flip Y: canvas row 0 is top, but grid row 0 is bottom
       const canvasRow = h - 1 - gy;
       const pxIdx = (canvasRow * w + gx) * 4;
-      data[pxIdx]     = rgba[0];
+      data[pxIdx] = rgba[0];
       data[pxIdx + 1] = rgba[1];
       data[pxIdx + 2] = rgba[2];
       data[pxIdx + 3] = rgba[3];
@@ -838,9 +838,9 @@ export function drawGoalMarker(ctx, viewport, goal) {
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.moveTo(s.x - 15, s.y); ctx.lineTo(s.x - 5, s.y);
-  ctx.moveTo(s.x + 5, s.y);  ctx.lineTo(s.x + 15, s.y);
+  ctx.moveTo(s.x + 5, s.y); ctx.lineTo(s.x + 15, s.y);
   ctx.moveTo(s.x, s.y - 15); ctx.lineTo(s.x, s.y - 5);
-  ctx.moveTo(s.x, s.y + 5);  ctx.lineTo(s.x, s.y + 15);
+  ctx.moveTo(s.x, s.y + 5); ctx.lineTo(s.x, s.y + 15);
   ctx.stroke();
 
   // Label
@@ -1147,9 +1147,9 @@ export function drawGoalPoseArrow(ctx, viewport, goal, robotX, robotY) {
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(s.x - 18, s.y); ctx.lineTo(s.x - 6, s.y);
-  ctx.moveTo(s.x + 6, s.y);  ctx.lineTo(s.x + 18, s.y);
+  ctx.moveTo(s.x + 6, s.y); ctx.lineTo(s.x + 18, s.y);
   ctx.moveTo(s.x, s.y - 18); ctx.lineTo(s.x, s.y - 6);
-  ctx.moveTo(s.x, s.y + 6);  ctx.lineTo(s.x, s.y + 18);
+  ctx.moveTo(s.x, s.y + 6); ctx.lineTo(s.x, s.y + 18);
   ctx.stroke();
 
   // Label

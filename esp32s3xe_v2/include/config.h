@@ -117,7 +117,7 @@
 // ============================================================
 //   SLAM / MAPPING
 // ============================================================
-#define GRID_SIZE       128
+#define GRID_SIZE       1024
 #define GRID_RESOLUTION 0.05f  // 5cm per cell
 #define GRID_UPDATE_INTERVAL_MS 200
 #define CSM_MIN_SCANS   10

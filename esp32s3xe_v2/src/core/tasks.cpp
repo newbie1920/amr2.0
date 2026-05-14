@@ -38,6 +38,7 @@ WheelPID rightPID(KP_VEL, KI_VEL, 0, FF_GAIN_RIGHT, 1.0f / CONTROL_FREQ_HZ, 5.0f
 // ── ICP Scan Matching buffers ────────────────────────────────
 static IcpMatcher icpMatcher;
 static LidarPoint* icpPrevScan = nullptr;
+static LidarPoint* icpCurrentScan = nullptr;  // PSRAM-backed (was static BSS)
 static int  icpPrevLen   = 0;
 static bool icpFirstScan = true;
 
@@ -116,7 +117,7 @@ void controlTask(void* pvParameters) {
         }
 
         // ── Navigator update (50Hz) ──────────────────────
-        if (state.nav.allowOnboardNav && navigator.isNavigating()) {
+        if (state.nav.mode == RobotState::MODE_ONBOARD && state.nav.allowOnboardNav && navigator.isNavigating()) {
             PoseSnapshot mapPose = getMapPose();
             navigator.update(mapPose.x, mapPose.y, mapPose.theta);
 
@@ -126,7 +127,7 @@ void controlTask(void* pvParameters) {
                 state.nav.streamOccupancyGrid) {
 
                 lastDwaTime = millis();
-                dwaPlanner.buildCostmap(gridMapper);
+                dwaPlanner.buildCostmap(gridMapper, mapPose.x, mapPose.y);
                 dwaPlanner.clearRobotFootprint(mapPose.x, mapPose.y, gridMapper);
 
                 DwaResult dwa = dwaPlanner.computeVelocity(
@@ -181,13 +182,24 @@ void lidarTask(void* pvParameters) {
     unsigned long lidarFailCount = 0;
     int consecutiveFails = 0;
 
-    // Allocate ICP prev-scan buffer in PSRAM if available
+    // Allocate ICP scan buffers in PSRAM if available
     if (ESP.getFreePsram() > 4096) {
-        icpPrevScan = (LidarPoint*)ps_malloc(360 * sizeof(LidarPoint));
-        LOG_I("SLAM", "ICP buffer allocated in PSRAM (%d bytes)", 360 * (int)sizeof(LidarPoint));
+        icpPrevScan    = (LidarPoint*)ps_malloc(OccupancyGridMapper::MAX_POINTS * sizeof(LidarPoint));
+        icpCurrentScan = (LidarPoint*)ps_malloc(OccupancyGridMapper::MAX_POINTS * sizeof(LidarPoint));
     } else {
-        icpPrevScan = (LidarPoint*)malloc(360 * sizeof(LidarPoint));
-        LOG_I("SLAM", "ICP buffer allocated in SRAM");
+        icpPrevScan    = (LidarPoint*)malloc(OccupancyGridMapper::MAX_POINTS * sizeof(LidarPoint));
+        icpCurrentScan = (LidarPoint*)malloc(OccupancyGridMapper::MAX_POINTS * sizeof(LidarPoint));
+    }
+    if (icpPrevScan != nullptr && icpCurrentScan != nullptr) {
+        LOG_I("SLAM", "ICP buffers allocated (%d bytes each, PSRAM: %s)",
+            OccupancyGridMapper::MAX_POINTS * (int)sizeof(LidarPoint),
+            psramFound() ? "yes" : "no");
+    } else {
+        free(icpPrevScan);
+        free(icpCurrentScan);
+        icpPrevScan = nullptr;
+        icpCurrentScan = nullptr;
+        LOG_E("SLAM", "ICP scan buffer allocation FAILED; scan matching disabled");
     }
     // Initialize ICP matcher buffers (PSRAM-backed)
     if (icpMatcher.init()) {
@@ -232,14 +244,16 @@ void lidarTask(void* pvParameters) {
             }
 
             // ── Grid update + SLAM pipeline ──────────────
-            if (state.nav.streamOccupancyGrid &&
+            if (state.nav.mode == RobotState::MODE_ONBOARD &&
+                state.nav.streamOccupancyGrid &&
                 millis() - state.lidar.lastGridUpdateTime > GRID_UPDATE_INTERVAL_MS &&
                 gridMapper.point_count > 180) {
 
                 // Copy scan BEFORE update_grid clears buffer
-                static LidarPoint icpCurrentScan[360];
-                int icpCurrentLen = gridMapper.point_count;
-                memcpy(icpCurrentScan, gridMapper.points, icpCurrentLen * sizeof(LidarPoint));
+                int icpCurrentLen = min(gridMapper.point_count, OccupancyGridMapper::MAX_POINTS);
+                if (icpCurrentScan != nullptr) {
+                    memcpy(icpCurrentScan, gridMapper.points, icpCurrentLen * sizeof(LidarPoint));
+                }
 
                 // Track odometry delta for ICP init guess
                 static float prevOdomX = state.odom.x;
@@ -257,16 +271,24 @@ void lidarTask(void* pvParameters) {
                 float localDx = odomDx * cosPrev + odomDy * sinPrev;
                 float localDy = -odomDx * sinPrev + odomDy * cosPrev;
 
-                // Update grid using MAP-frame pose
+                // Update grid using MAP-frame pose (critical section — applyTf writes state.map.*)
+                portENTER_CRITICAL(&stateMux);
                 applyTf();
-                gridMapper.update_pose(state.map.x, state.map.y, state.map.theta);
+                float mapX = state.map.x, mapY = state.map.y, mapTh = state.map.theta;
+                portEXIT_CRITICAL(&stateMux);
+                gridMapper.update_pose(mapX, mapY, mapTh);
                 gridMapper.update_grid();
                 state.lidar.lastGridUpdateTime = millis();
 
                 // ── ICP scan matching (always runs — no motor guard) ──
+                const float odomTravel = sqrtf(odomDx * odomDx + odomDy * odomDy);
+                const float odomTurn = fabsf(odomDTheta);
+
                 if (icpPrevScan != nullptr &&
+                    icpCurrentScan != nullptr &&
                     !icpFirstScan &&
-                    icpPrevLen > 0) {
+                    icpPrevLen > 0 &&
+                    (odomTravel > 0.015f || odomTurn > 0.015f)) {
 
                     IcpMatcher::Pose2D initGuess = {localDx, localDy, odomDTheta};
                     IcpMatcher::Pose2D correction;
@@ -276,38 +298,59 @@ void lidarTask(void* pvParameters) {
                             icpCurrentScan, icpCurrentLen,
                             initGuess, correction)) {
 
-                        float errX = constrain(correction.x - localDx, -0.05f, 0.05f);
-                        float errY = constrain(correction.y - localDy, -0.05f, 0.05f);
-                        float errT = constrain(correction.theta - odomDTheta, -0.08f, 0.08f);
-
-                        // Transform to global map frame
-                        float prevMapTheta = prevOdomTheta + state.tf.dTheta;
-                        float cosMap = cosf(prevMapTheta);
-                        float sinMap = sinf(prevMapTheta);
-                        float errMapX = errX * cosMap - errY * sinMap;
-                        float errMapY = errX * sinMap + errY * cosMap;
-
-                        const float ICP_WEIGHT = 0.65f;
-                        updateTf(errMapX, errMapY, errT, ICP_WEIGHT);
-
+                        // Compute RMS FIRST — use as quality gate
                         state.slam.icpRms = icpMatcher.computeRMS(
                             icpPrevScan, icpPrevLen,
                             icpCurrentScan, icpCurrentLen,
                             correction);
 
+                        // Quality gate: only apply correction when ICP converged well
+                        // RMS < 0.08m = good match, apply full weight
+                        // RMS 0.08-0.15 = mediocre, apply reduced weight
+                        // RMS > 0.15 = bad match, skip entirely
+                        float qualityWeight = 0.0f;
+                        if (state.slam.icpRms > 0 && state.slam.icpRms < 0.08f) {
+                            qualityWeight = 0.35f;  // Good match
+                        } else if (state.slam.icpRms < 0.15f) {
+                            qualityWeight = 0.15f;  // Mediocre — gentle nudge
+                        }
+                        // else: bad match — skip
+
+                        if (qualityWeight > 0.0f) {
+                            // Clamp correction to reject outliers
+                            float errX = constrain(correction.x - localDx, -0.06f, 0.06f);
+                            float errY = constrain(correction.y - localDy, -0.06f, 0.06f);
+                            float errT = constrain(correction.theta - odomDTheta, -0.08f, 0.08f);
+
+                            // Transform to global map frame
+                            float prevMapTheta = prevOdomTheta + state.tf.dTheta;
+                            float cosMap = cosf(prevMapTheta);
+                            float sinMap = sinf(prevMapTheta);
+                            float errMapX = errX * cosMap - errY * sinMap;
+                            float errMapY = errX * sinMap + errY * cosMap;
+
+                            updateTf(errMapX, errMapY, errT, qualityWeight);
+                        }
+
+                        // Update SLAM diagnostics for browser UI
+                        state.slam.matchScore = (state.slam.icpRms > 0) ? 
+                            fminf(1.0f, 0.08f / fmaxf(state.slam.icpRms, 0.001f)) : 0.0f;
+                        state.slam.tfNorm = sqrtf(state.tf.dx * state.tf.dx + state.tf.dy * state.tf.dy);
+                        state.slam.tfAngleDeg = state.tf.dTheta * 180.0f / M_PI;
+
                         static unsigned long lastIcpLog = 0;
                         if (millis() - lastIcpLog > 2000) {
                             lastIcpLog = millis();
-                            LOG_I("ICP", "dx=%.3f dy=%.3f dth=%.3f rms=%.4f tf=(%.3f,%.3f,%.3f)",
+                            LOG_I("ICP", "dx=%.3f dy=%.3f dth=%.3f rms=%.4f qw=%.2f tf=(%.3f,%.3f,%.3f)",
                                 correction.x, correction.y, correction.theta,
-                                state.slam.icpRms,
+                                state.slam.icpRms, qualityWeight,
                                 state.tf.dx, state.tf.dy, state.tf.dTheta);
                         }
                     }
                 }
 
                 // Save scan for next iteration
-                if (icpPrevScan != nullptr && icpCurrentLen > 0) {
+                if (icpPrevScan != nullptr && icpCurrentScan != nullptr && icpCurrentLen > 0) {
                     memcpy(icpPrevScan, icpCurrentScan, icpCurrentLen * sizeof(LidarPoint));
                     icpPrevLen = icpCurrentLen;
                     icpFirstScan = false;
@@ -351,6 +394,11 @@ void pathfinderTask(void* pvParameters) {
     GoToRequest req;
     for (;;) {
         if (xQueueReceive(pathfinderQueue, &req, portMAX_DELAY) == pdTRUE) {
+            if (state.nav.mode == RobotState::MODE_PC_BROWSER) {
+                LOG_W("A*", "Ignored request in PC_BROWSER mode");
+                continue;
+            }
+
             LOG_I("A*", "Computing path: (%.2f,%.2f) → (%.2f,%.2f)",
                   req.startX, req.startY, req.goalX, req.goalY);
 

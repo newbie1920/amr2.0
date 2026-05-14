@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
 import useNavStore from '../../stores/navStore.js';
 import vi from '../../i18n/vi.js';
+// NOTE: useNavStore must be used as a hook (not .getState()) for React reactivity
 import { CHARGING_STATIONS } from '../../core/warehouse.js';
 
 export default function ConnectionPanel() {
@@ -15,6 +16,9 @@ export default function ConnectionPanel() {
   const explorationInfo = useRobotStore((s) => s.explorationInfo) || {};
   const discoveredRobots = useRobotStore((s) => s.discoveredRobots);
   const mqttConnected = useRobotStore((s) => s.mqttConnected);
+  const navModes = useNavStore((s) => s.navModes);        // ← reactive!
+  const setNavMode = useNavStore((s) => s.setNavMode);    // ← reactive!
+  const getNavMode = useNavStore((s) => s.getNavMode);
   const robotList = Object.values(robots);
   const discoveredList = Object.values(discoveredRobots);
 
@@ -299,8 +303,7 @@ export default function ConnectionPanel() {
 
                   {/* Nav Mode Selector — Only for REAL robots */}
                   {!robot._sim && isConnected && (() => {
-                    const currentNavMode = useNavStore.getState().getNavMode(robot.id);
-                    const setNavMode = useNavStore.getState().setNavMode;
+                    const currentNavMode = getNavMode(robot.id);
                     return (
                       <div style={{
                         marginTop: '6px', padding: '6px 8px',

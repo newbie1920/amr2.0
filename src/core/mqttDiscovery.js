@@ -15,9 +15,9 @@ import mqtt from 'mqtt';
 //   CONFIGURATION
 // ============================================================
 
-// HiveMQ public broker via WebSocket (browser-compatible)
-const MQTT_BROKER_URL = 'wss://broker.hivemq.com:8884/mqtt';
-const MQTT_TOPIC = 'amr2/discovery/#';
+// Defaults are demo-friendly; production should set these to a private broker/topic.
+const MQTT_BROKER_URL = import.meta.env.VITE_MQTT_BROKER_URL || 'wss://broker.hivemq.com:8884/mqtt';
+const MQTT_TOPIC = import.meta.env.VITE_MQTT_DISCOVERY_TOPIC || 'amr2/discovery/#';
 const HEARTBEAT_TIMEOUT_MS = 90000; // Remove robot if no heartbeat for 90s
 
 // ============================================================
@@ -132,6 +132,11 @@ class MqttDiscoveryService {
         firmware: data.firmware || 'unknown',
         lastSeen: Date.now(),
       };
+
+      if (!robotInfo.ip || typeof robotInfo.ip !== 'string') {
+        console.warn('[MQTT] Ignoring discovery payload without a valid IP:', data.id);
+        return;
+      }
 
       const isNew = !this.discoveredRobots.has(data.id);
       this.discoveredRobots.set(data.id, robotInfo);

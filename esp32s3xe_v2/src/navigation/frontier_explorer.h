@@ -196,14 +196,14 @@ private:
         for (int y = 1; y < GRID_SIZE - 1; y++) {
             for (int x = 1; x < GRID_SIZE - 1; x++) {
                 // Cell này phải FREE
-                if (mapper.grid[y][x] >= -5) continue;
+                if (mapper.grid_cell_const(x, y) >= -5) continue;
 
                 // Kiểm tra 4-connected neighbors: có UNKNOWN không?
                 bool hasUnknown = false;
-                if (mapper.grid[y-1][x] == 0) hasUnknown = true;
-                if (mapper.grid[y+1][x] == 0) hasUnknown = true;
-                if (mapper.grid[y][x-1] == 0) hasUnknown = true;
-                if (mapper.grid[y][x+1] == 0) hasUnknown = true;
+                if (mapper.grid_cell_const(x, y-1) == 0) hasUnknown = true;
+                if (mapper.grid_cell_const(x, y+1) == 0) hasUnknown = true;
+                if (mapper.grid_cell_const(x-1, y) == 0) hasUnknown = true;
+                if (mapper.grid_cell_const(x+1, y) == 0) hasUnknown = true;
 
                 if (hasUnknown && frontierCellCount < FRONTIER_MAX_CELLS) {
                     _cells[frontierCellCount].gx = (int16_t)x;
@@ -219,29 +219,40 @@ private:
     void clusterFrontiers(const OccupancyGridMapper& mapper, float robotX, float robotY) {
         clusterCount = 0;
 
-        // Bit arrays to save DRAM (each uses (GRID_SIZE * GRID_SIZE) / 8 bytes)
-        static uint8_t _visited[GRID_SIZE][(GRID_SIZE + 7) / 8];
-        memset(_visited, 0, sizeof(_visited));
-
-        static uint8_t isFrontier[GRID_SIZE][(GRID_SIZE + 7) / 8];
-        memset(isFrontier, 0, sizeof(isFrontier));
+        // Bit arrays — PSRAM-backed to handle 1024x1024 grid (128KB each)
+        static const int BIT_ROW_BYTES = (GRID_SIZE + 7) / 8;
+        static const int BIT_TOTAL = GRID_SIZE * BIT_ROW_BYTES;
+        static uint8_t* _visited = nullptr;
+        static uint8_t* isFrontier = nullptr;
+        if (!_visited) {
+            _visited = (uint8_t*)heap_caps_malloc(BIT_TOTAL, MALLOC_CAP_SPIRAM);
+            if (!_visited) _visited = (uint8_t*)malloc(BIT_TOTAL);
+        }
+        if (!isFrontier) {
+            isFrontier = (uint8_t*)heap_caps_malloc(BIT_TOTAL, MALLOC_CAP_SPIRAM);
+            if (!isFrontier) isFrontier = (uint8_t*)malloc(BIT_TOTAL);
+        }
+        if (!_visited || !isFrontier) return;
+        memset(_visited, 0, BIT_TOTAL);
+        memset(isFrontier, 0, BIT_TOTAL);
         
         for (int i = 0; i < frontierCellCount; i++) {
-            isFrontier[_cells[i].gy][_cells[i].gx >> 3] |= (1 << (_cells[i].gx & 7));
+            int byteIdx = _cells[i].gy * BIT_ROW_BYTES + (_cells[i].gx >> 3);
+            isFrontier[byteIdx] |= (1 << (_cells[i].gx & 7));
         }
 
         // BFS cluster mỗi frontier cell chưa visited
         for (int i = 0; i < frontierCellCount; i++) {
             int sx = _cells[i].gx;
             int sy = _cells[i].gy;
-            if (_visited[sy][sx >> 3] & (1 << (sx & 7))) continue;
+            if (_visited[sy * BIT_ROW_BYTES + (sx >> 3)] & (1 << (sx & 7))) continue;
             if (clusterCount >= FRONTIER_MAX_CLUSTERS) break;
 
             // BFS flood-fill từ cell này
             static FrontierCell queue[FRONTIER_MAX_CELLS];
             int qHead = 0, qTail = 0;
             queue[qTail++] = {(int16_t)sx, (int16_t)sy};
-            _visited[sy][sx >> 3] |= (1 << (sx & 7));
+            _visited[sy * BIT_ROW_BYTES + (sx >> 3)] |= (1 << (sx & 7));
 
             float sumGx = 0, sumGy = 0;
             int count = 0;
@@ -260,10 +271,13 @@ private:
                     int ny = c.gy + dy[d];
                     if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
                     
-                    if (_visited[ny][nx >> 3] & (1 << (nx & 7))) continue;
-                    if (!(isFrontier[ny][nx >> 3] & (1 << (nx & 7)))) continue;
+                    int vIdx = ny * BIT_ROW_BYTES + (nx >> 3);
+                    int fIdx = vIdx;
+                    uint8_t bit = (1 << (nx & 7));
+                    if (_visited[vIdx] & bit) continue;
+                    if (!(isFrontier[fIdx] & bit)) continue;
                     
-                    _visited[ny][nx >> 3] |= (1 << (nx & 7));
+                    _visited[vIdx] |= bit;
                     if (qTail < FRONTIER_MAX_CELLS) {
                         queue[qTail++] = {(int16_t)nx, (int16_t)ny};
                     }
@@ -344,7 +358,7 @@ private:
             bool tooClose = false;
             for (int dy = -FRONTIER_SAFE_DIST_CELLS; dy <= FRONTIER_SAFE_DIST_CELLS && !tooClose; dy++) {
                 for (int dx = -FRONTIER_SAFE_DIST_CELLS; dx <= FRONTIER_SAFE_DIST_CELLS && !tooClose; dx++) {
-                    if (mapper.grid[gy + dy][gx + dx] > 10) tooClose = true;  // OCC_THRESHOLD
+                    if (mapper.grid_cell_const(gx + dx, gy + dy) > 10) tooClose = true;  // OCC_THRESHOLD
                 }
             }
             if (!tooClose) return;  // Safe
@@ -358,13 +372,13 @@ private:
                 int cx = gx + sx;
                 int cy = gy + sy;
                 if (cx < 2 || cx >= GRID_SIZE - 2 || cy < 2 || cy >= GRID_SIZE - 2) continue;
-                if (mapper.grid[cy][cx] >= -5) continue;  // Phải FREE
+                if (mapper.grid_cell_const(cx, cy) >= -5) continue;  // Phải FREE
 
                 // Kiểm tra safe radius
                 bool safe = true;
                 for (int dy = -2; dy <= 2 && safe; dy++) {
                     for (int dx = -2; dx <= 2 && safe; dx++) {
-                        if (mapper.grid[cy + dy][cx + dx] > 10) safe = false;  // OCC_THRESHOLD
+                        if (mapper.grid_cell_const(cx + dx, cy + dy) > 10) safe = false;  // OCC_THRESHOLD
                     }
                 }
                 if (!safe) continue;

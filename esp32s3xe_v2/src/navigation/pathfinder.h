@@ -6,7 +6,7 @@
 #include "navigator.h"
 #include "occupancy_grid.h"
 
-#define PATHFINDER_MAX_NODES       4000
+#define PATHFINDER_MAX_NODES       50000
 #define PATHFINDER_COST_LETHAL     254
 #define PATHFINDER_COST_UNKNOWN    255
 

@@ -36,14 +36,19 @@
  *  Tuned for balanced map: occupied cells cần nhiều evidence để build up,
  *  free cells dễ clear hơn → tránh phantom walls.
  */
-#define LOGODDS_OCC 30       // Ghi nhận cell bị chiếm (giảm từ 50 → 30 cho smoother build-up)
-#define LOGODDS_FREE -15     // Ghi nhận cell trống (tăng từ -10 → -15 cho faster clearing)
+#define LOGODDS_OCC 15       // Ghi nhận cell bị chiếm (giảm 30→15: cần 3+ observations để confirm)
+#define LOGODDS_FREE -15     // Ghi nhận cell trống (giữ nguyên — đủ mạnh để clear ghost walls)
 #define LOGODDS_UNKNOWN 0    // Chưa biết
-#define LOGODDS_MAX_OCC 80   // Giới hạn trên (giảm từ 100 → 80, tránh saturate)
-#define LOGODDS_MIN_FREE -50 // Giới hạn dưới (tăng từ -100 → -50, enough for free)
+#define LOGODDS_MAX_OCC 50   // Giới hạn trên (giảm 80→50: occupied cells dễ clear hơn)
+#define LOGODDS_MIN_FREE -50 // Giới hạn dưới (giữ nguyên)
 // Legacy compatibility defines
 #define LOGODDS_MAX LOGODDS_MAX_OCC
 #define LOGODDS_MIN LOGODDS_MIN_FREE
+
+/** Temporal decay: mỗi DECAY_INTERVAL scans, giảm tất cả cells 1 unit về phía 0.
+ *  Giúp xóa ghost walls từ pose sai cũ. */
+#define LOGODDS_DECAY_INTERVAL 10  // Mỗi 10 scans
+#define LOGODDS_DECAY_AMOUNT   2   // Giảm 2 units/lần
 
 /** Max LIDAR range (mét) */
 #define LIDAR_MAX_RANGE 6.0f
@@ -166,6 +171,12 @@ public:
     
     point_count = 0; // Clear buffer
     scanCount++;
+    
+    // Temporal decay: mỗi DECAY_INTERVAL scans, giảm toàn bộ grid về phía 0
+    // Giúp xóa ghost walls do pose sai ở quá khứ
+    if (scanCount % LOGODDS_DECAY_INTERVAL == 0) {
+      decayGrid();
+    }
   }
 
   /**
@@ -242,6 +253,26 @@ public:
       len += 2;
       memcpy(buffer + len, &dist_int, 2);
       len += 2;
+    }
+  }
+
+  /**
+   * Temporal decay — fade ALL cells toward UNKNOWN (0)
+   * Occupied cells decrease, free cells increase → stale evidence erased.
+   * Runs every DECAY_INTERVAL scans.
+   */
+  void decayGrid() {
+    for (int y = 0; y < GRID_SIZE; y++) {
+      for (int x = 0; x < GRID_SIZE; x++) {
+        int8_t v = grid[y][x];
+        if (v > LOGODDS_DECAY_AMOUNT) {
+          grid[y][x] = v - LOGODDS_DECAY_AMOUNT;
+        } else if (v < -LOGODDS_DECAY_AMOUNT) {
+          grid[y][x] = v + LOGODDS_DECAY_AMOUNT;
+        } else {
+          grid[y][x] = 0; // Snap to unknown
+        }
+      }
     }
   }
 

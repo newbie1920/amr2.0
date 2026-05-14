@@ -89,7 +89,7 @@ uint8_t AStarPathfinder::getCombinedCost(int gx, int gy) const {
         int check_radius = 3; // 3 cells = 0.3m inflation radius (sync with DWA INFLATE_CELLS=4)
         
         if (gx >= 0 && gx < GRID_SIZE && gy >= 0 && gy < GRID_SIZE) {
-            center_logodds = slamMap->grid[gy][gx];
+            center_logodds = slamMap->grid_cell_const(gx, gy);
         }
 
         for (int dy = -check_radius; dy <= check_radius; dy++) {
@@ -98,8 +98,8 @@ uint8_t AStarPathfinder::getCombinedCost(int gx, int gy) const {
                 int ny = gy + dy;
                 // SLAM grid is GRID_SIZE x GRID_SIZE
                 if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE) {
-                    if (slamMap->grid[ny][nx] > max_logodds) {
-                        max_logodds = slamMap->grid[ny][nx];
+                    if (slamMap->grid_cell_const(nx, ny) > max_logodds) {
+                        max_logodds = slamMap->grid_cell_const(nx, ny);
                     }
                 }
             }
@@ -318,13 +318,23 @@ int AStarPathfinder::computePath(float startX, float startY,
     }
 
     // ── Reconstruct raw path ─────────────────────────────────
-    static int pathX[PATHFINDER_MAX_NODES];
-    static int pathY[PATHFINDER_MAX_NODES];
+    // PSRAM-backed path buffers (50000 × int = 200KB each — too large for DRAM)
+    static int* pathX = nullptr;
+    static int* pathY = nullptr;
+    if (!pathX) {
+        pathX = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
+        pathY = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
+        if (!pathX || !pathY) { Serial.println("[A*] PSRAM alloc failed for path!"); return 0; }
+    }
     int rawLen = 0;
 
     {
         // Collect indices from goal → start
-        static int tmp[PATHFINDER_MAX_NODES];
+        static int* tmp = nullptr;
+        if (!tmp) {
+            tmp = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
+            if (!tmp) { Serial.println("[A*] PSRAM alloc failed for tmp!"); return 0; }
+        }
         int tmpLen = 0;
         int curr   = bestNodeIdx;
         while (curr != -1 && tmpLen < PATHFINDER_MAX_NODES) {
@@ -341,7 +351,11 @@ int AStarPathfinder::computePath(float startX, float startY,
 
     // ── Douglas-Peucker smoothing (eps = 1.5 cells ≈ 15 cm) ─
     const float DP_EPS = 1.5f;
-    static bool keep[PATHFINDER_MAX_NODES];
+    static bool* keep = nullptr;
+    if (!keep) {
+        keep = (bool*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(bool), MALLOC_CAP_SPIRAM);
+        if (!keep) { Serial.println("[A*] PSRAM alloc failed for keep!"); return 0; }
+    }
     memset(keep, 0, rawLen * sizeof(bool));
     keep[0]        = true;
     keep[rawLen-1] = true;

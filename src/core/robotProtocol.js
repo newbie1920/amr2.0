@@ -412,7 +412,22 @@ export class RobotConnection {
   }
 
   setArchitectureProfile(profile = 'hybrid') {
+    this.architectureProfile = profile;
     this._send({ cmd: 'set_arch_mode', profile });
+  }
+
+  /**
+   * Set Dual-Mode (Nav mode)
+   * @param {string} mode - 'pc_browser' or 'onboard'
+   */
+  setDualMode(mode) {
+    // Sync local architectureProfile so mapStore detects the correct pipeline
+    if (mode === 'pc_browser') {
+      this.architectureProfile = 'pc_slam';
+    } else {
+      this.architectureProfile = 'hybrid';
+    }
+    this._send({ cmd: 'set_mode', mode });
   }
 
   // ============================================================
@@ -451,25 +466,26 @@ export class RobotConnection {
    * Dispatch binary message dựa trên byte đầu tiên:
    * - 0x01 = Occupancy Grid (custom binary format)
    * - 0x02 = MessagePack telemetry (có type marker từ ESP32 mới)
+   * - 0x04 = Compact binary LiDAR
+   * - 0x05 = Fast binary pose
+   * - 0x06 = Raw binary LiDAR
    * - Khác = MessagePack thuần (không có type marker)
    */
   _dispatchBinaryMessage(buffer) {
     if (buffer.byteLength === 0) return;
+    const view = new Uint8Array(buffer);
+    const messageType = view[0];
 
-    const firstByte = new Uint8Array(buffer)[0];
-
-    if (firstByte === 0x01) {
-      // Occupancy Grid — custom binary protocol (legacy)
+    if (messageType === 0x01) {
       this._handleGridMessage(buffer);
-    } else if (firstByte === 0x02) {
-      // MessagePack telemetry với type marker — skip byte đầu
+    } else if (messageType === 0x02) {
       this._handleMsgPackMessage(buffer.slice(1));
-    } else if (firstByte === 0x04) {
-      // Compact binary LiDAR scan: 0x04 + 360 × uint16_t (LE) = 721 bytes
+    } else if (messageType === 0x04) {
       this._handleBinaryLidar(buffer);
-    } else if (firstByte === 0x05) {
-      // Fast binary pose: 0x05 + 5 floats (x,y,theta,vx,wz) + batt% = 22 bytes
+    } else if (messageType === 0x05) {
       this._handleFastPose(buffer);
+    } else if (messageType === 0x06) {
+      this._handleRawLidar(buffer);
     } else {
       // MessagePack thuần (không có marker) hoặc legacy MsgPack
       this._handleMsgPackMessage(buffer);
@@ -501,6 +517,14 @@ export class RobotConnection {
       if (data.type === 'map_ack') {
         console.log(`[Robot ${this.name}] MAP_ACK: ${data.w}x${data.h}, ${data.bytes} bytes`);
         if (this.onMapAck) this.onMapAck(data);
+        return;
+      }
+
+      // MODE_ACK — ESP32 confirmed dual-mode switch
+      if (data.type === 'mode_ack') {
+        const profile = data.mode === 'pc_browser' ? 'pc_slam' : 'hybrid';
+        this.architectureProfile = profile;
+        console.log(`[Robot ${this.name}] MODE_ACK: ${data.mode} → architectureProfile=${profile}`);
         return;
       }
 
@@ -541,6 +565,14 @@ export class RobotConnection {
         return;
       }
 
+      // MODE_ACK — ESP32 confirmed dual-mode switch
+      if (data.type === 'mode_ack') {
+        const profile = data.mode === 'pc_browser' ? 'pc_slam' : 'hybrid';
+        this.architectureProfile = profile;
+        console.log(`[Robot ${this.name}] MODE_ACK: ${data.mode} → architectureProfile=${profile}`);
+        return;
+      }
+
       // Telemetry
       if (data.x !== undefined || data.batt !== undefined) {
         this._processTelemetryData(data);
@@ -552,23 +584,56 @@ export class RobotConnection {
 
   /**
    * Occupancy Grid — custom binary message (byte[0] = 0x01)
-   * Giữ nguyên logic cũ.
+   * Pass raw buffer to store for parsing.
    */
   _handleGridMessage(buffer) {
     try {
-      import('../core/lidarMapper.js').then(module => {
-        const OccupancyGrid = module.default;
-        const grid = OccupancyGrid.fromBinary(buffer);
-        
-        if (this.onLidarGrid) {
-          this.onLidarGrid(grid);
-        }
-      }).catch(err => {
-        console.error(`[Robot ${this.name}] Error importing lidarMapper:`, err);
-      });
+      if (this.onLidarGrid) {
+        this.onLidarGrid(buffer);
+      }
     } catch (err) {
-      console.error(`[Robot ${this.name}] Error parsing binary message:`, err);
+      console.error(`[Robot ${this.name}] Error passing grid binary message:`, err);
     }
+  }
+
+  /**
+   * Handle Raw LiDAR Scan (type 0x06)
+   * Format: 0x06 + uint16(count) + N x (float angle + float dist + uint8 quality) = 9 bytes/pt
+   */
+  _handleRawLidar(buffer) {
+    const view = new DataView(buffer);
+    if (buffer.byteLength < 3) return;
+
+    const count = view.getUint16(1, true);
+    const expected = 3 + count * 9;
+    if (buffer.byteLength < expected) return;
+
+    const lidarPoints = [];
+    let offset = 3;
+
+    for (let i = 0; i < count; i++) {
+      const angle = view.getFloat32(offset, true);
+      const dist = view.getFloat32(offset + 4, true);
+      const quality = view.getUint8(offset + 8);
+      offset += 9;
+
+      if (dist > 0 && dist < 12.0 && quality > 0) {
+        // Convert dist to mm to match existing pipeline
+        lidarPoints.push({ a: angle, d: dist * 1000 });
+      }
+    }
+
+    if (this.telemetry) {
+      this.telemetry.lidar = lidarPoints;
+    }
+    
+    // Fire callback if there is a dedicated WebWorker listener
+    if (this.onRawLidar) {
+      this.onRawLidar(lidarPoints);
+    }
+
+    this.lastPong = Date.now();
+    this.missedPongs = 0;
   }
 
   /**

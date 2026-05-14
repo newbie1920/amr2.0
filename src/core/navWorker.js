@@ -133,15 +133,17 @@ class NavWorkerAPI {
 
     const rgx = Math.floor((robotX - originX) / resolution);
     const rgy = Math.floor((robotY - originY) / resolution);
+    const MIN_RANGE_M = 0.12;
+    const MAX_RANGE_M = 6.0;
 
     for (const pt of lidarPts) {
       const angle = robotTheta + (pt.a * Math.PI) / 180;
-      const dist = pt.d;
-      if (dist <= 0.05 || dist > 12) continue;
+      const distM = pt.d / 1000.0;
+      if (distM < MIN_RANGE_M || distM > MAX_RANGE_M) continue;
 
-      // Hit cell
-      const hitX = robotX + Math.cos(angle) * dist;
-      const hitY = robotY + Math.sin(angle) * dist;
+      // Hit cell (pt.d is mm everywhere else in AMR 2.0 — must use meters here)
+      const hitX = robotX + Math.cos(angle) * distM;
+      const hitY = robotY + Math.sin(angle) * distM;
       const hgx = Math.floor((hitX - originX) / resolution);
       const hgy = Math.floor((hitY - originY) / resolution);
 

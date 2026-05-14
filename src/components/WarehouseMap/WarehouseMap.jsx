@@ -289,6 +289,8 @@ function RealisticShelf({ shelf, cx, cz }) {
   );
 }
 
+import useUIStore from '../../stores/uiStore.js';
+
 function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRobotId, mappingActive, layers, dataSource }) {
   // When using a REAL robot, suppress all simulated warehouse elements
   // Only show LiDAR-generated map data
@@ -300,6 +302,25 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
   // Mapping from 2D coordinate system to 3D.
   const map2To3X = (x) => x - cx;
   const map2To3Z = (y) => -(y - cz);
+
+  const activeTool = useUIStore((s) => s.activeTool);
+  const setActiveTool = useUIStore((s) => s.setActiveTool);
+
+  const handleFloorClick = (e) => {
+    if (activeTool !== 'goal') return;
+    if (!selectedRobotId) return;
+    // Get 3D hit point
+    const pt = e.point;
+    // Convert back to 2D
+    const x2d = pt.x + cx;
+    const y2d = cz - pt.z;
+    
+    useNavStore.getState().navigateToGoal(selectedRobotId, x2d, y2d);
+    console.log(`[WarehouseMap] Waypoint injected: (${x2d.toFixed(2)}, ${y2d.toFixed(2)}) for robot ${selectedRobotId}`);
+    
+    // Auto-revert to move tool after placing goal
+    setActiveTool('move');
+  };
 
   // Get the active occupancy grid for selected robot
   const activeGrid = selectedRobotId ? occupancyGrid[selectedRobotId] : null;
@@ -320,6 +341,17 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         infiniteGrid
         followCamera
       />
+
+      {/* Invisible Floor for Raycasting Clicks */}
+      <mesh
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[0, 0, 0]}
+        onClick={handleFloorClick}
+        receiveShadow
+      >
+        <planeGeometry args={[100, 100]} />
+        <meshBasicMaterial visible={false} />
+      </mesh>
 
       {/* 4 Outer Walls (Low walls for LiDAR) — HIDE in real mode */}
       {mapType === '3d' && !isRealMode && (

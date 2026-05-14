@@ -89,8 +89,10 @@ static constexpr int INSCRIBED_CELLS = 2;     // 0.2m inscribed radius
 static constexpr float COST_SCALING = 3.0f;   // Exponential decay factor
 static constexpr int8_t OCC_THRESHOLD = 10;   // Log-odds occupied threshold
 
-// Safety: BFS packing uses (y << 8) | x, requires GRID_SIZE <= 256
-static_assert(GRID_SIZE <= 256, "DWA BFS packing requires GRID_SIZE <= 256");
+// DWA operates on a LOCAL window (256x256) centered on robot,
+// not the full 1024x1024 grid. This keeps BFS fast and memory bounded.
+static constexpr int DWA_LOCAL_SIZE = 256;
+static_assert(DWA_LOCAL_SIZE <= 256, "DWA BFS packing requires DWA_LOCAL_SIZE <= 256");
 
 // ============================================================
 //   DWA PLANNER CLASS
@@ -105,40 +107,64 @@ public:
     bool costmapValid = false;
     unsigned long lastCostmapBuildMs = 0;
 
+    // Local window origin in global grid coords
+    int _winOriginX = 0, _winOriginY = 0;
+
     DwaPlanner() {}
 
     /**
      * Rebuild the inflation costmap from the current occupancy grid.
-     * Uses BFS flood-fill from all occupied cells.
-     * Cost: ~5-8ms on ESP32-S3 @ 240MHz for typical SLAM grid.
+     * Uses a LOCAL 256x256 window centered on the robot.
+     * BFS flood-fill from all occupied cells within this window.
+     * Cost: ~5-8ms on ESP32-S3 @ 240MHz.
      * 
      * Call this ONCE per DWA cycle, before computeVelocity().
      */
-    void buildCostmap(const OccupancyGridMapper& mapper) {
+    void buildCostmap(const OccupancyGridMapper& mapper, float robotX, float robotY) {
         unsigned long t0 = micros();
 
-        // Static arrays to avoid DRAM per-instance cost
-        // distMap: quantized distance (dist * 20). Max meaningful = INFLATE_CELLS * 1.414 * 20 ≈ 113
-        static uint8_t costmapBuf[GRID_SIZE][GRID_SIZE];
-        static uint8_t distMap[GRID_SIZE][GRID_SIZE];
-        
-        // BFS queue — 16384 covers full grid (GRID_SIZE²=16384)
-        static uint16_t bfsQueue[16384];
+        // Compute local window origin centered on robot
+        int robotGX = mapper.world_to_grid_x(robotX);
+        int robotGY = mapper.world_to_grid_y(robotY);
+        int half = DWA_LOCAL_SIZE / 2;
+        _winOriginX = constrain(robotGX - half, 0, GRID_SIZE - DWA_LOCAL_SIZE);
+        _winOriginY = constrain(robotGY - half, 0, GRID_SIZE - DWA_LOCAL_SIZE);
 
-        memset(costmapBuf, 0, sizeof(costmapBuf));
-        memset(distMap, 255, sizeof(distMap)); // 255 = infinity (unvisited)
+        // PSRAM-backed arrays (256x256 = 64KB each + 128KB BFS queue)
+        // Cannot fit 256KB in 320KB DRAM — must use PSRAM
+        static uint8_t* costmapBuf = nullptr;
+        static uint8_t* distMap = nullptr;
+        static uint16_t* bfsQueue = nullptr;
+        static const int CM_SIZE = DWA_LOCAL_SIZE * DWA_LOCAL_SIZE;
+        static const int BFS_SIZE = DWA_LOCAL_SIZE * DWA_LOCAL_SIZE;
+        
+        if (!costmapBuf) {
+            costmapBuf = (uint8_t*)heap_caps_malloc(CM_SIZE, MALLOC_CAP_SPIRAM);
+            distMap    = (uint8_t*)heap_caps_malloc(CM_SIZE, MALLOC_CAP_SPIRAM);
+            bfsQueue   = (uint16_t*)heap_caps_malloc(BFS_SIZE * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+            if (!costmapBuf || !distMap || !bfsQueue) {
+                Serial.println("[DWA] PSRAM alloc failed!");
+                return;
+            }
+        }
+
+        memset(costmapBuf, 0, CM_SIZE);
+        memset(distMap, 255, CM_SIZE); // 255 = infinity (unvisited)
 
         int qHead = 0, qTail = 0;
-        const int BFS_CAP = 16384;
+        const int BFS_CAP = DWA_LOCAL_SIZE * DWA_LOCAL_SIZE;
 
-        // Seed BFS with all occupied cells
-        for (int y = 0; y < GRID_SIZE; y++) {
-            for (int x = 0; x < GRID_SIZE; x++) {
-                if (mapper.grid[y][x] >= OCC_THRESHOLD) {
-                    costmapBuf[y][x] = 254; // Lethal
-                    distMap[y][x] = 0;
+        // Seed BFS with all occupied cells in local window
+        for (int ly = 0; ly < DWA_LOCAL_SIZE; ly++) {
+            for (int lx = 0; lx < DWA_LOCAL_SIZE; lx++) {
+                int gx = _winOriginX + lx;
+                int gy = _winOriginY + ly;
+                if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE) continue;
+                if (mapper.grid_cell_const(gx, gy) >= OCC_THRESHOLD) {
+                    costmapBuf[ly * DWA_LOCAL_SIZE + lx] = 254; // Lethal
+                    distMap[ly * DWA_LOCAL_SIZE + lx] = 0;
                     if (qTail < BFS_CAP) {
-                        bfsQueue[qTail++] = (uint16_t)((y << 8) | x);
+                        bfsQueue[qTail++] = (uint16_t)((ly << 8) | lx);
                     }
                 }
             }
@@ -151,7 +177,7 @@ public:
             uint16_t packed = bfsQueue[qHead++];
             int cy = (packed >> 8) & 0xFF;
             int cx = packed & 0xFF;
-            uint8_t currentDist = distMap[cy][cx];
+            uint8_t currentDist = distMap[cy * DWA_LOCAL_SIZE + cx];
 
             if (currentDist >= INFLATE_DIST_MAX) continue;
 
@@ -159,15 +185,15 @@ public:
                 for (int dx = -1; dx <= 1; dx++) {
                     if (dx == 0 && dy == 0) continue;
                     int nx = cx + dx, ny = cy + dy;
-                    if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
+                    if (nx < 0 || nx >= DWA_LOCAL_SIZE || ny < 0 || ny >= DWA_LOCAL_SIZE) continue;
 
                     // step = 20 for cardinal, 28 for diagonal (≈1.414 * 20)
                     uint8_t step = (dx != 0 && dy != 0) ? 28 : 20;
                     uint16_t newDistRaw = (uint16_t)currentDist + step;
                     uint8_t newDist = (newDistRaw > 255) ? 255 : (uint8_t)newDistRaw;
 
-                    if (newDist < distMap[ny][nx]) {
-                        distMap[ny][nx] = newDist;
+                    if (newDist < distMap[ny * DWA_LOCAL_SIZE + nx]) {
+                        distMap[ny * DWA_LOCAL_SIZE + nx] = newDist;
 
                         // Compute cost from distance
                         float realDist = newDist / 20.0f; // Convert back to cells
@@ -179,7 +205,7 @@ public:
                             float c = 252.0f * expf(-COST_SCALING * distM);
                             cost = (uint8_t)fmaxf(1.0f, fminf(252.0f, c));
                         }
-                        costmapBuf[ny][nx] = cost;
+                        costmapBuf[ny * DWA_LOCAL_SIZE + nx] = cost;
 
                         if (newDist < INFLATE_DIST_MAX && qTail < BFS_CAP) {
                             bfsQueue[qTail++] = (uint16_t)((ny << 8) | nx);
@@ -190,7 +216,7 @@ public:
         }
 
         // Copy to accessible location
-        _costmapPtr = &costmapBuf[0][0];
+        _costmapPtr = costmapBuf;
         costmapValid = true;
         lastCostmapBuildMs = millis();
 
@@ -198,7 +224,7 @@ public:
         static unsigned long lastLog = 0;
         if (millis() - lastLog > 5000) {
             lastLog = millis();
-            Serial.printf("[DWA] Costmap built in %lu us, %d BFS entries\n", dt, qHead);
+            Serial.printf("[DWA] Costmap built in %lu us, %d BFS entries (win %d,%d)\n", dt, qHead, _winOriginX, _winOriginY);
         }
     }
 
@@ -212,15 +238,17 @@ public:
         if (!_costmapPtr) return;
         int rgx = mapper.world_to_grid_x(robotX);
         int rgy = mapper.world_to_grid_y(robotY);
+        // Convert to local window coords
+        int lrx = rgx - _winOriginX;
+        int lry = rgy - _winOriginY;
         // Footprint = INSCRIBED_CELLS + 1 = 3 cells = 0.3m
         const int CLEAR_R = INSCRIBED_CELLS + 1;
         for (int dy = -CLEAR_R; dy <= CLEAR_R; dy++) {
             for (int dx = -CLEAR_R; dx <= CLEAR_R; dx++) {
-                int nx = rgx + dx, ny = rgy + dy;
-                if (nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE) continue;
+                int nx = lrx + dx, ny = lry + dy;
+                if (nx < 0 || nx >= DWA_LOCAL_SIZE || ny < 0 || ny >= DWA_LOCAL_SIZE) continue;
                 if (dx*dx + dy*dy <= CLEAR_R*CLEAR_R) {
-                    // Cast to non-const static array via pointer offset
-                    _costmapPtr[ny * GRID_SIZE + nx] = 0;
+                    _costmapPtr[ny * DWA_LOCAL_SIZE + nx] = 0;
                 }
             }
         }
@@ -408,12 +436,14 @@ private:
         return minDist;
     }
 
-    // ── O(1) cost lookup from pre-computed costmap ───────────
-    // Returns cost at grid cell (gx, gy). Must call buildCostmap() first.
+    // ── O(1) cost lookup from pre-computed LOCAL costmap ───────
+    // Translates global grid coords → local window coords.
     uint8_t getCostmapCost(int gx, int gy) const {
-        if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE) return 254;
+        int lx = gx - _winOriginX;
+        int ly = gy - _winOriginY;
+        if (lx < 0 || lx >= DWA_LOCAL_SIZE || ly < 0 || ly >= DWA_LOCAL_SIZE) return 254;
         if (!_costmapPtr) return 0; // Costmap not built yet
-        return _costmapPtr[gy * GRID_SIZE + gx];
+        return _costmapPtr[ly * DWA_LOCAL_SIZE + lx];
     }
 
     // ── Check collision at position (circular footprint + costmap) ─────

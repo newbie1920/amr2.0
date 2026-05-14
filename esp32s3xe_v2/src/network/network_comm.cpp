@@ -52,22 +52,56 @@ void setArchitectureProfile(const char* profile) {
         state.nav.archProfile = "pc_slam";
         state.nav.streamOccupancyGrid = false;
         state.nav.allowOnboardNav = false;
+        state.nav.mode = RobotState::MODE_PC_BROWSER;
         gridMapper.reset();
         navigator.abort();
-        LOG_I("ARCH", "Switched to PC_SLAM profile");
+        LOG_I("ARCH", "Switched to PC_SLAM profile (MODE_PC_BROWSER)");
         return;
     }
     if (strcmp(profile, "aggressive") == 0) {
         state.nav.archProfile = "aggressive";
         state.nav.streamOccupancyGrid = true;
         state.nav.allowOnboardNav = true;
-        LOG_I("ARCH", "Switched to AGGRESSIVE profile");
+        state.nav.mode = RobotState::MODE_ONBOARD;
+        LOG_I("ARCH", "Switched to AGGRESSIVE profile (MODE_ONBOARD)");
         return;
     }
     state.nav.archProfile = "hybrid";
     state.nav.streamOccupancyGrid = true;
     state.nav.allowOnboardNav = true;
-    LOG_I("ARCH", "Switched to HYBRID profile");
+    state.nav.mode = RobotState::MODE_ONBOARD;
+    LOG_I("ARCH", "Switched to HYBRID profile (MODE_ONBOARD)");
+}
+
+// ── Switch NavMode directly ─────────────────────────────────
+static void switchNavMode(RobotState::NavMode newMode) {
+    if (state.nav.mode == newMode) return;
+    state.nav.mode = newMode;
+
+    if (newMode == RobotState::MODE_PC_BROWSER) {
+        // Suspend onboard SLAM & pathfinding — ESP32 becomes "spinal cord"
+        state.nav.streamOccupancyGrid = false;
+        state.nav.allowOnboardNav = false;
+        state.nav.archProfile = "pc_slam";
+        navigator.abort();
+        explorer.stop();
+        state.nav.explorationRequested = false;
+        // Keep motor control alive — PC sends velocity or waypoints
+        LOG_I("MODE", "→ PC_BROWSER: onboard SLAM/Nav suspended, raw streaming active");
+    } else {
+        // Resume onboard SLAM
+        state.nav.streamOccupancyGrid = true;
+        state.nav.allowOnboardNav = true;
+        state.nav.archProfile = "hybrid";
+        gridMapper.reset();
+        gridMapper.centerOnPosition(state.odom.x, state.odom.y);
+        portENTER_CRITICAL(&stateMux);
+        state.tf.dx = state.tf.dy = state.tf.dTheta = 0;
+        applyTf();
+        portEXIT_CRITICAL(&stateMux);
+        leftPID.reset(); rightPID.reset();
+        LOG_I("MODE", "→ ONBOARD: SLAM/Nav resumed, grid reset");
+    }
 }
 
 // ── WebSocket Event Handler ─────────────────────────────────
@@ -232,6 +266,50 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     if (doc["cmd"] == "resume")   { if (state.nav.allowOnboardNav) navigator.resume(); }
     if (doc["cmd"] == "set_arch_mode") setArchitectureProfile(doc["profile"] | "hybrid");
 
+    // ── Switch Dual-Mode ──
+    if (doc["cmd"] == "set_mode") {
+        const char* m = doc["mode"] | "onboard";
+        if (strcmp(m, "pc_browser") == 0) {
+            switchNavMode(RobotState::MODE_PC_BROWSER);
+        } else {
+            switchNavMode(RobotState::MODE_ONBOARD);
+        }
+        // ACK
+        JsonDocument ack;
+        ack["type"] = "mode_ack";
+        ack["mode"] = (state.nav.mode == RobotState::MODE_PC_BROWSER) ? "pc_browser" : "onboard";
+        static uint8_t buf[64];
+        size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+        webSocket.sendBIN(num, buf, len);
+    }
+
+    // ── External Waypoints (PC_BROWSER mode: PC sends path, ESP32 follows) ──
+    if (doc["cmd"] == "ext_waypoints") {
+        JsonArray pathArr = doc["path"].as<JsonArray>();
+        int count = pathArr.size();
+        if (count > 0 && count <= MAX_WAYPOINTS) {
+            // Temporarily allow onboard nav to execute the path
+            state.nav.allowOnboardNav = true;
+            Waypoint tempWps[MAX_WAYPOINTS];
+            for (int i = 0; i < count; i++) {
+                tempWps[i].x = pathArr[i]["x"];
+                tempWps[i].y = pathArr[i]["y"];
+                tempWps[i].heading = NAN;
+                tempWps[i].useReverse = pathArr[i]["rev"] | false;
+            }
+            float endH = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
+            navigator.loadPath(tempWps, count, endH);
+            LOG_I("EXT_WP", "PC sent %d waypoints → Navigator loaded", count);
+
+            JsonDocument ack;
+            ack["type"] = "ext_wp_ack";
+            ack["wp_count"] = count;
+            static uint8_t buf[64];
+            size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+            webSocket.sendBIN(num, buf, len);
+        }
+    }
+
     // ── Set Pose ──
     if (doc["cmd"] == "set_pose") {
         portENTER_CRITICAL(&stateMux);
@@ -334,8 +412,8 @@ void init_network() {
     // After abnormal disconnect (code 1006), the old client slot stays occupied
     // and blocks new connections (max 5 slots). This sends WS ping every 10s,
     // expects pong within 3s, and evicts after 2 consecutive misses.
-    // Heartbeat: 5s ping, 2s pong timeout, 1 miss = evict after 7s max
-    webSocket.enableHeartbeat(5000, 2000, 1);
+    // Heartbeat: 5s ping, 2s pong timeout, 2 misses = evict after 14s max
+    webSocket.enableHeartbeat(5000, 2000, 2);
     server.begin();
 
     // NOTE: Do NOT add loopTask to WDT.
@@ -363,34 +441,98 @@ void flush_network() {
 }
 
 // ============================================================
-//   OCCUPANCY GRID BROADCAST
+//   OCCUPANCY GRID BROADCAST — Windowed RLE for large grids
+//   Sends only the local window around the robot (VIEW_SIZE x VIEW_SIZE)
+//   with Run-Length Encoding to keep packets < 8KB.
 // ============================================================
+
+// Viewport size around robot (cells). 256 cells × 0.05m = 12.8m window.
+#define GRID_VIEW_SIZE 256
+
 void send_occupancy_grid() {
-    static uint8_t gridBuffer[20000];
+    // Allocate on PSRAM if available, else use a smaller static buffer
+    static uint8_t* gridBuffer = nullptr;
+    static const int GRID_BUF_SIZE = 32000;  // 32KB max packet
+    if (!gridBuffer) {
+        gridBuffer = (uint8_t*)heap_caps_malloc(GRID_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (!gridBuffer) gridBuffer = (uint8_t*)malloc(GRID_BUF_SIZE);
+        if (!gridBuffer) { LOG_E("GRID", "Buffer alloc failed!"); return; }
+    }
+
+    PoseSnapshot mp = getMapPose();
+
+    // Compute windowed view centered on robot
+    int robotGX = gridMapper.world_to_grid_x(mp.x);
+    int robotGY = gridMapper.world_to_grid_y(mp.y);
+    int half = GRID_VIEW_SIZE / 2;
+    int viewStartX = constrain(robotGX - half, 0, GRID_SIZE - GRID_VIEW_SIZE);
+    int viewStartY = constrain(robotGY - half, 0, GRID_SIZE - GRID_VIEW_SIZE);
+    int viewW = min(GRID_VIEW_SIZE, GRID_SIZE - viewStartX);
+    int viewH = min(GRID_VIEW_SIZE, GRID_SIZE - viewStartY);
+
+    // ── Build header ──
     int idx = 0;
-    gridBuffer[idx++] = 0x01;
-    gridBuffer[idx++] = GRID_SIZE; gridBuffer[idx++] = GRID_SIZE;
+    gridBuffer[idx++] = 0x01;  // Frame type
+
+    // View dimensions (uint16)
+    uint16_t vw = (uint16_t)viewW, vh = (uint16_t)viewH;
+    memcpy(&gridBuffer[idx], &vw, 2); idx += 2;
+    memcpy(&gridBuffer[idx], &vh, 2); idx += 2;
+
+    // Resolution
     float gridRes = GRID_RESOLUTION;
     memcpy(&gridBuffer[idx], &gridRes, 4); idx += 4;
 
-    PoseSnapshot mp = getMapPose();
+    // Robot pose (map frame)
     memcpy(&gridBuffer[idx], &mp.x, 4); idx += 4;
     memcpy(&gridBuffer[idx], &mp.y, 4); idx += 4;
     memcpy(&gridBuffer[idx], &mp.theta, 4); idx += 4;
 
+    // Grid origin (world coords of cell [0,0])
     float ox = gridMapper.originX, oy = gridMapper.originY;
     memcpy(&gridBuffer[idx], &ox, 4); idx += 4;
     memcpy(&gridBuffer[idx], &oy, 4); idx += 4;
 
-    int payloadLen = 0;
-    gridMapper.serialize_grid(&gridBuffer[idx], payloadLen);
+    // View offset (uint16) — so browser knows where this window starts
+    uint16_t vsX = (uint16_t)viewStartX, vsY = (uint16_t)viewStartY;
+    memcpy(&gridBuffer[idx], &vsX, 2); idx += 2;
+    memcpy(&gridBuffer[idx], &vsY, 2); idx += 2;
 
-    // Bounds check — prevent buffer overflow
-    if (idx + payloadLen > (int)sizeof(gridBuffer)) {
-        LOG_W("GRID", "Grid payload too large (%d bytes) — skipping", idx + payloadLen);
-        return;
+    // Full grid size (uint16)
+    uint16_t fullSize = (uint16_t)GRID_SIZE;
+    memcpy(&gridBuffer[idx], &fullSize, 2); idx += 2;
+
+    // ── RLE encode the view window ──
+    // Format: [value (uint8), count (uint8)] pairs. Max run = 255.
+    int maxPayload = GRID_BUF_SIZE - idx - 4;  // Safety margin
+    int rleStart = idx;
+
+    uint8_t prevVal = gridMapper.get_occupancy(viewStartX, viewStartY);
+    uint8_t runLen = 1;
+
+    for (int y = 0; y < viewH; y++) {
+        for (int x = 0; x < viewW; x++) {
+            if (y == 0 && x == 0) continue;  // Already captured first cell
+            uint8_t val = gridMapper.get_occupancy(viewStartX + x, viewStartY + y);
+            if (val == prevVal && runLen < 255) {
+                runLen++;
+            } else {
+                // Flush run
+                if (idx - rleStart + 2 > maxPayload) goto rle_done;
+                gridBuffer[idx++] = prevVal;
+                gridBuffer[idx++] = runLen;
+                prevVal = val;
+                runLen = 1;
+            }
+        }
     }
-    idx += payloadLen;
+    // Flush final run
+    if (idx - rleStart + 2 <= maxPayload) {
+        gridBuffer[idx++] = prevVal;
+        gridBuffer[idx++] = runLen;
+    }
+rle_done:
+
     webSocket.broadcastBIN(gridBuffer, idx);
 }
 
@@ -400,8 +542,10 @@ void send_occupancy_grid() {
 
 // Fast pose: binary 0x05 + 5 floats = 21 bytes, 20Hz
 // No JSON, no MsgPack — raw memcpy for <1ms serialize time
+// NOTE: Uses MAP-frame pose (odom + TF correction) so browser renders
+//       robot in the same coordinate system as the occupancy grid.
 static void broadcast_fast_pose() {
-    PoseSnapshot op = getOdomPose();
+    PoseSnapshot mp = getMapPose();  // MAP frame — matches grid coordinate system
     float vL = state.motor.vL_meas, vR = state.motor.vR_meas;
     float v_robot = (vR + vL) / 2.0f * WHEEL_RADIUS;
     float w_fused = (state.imu.available && state.imu.calibrated)
@@ -410,7 +554,7 @@ static void broadcast_fast_pose() {
 
     static uint8_t poseBuf[1 + 5 * 4 + 1];  // 0x05 + 5 floats + batt% = 22 bytes
     poseBuf[0] = 0x05;
-    float pose[5] = { op.x, op.y, op.theta, v_robot, w_fused };
+    float pose[5] = { mp.x, mp.y, mp.theta, v_robot, w_fused };
     memcpy(&poseBuf[1], pose, 20);
     poseBuf[21] = (uint8_t)state.power.percent;  // Battery 0-100
     webSocket.broadcastBIN(poseBuf, 22);
@@ -435,9 +579,10 @@ static void broadcast_full_telemetry() {
                     : (vR - vL) * WHEEL_RADIUS / WHEEL_SEPARATION;
 
     telem["vx"] = v_robot; telem["wz"] = w_fused;
-    telem["theta"] = op.theta; telem["h"] = op.theta * 180.0f / PI;
+    telem["theta"] = mp.theta; telem["h"] = mp.theta * 180.0f / PI;
     telem["d"] = state.odom.distance;
-    telem["x"] = op.x; telem["y"] = op.y;
+    telem["x"] = mp.x; telem["y"] = mp.y;  // MAP frame — matches grid
+    telem["oX"] = op.x; telem["oY"] = op.y;  // Raw ODOM (debug / Topic Inspector)
     telem["imu"] = state.imu.available; telem["imu_cal"] = state.imu.calibrated;
     telem["gyroZ"] = state.imu.gyroZ_raw;
     telem["fTheta"] = state.odom.fusedTheta * 180.0f / PI;
@@ -504,6 +649,48 @@ static void broadcast_full_telemetry() {
     if (len > 0) webSocket.broadcastBIN(telemBuf, len + 1);
 }
 
+// ── Raw LiDAR scan for PC_BROWSER SLAM ──────────────────────
+// Frame 0x06: raw (angle_deg:float, distance_m:float, quality:uint8) per point
+// Sent at grid-update rate (~5Hz) with all buffered points
+static void broadcast_raw_lidar_scan() {
+    // In PC_BROWSER mode, gridMapper still collects points via add_point()
+    // but does NOT call update_grid(). We read the buffer and stream it.
+    int count = gridMapper.point_count;
+    if (count == 0) return;
+
+    // Frame: 0x06 + uint16(count) + N × (float angle + float dist + uint8 quality) = 9 bytes/pt
+    const int POINT_SIZE = 9;  // 4+4+1
+    int frameSize = 1 + 2 + count * POINT_SIZE;
+
+    // Use PSRAM-backed buffer for large scans
+    static uint8_t* rawBuf = nullptr;
+    static int rawBufSize = 0;
+    if (frameSize > rawBufSize) {
+        if (rawBuf) heap_caps_free(rawBuf);
+        rawBufSize = frameSize + 256;  // Extra headroom
+        rawBuf = (uint8_t*)heap_caps_malloc(rawBufSize, MALLOC_CAP_SPIRAM);
+        if (!rawBuf) rawBuf = (uint8_t*)malloc(rawBufSize);
+        if (!rawBuf) { rawBufSize = 0; return; }
+    }
+
+    int idx = 0;
+    rawBuf[idx++] = 0x06;  // Raw scan frame type
+    uint16_t cnt = (uint16_t)count;
+    memcpy(&rawBuf[idx], &cnt, 2); idx += 2;
+
+    for (int i = 0; i < count; i++) {
+        const LidarPoint& pt = gridMapper.points[i];
+        memcpy(&rawBuf[idx], &pt.angle, 4);    idx += 4;
+        memcpy(&rawBuf[idx], &pt.distance, 4); idx += 4;
+        rawBuf[idx++] = pt.quality ? 1 : 0;
+    }
+
+    webSocket.broadcastBIN(rawBuf, idx);
+
+    // Clear the point buffer (since onboard SLAM isn't consuming it)
+    gridMapper.point_count = 0;
+}
+
 void broadcast_telemetry() {
     if (millis() - lastTelemetryTime < TELEMETRY_INTERVAL) return;
     lastTelemetryTime = millis();
@@ -514,7 +701,7 @@ void broadcast_telemetry() {
     // ── SLOW: Full MsgPack telemetry at 2Hz (500ms) ──
     broadcast_full_telemetry();
 
-    // ── LiDAR binary (20Hz, 721 bytes) ──
+    // ── LiDAR binary (20Hz, 721 bytes) — distance table ──
     static uint8_t lidarBuf[1 + 360 * 2];
     lidarBuf[0] = 0x04;
     uint16_t* lidarData = (uint16_t*)&lidarBuf[1];
@@ -523,11 +710,21 @@ void broadcast_telemetry() {
     }
     webSocket.broadcastBIN(lidarBuf, sizeof(lidarBuf));
 
-    // Grid broadcast (2Hz)
-    static unsigned long lastGridSendTime = 0;
-    if (state.nav.streamOccupancyGrid && millis() - lastGridSendTime > 500) {
-        lastGridSendTime = millis();
-        send_occupancy_grid();
+    // ── MODE-dependent streaming ──
+    if (state.nav.mode == RobotState::MODE_PC_BROWSER) {
+        // PC_BROWSER: stream raw lidar scans for PC-side SLAM
+        static unsigned long lastRawScanTime = 0;
+        if (millis() - lastRawScanTime > GRID_UPDATE_INTERVAL_MS) {
+            lastRawScanTime = millis();
+            broadcast_raw_lidar_scan();
+        }
+    } else {
+        // ONBOARD: send occupancy grid at 2Hz
+        static unsigned long lastGridSendTime = 0;
+        if (state.nav.streamOccupancyGrid && millis() - lastGridSendTime > 500) {
+            lastGridSendTime = millis();
+            send_occupancy_grid();
+        }
     }
 }
 
