@@ -17,14 +17,26 @@ const MIN_SCALE = 10;   // 10 px/m (zoomed out max)
 const MAX_SCALE = 400;  // 400 px/m (zoomed in max)
 const DEFAULT_SCALE = 60; // 60 px/m (default)
 
-export function useRVizViewport(canvasWidth, canvasHeight) {
+function normalizeAngle(a) {
+  let out = a;
+  while (out > Math.PI) out -= Math.PI * 2;
+  while (out < -Math.PI) out += Math.PI * 2;
+  return out;
+}
+
+export function useRVizViewport(canvasWidth, canvasHeight, rotateCenterWorld = null) {
   // offset = center of viewport in world coords (meters)
   const [offset, setOffset] = useState({ x: 5, y: 5 }); // center of warehouse
   const [scale, setScale] = useState(DEFAULT_SCALE);     // pixels per meter
+  const [rotation, setRotation] = useState(0);            // radians, screen-space rotation
 
   const isDragging = useRef(false);
+  const dragMode = useRef(null); // 'pan' | 'rotate'
   const dragStart = useRef({ x: 0, y: 0 });
   const offsetStart = useRef({ x: 0, y: 0 });
+  const rotationStart = useRef(0);
+  const rotateAngleStart = useRef(0);
+  const rotateCenterStart = useRef({ world: null, screen: null });
 
   // ── Coordinate Transforms ────────────────────────────────
 
@@ -32,19 +44,29 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
    * World coords (meters) → Canvas pixels
    */
   const worldToScreen = useCallback((wx, wy) => {
-    const sx = (wx - offset.x) * scale + canvasWidth / 2;
-    const sy = -(wy - offset.y) * scale + canvasHeight / 2; // Y flipped
+    const ux = (wx - offset.x) * scale;
+    const uy = -(wy - offset.y) * scale; // Y flipped
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    const sx = ux * c - uy * s + canvasWidth / 2;
+    const sy = ux * s + uy * c + canvasHeight / 2;
     return { x: sx, y: sy };
-  }, [offset.x, offset.y, scale, canvasWidth, canvasHeight]);
+  }, [offset.x, offset.y, scale, rotation, canvasWidth, canvasHeight]);
 
   /**
    * Canvas pixels → World coords (meters)
    */
   const screenToWorld = useCallback((sx, sy) => {
-    const wx = (sx - canvasWidth / 2) / scale + offset.x;
-    const wy = -(sy - canvasHeight / 2) / scale + offset.y; // Y flipped
+    const dx = sx - canvasWidth / 2;
+    const dy = sy - canvasHeight / 2;
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    const ux = dx * c + dy * s;
+    const uy = -dx * s + dy * c;
+    const wx = ux / scale + offset.x;
+    const wy = -uy / scale + offset.y; // Y flipped
     return { x: wx, y: wy };
-  }, [offset.x, offset.y, scale, canvasWidth, canvasHeight]);
+  }, [offset.x, offset.y, scale, rotation, canvasWidth, canvasHeight]);
 
   // ── Mouse Handlers ───────────────────────────────────────
 
@@ -54,10 +76,17 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
 
+    const dx = mx - canvasWidth / 2;
+    const dy = my - canvasHeight / 2;
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    const ux = dx * c + dy * s;
+    const uy = -dx * s + dy * c;
+
     // World pos under cursor before zoom
     const worldBefore = {
-      x: (mx - canvasWidth / 2) / scale + offset.x,
-      y: -(my - canvasHeight / 2) / scale + offset.y,
+      x: ux / scale + offset.x,
+      y: -uy / scale + offset.y,
     };
 
     // Zoom
@@ -65,38 +94,91 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
     const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * factor));
 
     // World pos under cursor after zoom (should stay same)
-    const newOffsetX = worldBefore.x - (mx - canvasWidth / 2) / newScale;
-    const newOffsetY = worldBefore.y + (my - canvasHeight / 2) / newScale;
+    const newOffsetX = worldBefore.x - ux / newScale;
+    const newOffsetY = worldBefore.y + uy / newScale;
 
     setScale(newScale);
     setOffset({ x: newOffsetX, y: newOffsetY });
-  }, [scale, offset, canvasWidth, canvasHeight]);
+  }, [scale, offset, rotation, canvasWidth, canvasHeight]);
 
   const onMouseDown = useCallback((e) => {
-    if (e.button !== 0 && e.button !== 1) return; // Left or middle click
+    if (e.button !== 0 && e.button !== 1 && e.button !== 2) return;
+    e.preventDefault();
     isDragging.current = true;
+    dragMode.current = e.button === 2 ? 'rotate' : 'pan';
     dragStart.current = { x: e.clientX, y: e.clientY };
     offsetStart.current = { ...offset };
-    e.currentTarget.style.cursor = 'grabbing';
-  }, [offset]);
+    rotationStart.current = rotation;
+
+    if (dragMode.current === 'rotate') {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const centerWorld = (
+        rotateCenterWorld &&
+        Number.isFinite(rotateCenterWorld.x) &&
+        Number.isFinite(rotateCenterWorld.y)
+      ) ? rotateCenterWorld : offset;
+      const centerScreen = worldToScreen(centerWorld.x, centerWorld.y);
+
+      rotateCenterStart.current = {
+        world: { x: centerWorld.x, y: centerWorld.y },
+        screen: centerScreen,
+      };
+      rotateAngleStart.current = Math.atan2(my - centerScreen.y, mx - centerScreen.x);
+    }
+
+    e.currentTarget.style.cursor = dragMode.current === 'rotate' ? 'ew-resize' : 'grabbing';
+  }, [offset, rotation, rotateCenterWorld, worldToScreen]);
 
   const onMouseMove = useCallback((e) => {
     if (!isDragging.current) return;
     const dx = e.clientX - dragStart.current.x;
     const dy = e.clientY - dragStart.current.y;
+
+    if (dragMode.current === 'rotate') {
+      const center = rotateCenterStart.current;
+      if (!center.world || !center.screen) return;
+
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const angle = Math.atan2(my - center.screen.y, mx - center.screen.x);
+      const newRotation = rotationStart.current + normalizeAngle(angle - rotateAngleStart.current);
+      const c = Math.cos(newRotation);
+      const s = Math.sin(newRotation);
+      const screenDx = center.screen.x - canvasWidth / 2;
+      const screenDy = center.screen.y - canvasHeight / 2;
+      const ux = screenDx * c + screenDy * s;
+      const uy = -screenDx * s + screenDy * c;
+
+      setRotation(newRotation);
+      setOffset({
+        x: center.world.x - ux / scale,
+        y: center.world.y + uy / scale,
+      });
+      return;
+    }
+
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
+    const ux = dx * c + dy * s;
+    const uy = -dx * s + dy * c;
     setOffset({
-      x: offsetStart.current.x - dx / scale,
-      y: offsetStart.current.y + dy / scale, // Y flipped
+      x: offsetStart.current.x - ux / scale,
+      y: offsetStart.current.y + uy / scale, // Y flipped
     });
-  }, [scale]);
+  }, [scale, rotation, canvasWidth, canvasHeight]);
 
   const onMouseUp = useCallback((e) => {
     isDragging.current = false;
+    dragMode.current = null;
     e.currentTarget.style.cursor = 'crosshair';
   }, []);
 
   const onMouseLeave = useCallback((e) => {
     isDragging.current = false;
+    dragMode.current = null;
     e.currentTarget.style.cursor = 'crosshair';
   }, []);
 
@@ -111,6 +193,7 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
   const resetZoom = useCallback(() => {
     setScale(DEFAULT_SCALE);
     setOffset({ x: 5, y: 5 });
+    setRotation(0);
   }, []);
 
   /** Follow robot (smooth center) */
@@ -125,6 +208,7 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
     // State
     offset,
     scale,
+    rotation,
 
     // Transforms
     worldToScreen,
@@ -144,6 +228,7 @@ export function useRVizViewport(canvasWidth, canvasHeight) {
     resetZoom,
     followRobot,
     setScale,
+    setRotation,
   };
 }
 

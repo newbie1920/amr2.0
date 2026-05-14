@@ -80,7 +80,7 @@ const TOOLS = [
 const LAYERS = [
   { id: 'grid', icon: '#', label: 'Grid' },
   { id: 'map', icon: '🗺', label: 'Occupancy Map' },
-  { id: 'costmap', icon: '🌡', label: 'Costmap' },
+  { id: 'costmap', icon: 'CM', label: 'Costmap' },
   { id: 'walls', icon: '🧱', label: 'World Segments' },
   { id: 'laser', icon: '🔴', label: 'Laser Scan' },
   { id: 'path', icon: '➡', label: 'Nav Path' },

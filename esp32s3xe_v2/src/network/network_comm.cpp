@@ -224,10 +224,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 
     // ── Navigate (path from Web) ──
     if (doc["cmd"] == "navigate") {
-        if (!state.nav.allowOnboardNav) return;
         JsonArray pathArr = doc["path"].as<JsonArray>();
         int count = pathArr.size();
         if (count > 0 && count <= MAX_WAYPOINTS) {
+            state.nav.allowOnboardNav = true;
             Waypoint tempWps[MAX_WAYPOINTS];
             for (int i = 0; i < count; i++) {
                 tempWps[i].x = pathArr[i]["x"]; tempWps[i].y = pathArr[i]["y"];
@@ -727,5 +727,4 @@ void broadcast_telemetry() {
         }
     }
 }
-
 

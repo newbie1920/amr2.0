@@ -96,7 +96,7 @@ export class VelocityMux {
   /**
    * Resolve: chọn source có priority cao nhất chưa timeout
    */
-  _resolve() {
+  _resolve(forceEmit = false) {
     const now = Date.now();
     let bestSource = null;
     let bestPriority = -1;
@@ -120,8 +120,10 @@ export class VelocityMux {
     const linear = bestData?.linear ?? 0;
     const angular = bestData?.angular ?? 0;
 
-    // Chỉ gửi nếu thay đổi hoặc source thay đổi
-    if (linear !== this.lastLinear || angular !== this.lastAngular || bestSource !== this.activeSource) {
+    const changed = linear !== this.lastLinear || angular !== this.lastAngular || bestSource !== this.activeSource;
+
+    // Gửi nếu thay đổi hoặc được yêu cầu gửi lại (để feed ESP32 watchdog khi đang có lệnh chạy)
+    if (changed || (forceEmit && bestSource !== null)) {
       this.lastLinear = linear;
       this.lastAngular = angular;
 
@@ -140,7 +142,7 @@ export class VelocityMux {
    * Gọi periodically (khoảng 100ms) để cleanup timeout sources
    */
   tick() {
-    this._resolve();
+    this._resolve(true);
   }
 
   /**

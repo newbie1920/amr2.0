@@ -117,7 +117,7 @@ void controlTask(void* pvParameters) {
         }
 
         // ── Navigator update (50Hz) ──────────────────────
-        if (state.nav.mode == RobotState::MODE_ONBOARD && state.nav.allowOnboardNav && navigator.isNavigating()) {
+        if (state.nav.allowOnboardNav && navigator.isNavigating()) {
             PoseSnapshot mapPose = getMapPose();
             navigator.update(mapPose.x, mapPose.y, mapPose.theta);
 
@@ -208,6 +208,18 @@ void lidarTask(void* pvParameters) {
         LOG_E("SLAM", "ICP matcher init FAILED — no memory!");
     }
 
+    auto shouldFreezeMapping = []() -> bool {
+        const float vRobot = (state.motor.vR_meas + state.motor.vL_meas) * 0.5f * WHEEL_RADIUS;
+        const float wRobot = (state.motor.vR_meas - state.motor.vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
+        const bool recovering =
+            navigator.state == NAV_RECOVERY_SPIN ||
+            navigator.state == NAV_RECOVERY_BACKUP ||
+            navigator.state == NAV_RECOVERY_WAIT;
+        const bool reversing = vRobot < -0.02f;
+        const bool turningHard = fabsf(wRobot) > 0.45f;
+        return recovering || reversing || turningHard;
+    };
+
     for (;;) {
         if (state.nav.hitlMode) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -232,7 +244,7 @@ void lidarTask(void* pvParameters) {
                 state.lidar.distances[deg] = (uint16_t)distance;
 
                 // Feed occupancy grid
-                if (state.nav.streamOccupancyGrid) {
+                if (state.nav.streamOccupancyGrid && !shouldFreezeMapping()) {
                     gridMapper.add_point(angle, distance / 1000.0f);
                 }
 
@@ -244,8 +256,14 @@ void lidarTask(void* pvParameters) {
             }
 
             // ── Grid update + SLAM pipeline ──────────────
+            const bool mappingFrozen = shouldFreezeMapping();
+            if (mappingFrozen && gridMapper.point_count > 0) {
+                gridMapper.point_count = 0;
+            }
+
             if (state.nav.mode == RobotState::MODE_ONBOARD &&
                 state.nav.streamOccupancyGrid &&
+                !mappingFrozen &&
                 millis() - state.lidar.lastGridUpdateTime > GRID_UPDATE_INTERVAL_MS &&
                 gridMapper.point_count > 180) {
 

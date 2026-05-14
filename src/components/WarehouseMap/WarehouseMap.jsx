@@ -398,6 +398,7 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
                 robotX={telem.x ?? 0}
                 robotY={telem.y ?? 0}
                 robotHeading={telem.heading ?? 0}
+                robotHeadingRad={telem.headingRad}
                 lidarPoints={telem.lidar}
                 warehouseCX={cx}
                 warehouseCZ={cz}
@@ -536,17 +537,10 @@ function WarehouseScene({ robots, activePath, mapType, occupancyGrid, selectedRo
         if (robot.status !== 'connected') return null;
         const x = map2To3X(robot.telemetry.x);
         const z = map2To3Z(robot.telemetry.y);
-        // 2D theta to 3D rotY conversion:
-        // 2D: theta=0 → +X (right), theta=PI/2 → +Y (up)
-        // 3D: X stays +X, Y_2d maps to -Z_3d
-        // Model front is -Z local, so:
-        //   theta=0 → face +X → rotY = PI/2 (rotate -Z to +X)
-        //   theta=PI/2 → face +Y → face -Z → rotY = PI (rotate -Z to -Z, i.e. 0... wait)
-        // Correct formula: rotY = theta + PI/2
-        // When theta=0: rotY=PI/2 → local -Z rotates to +X ✓
-        // When theta=PI/2: rotY=PI → local -Z rotates to -Z (which is +Y_2d) ✓
+        // 2D theta: 0=+X, PI/2=+Y. Three.js maps 2D +Y to world -Z.
+        // The model's local front is -Z, so rotY = theta - PI/2.
         const theta2D = robot.telemetry.headingRad ?? 0;
-        const rotY = theta2D + Math.PI / 2;
+        const rotY = theta2D - Math.PI / 2;
         
         return (
           <React.Fragment key={robot.id}>

@@ -270,12 +270,12 @@ export class RobotConnection {
    * @param {number|null} finalHeading - Góc cuối tại đích (độ), null nếu không cần
    */
   navigate(path, finalHeading = null) {
-    const msg = { cmd: 'navigate', path };
+    const msg = { cmd: 'ext_waypoints', path };
     if (finalHeading !== null && finalHeading !== undefined) {
       msg.finalHeading = finalHeading;
     }
     this._send(msg);
-    console.log(`[Navigate] Sent ${path.length} waypoints, finalH=${finalHeading}°`);
+    console.log(`[Navigate] Sent ${path.length} external waypoints, finalH=${finalHeading}°`);
   }
 
   /**
@@ -690,8 +690,8 @@ export class RobotConnection {
     for (let i = 0; i < 360; i++) {
       const d = view.getUint16(1 + i * 2, true); // LE, offset past 0x04 byte
       if (d > 0 && d < 6000) {
-        // Mirror angles: LiDAR mounted with scan direction flipped
-        lidarPoints.push({ a: (360 - i) % 360, d });
+        // Mirror + Rotate 180°: LiDAR mounted with scan direction flipped and facing backwards
+        lidarPoints.push({ a: (360 - i + 180) % 360, d });
       }
     }
 

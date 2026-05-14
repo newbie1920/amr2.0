@@ -93,6 +93,12 @@ function SplitPane({ left, right, defaultRatio = 0.55, minLeft = 300, minRight =
 function App() {
   const [activePath, setActivePath] = useState(null);
   const [viewMode, setViewMode] = useState('split'); // 'gazebo', 'rviz', 'split'
+  const [isLeftSidebarCollapsed, setIsLeftSidebarCollapsed] = useState(() => {
+    return localStorage.getItem('amr_left_sidebar_collapsed') === 'true';
+  });
+  const [isRightSidebarCollapsed, setIsRightSidebarCollapsed] = useState(() => {
+    return localStorage.getItem('amr_right_sidebar_collapsed') === 'true';
+  });
   const robots = useRobotStore((s) => s.robots);
   const loadStoredRobots = useRobotStore((s) => s.loadStoredRobots);
   const simMode = useRobotStore((s) => s.simMode);
@@ -115,6 +121,15 @@ function App() {
       stopTrafficBroadcaster();
     };
   }, [loadStoredRobots]);
+
+  useEffect(() => {
+    localStorage.setItem('amr_left_sidebar_collapsed', String(isLeftSidebarCollapsed));
+  }, [isLeftSidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem('amr_right_sidebar_collapsed', String(isRightSidebarCollapsed));
+  }, [isRightSidebarCollapsed]);
+
   const robotList = Object.values(robots);
 
   const onlineCount = robotList.filter(r => r.status === 'connected').length;
@@ -135,8 +150,26 @@ function App() {
   const firstSimInfo = Object.values(simInfo)[0];
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${isLeftSidebarCollapsed ? 'app-layout--left-collapsed' : ''} ${isRightSidebarCollapsed ? 'app-layout--right-collapsed' : ''}`}>
       <CollisionManager />
+      <button
+        type="button"
+        className={`sidebar-toggle sidebar-toggle--left ${isLeftSidebarCollapsed ? 'sidebar-toggle--collapsed' : ''}`}
+        onClick={() => setIsLeftSidebarCollapsed((collapsed) => !collapsed)}
+        aria-label={isLeftSidebarCollapsed ? 'Mở quản lý xe' : 'Thu quản lý xe'}
+        title={isLeftSidebarCollapsed ? 'Mở quản lý xe' : 'Thu quản lý xe'}
+      >
+        {isLeftSidebarCollapsed ? '>' : '<'}
+      </button>
+      <button
+        type="button"
+        className={`sidebar-toggle sidebar-toggle--right ${isRightSidebarCollapsed ? 'sidebar-toggle--collapsed' : ''}`}
+        onClick={() => setIsRightSidebarCollapsed((collapsed) => !collapsed)}
+        aria-label={isRightSidebarCollapsed ? 'Mở quản lý nhiệm vụ' : 'Thu quản lý nhiệm vụ'}
+        title={isRightSidebarCollapsed ? 'Mở quản lý nhiệm vụ' : 'Thu quản lý nhiệm vụ'}
+      >
+        {isRightSidebarCollapsed ? '<' : '>'}
+      </button>
       
       {/* ── HEADER ──────────────────────────────────────────── */}
       <header className="app-header">
@@ -209,7 +242,7 @@ function App() {
       </header>
 
       {/* ── SIDEBAR LEFT — Robot Panel + Sim Controls ──────── */}
-      <aside className="sidebar-left">
+      <aside className={`sidebar-left ${isLeftSidebarCollapsed ? 'collapsed' : ''}`}>
         <SimControlPanel />
         <ConnectionPanel />
         <DWATuningPanel />
@@ -233,7 +266,7 @@ function App() {
       </main>
 
       {/* ── SIDEBAR RIGHT — Task Manager ────────────────────── */}
-      <aside className="sidebar-right">
+      <aside className={`sidebar-right ${isRightSidebarCollapsed ? 'collapsed' : ''}`}>
         <TaskManager onPathGenerated={(path) => setActivePath(path)} />
       </aside>
 

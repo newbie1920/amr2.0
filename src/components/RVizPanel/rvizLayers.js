@@ -32,6 +32,23 @@ const COLORS = {
   measure: '#f59e0b',
 };
 
+function getVisibleWorldBounds(w, h, viewport, spacing = 1) {
+  const corners = [
+    viewport.screenToWorld(0, 0),
+    viewport.screenToWorld(w, 0),
+    viewport.screenToWorld(w, h),
+    viewport.screenToWorld(0, h),
+  ];
+  const xs = corners.map(p => p.x);
+  const ys = corners.map(p => p.y);
+  return {
+    minX: Math.floor(Math.min(...xs) / spacing) * spacing - spacing,
+    maxX: Math.ceil(Math.max(...xs) / spacing) * spacing + spacing,
+    minY: Math.floor(Math.min(...ys) / spacing) * spacing - spacing,
+    maxY: Math.ceil(Math.max(...ys) / spacing) * spacing + spacing,
+  };
+}
+
 // ============================================================
 //   1. GRID BACKGROUND
 // ============================================================
@@ -43,13 +60,12 @@ export function drawGrid(ctx, w, h, viewport) {
   const majorSpacing = scale > 40 ? 1.0 : scale > 15 ? 2.0 : 5.0; // meters
   const minorSpacing = majorSpacing / 5;
 
-  // Find visible world bounds
-  const topLeft = viewport.screenToWorld(0, 0);
-  const bottomRight = viewport.screenToWorld(w, h);
-  const minWX = Math.floor(topLeft.x / majorSpacing) * majorSpacing - majorSpacing;
-  const maxWX = Math.ceil(bottomRight.x / majorSpacing) * majorSpacing + majorSpacing;
-  const minWY = Math.floor(bottomRight.y / majorSpacing) * majorSpacing - majorSpacing;
-  const maxWY = Math.ceil(topLeft.y / majorSpacing) * majorSpacing + majorSpacing;
+  // Find visible world bounds from all corners so rotated views keep full coverage.
+  const bounds = getVisibleWorldBounds(w, h, viewport, majorSpacing);
+  const minWX = bounds.minX;
+  const maxWX = bounds.maxX;
+  const minWY = bounds.minY;
+  const maxWY = bounds.maxY;
 
   // Minor grid lines
   if (scale > 25) {
@@ -57,14 +73,16 @@ export function drawGrid(ctx, w, h, viewport) {
     ctx.lineWidth = 0.5;
     ctx.beginPath();
     for (let x = minWX; x <= maxWX; x += minorSpacing) {
-      const s = worldToScreen(x, 0);
-      ctx.moveTo(s.x, 0);
-      ctx.lineTo(s.x, h);
+      const a = worldToScreen(x, minWY);
+      const b = worldToScreen(x, maxWY);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
     }
     for (let y = minWY; y <= maxWY; y += minorSpacing) {
-      const s = worldToScreen(0, y);
-      ctx.moveTo(0, s.y);
-      ctx.lineTo(w, s.y);
+      const a = worldToScreen(minWX, y);
+      const b = worldToScreen(maxWX, y);
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
     }
     ctx.stroke();
   }
@@ -74,31 +92,36 @@ export function drawGrid(ctx, w, h, viewport) {
   ctx.lineWidth = 1;
   ctx.beginPath();
   for (let x = minWX; x <= maxWX; x += majorSpacing) {
-    const s = worldToScreen(x, 0);
-    ctx.moveTo(s.x, 0);
-    ctx.lineTo(s.x, h);
+    const a = worldToScreen(x, minWY);
+    const b = worldToScreen(x, maxWY);
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
   }
   for (let y = minWY; y <= maxWY; y += majorSpacing) {
-    const s = worldToScreen(0, y);
-    ctx.moveTo(0, s.y);
-    ctx.lineTo(w, s.y);
+    const a = worldToScreen(minWX, y);
+    const b = worldToScreen(maxWX, y);
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
   }
   ctx.stroke();
 
   // Origin axes
-  const origin = worldToScreen(0, 0);
   // X axis (red)
   ctx.strokeStyle = 'rgba(239, 68, 68, 0.4)';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(0, origin.y);
-  ctx.lineTo(w, origin.y);
+  const xAxisA = worldToScreen(minWX, 0);
+  const xAxisB = worldToScreen(maxWX, 0);
+  ctx.moveTo(xAxisA.x, xAxisA.y);
+  ctx.lineTo(xAxisB.x, xAxisB.y);
   ctx.stroke();
   // Y axis (green)
   ctx.strokeStyle = 'rgba(34, 197, 94, 0.4)';
   ctx.beginPath();
-  ctx.moveTo(origin.x, 0);
-  ctx.lineTo(origin.x, h);
+  const yAxisA = worldToScreen(0, minWY);
+  const yAxisB = worldToScreen(0, maxWY);
+  ctx.moveTo(yAxisA.x, yAxisA.y);
+  ctx.lineTo(yAxisB.x, yAxisB.y);
   ctx.stroke();
 
   // Scale bar
@@ -194,9 +217,13 @@ export function drawOccupancyMap(ctx, w, h, viewport, grid) {
   const pixH = grid.height * grid.resolution * scale;
 
   const prevSmooth = ctx.imageSmoothingEnabled;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(viewport.rotation || 0);
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(_occMapCache.canvas, s.x, s.y, pixW, pixH);
+  ctx.drawImage(_occMapCache.canvas, 0, 0, pixW, pixH);
   ctx.imageSmoothingEnabled = prevSmooth;
+  ctx.restore();
 }
 
 // ============================================================
@@ -389,61 +416,66 @@ export function drawRobotPose(ctx, w, h, viewport, robotX, robotY, robotTheta, r
   // Chiều dài mũi tên tỷ lệ thuận với vận tốc tức thời (tối thiểu = 1.8 * rPx)
   const speedScale = Math.max(0, Math.min(1.5, Math.abs(linearVel))); // Clamp để không dài quá
   const arrowLen = rPx * 1.8 + (speedScale * scale * 0.4);
+  const arrowLenWorld = arrowLen / Math.max(scale, 1e-6);
 
   // 1. Mũi tên Odometry (xanh dương lớn)
   if (odomTheta !== null && odomTheta !== undefined) {
-    const odomScreenAngle = -(odomTheta + Math.PI); // Y flipped + 180° heading correction
-    const odomArrowX = s.x + Math.cos(odomScreenAngle) * arrowLen;
-    const odomArrowY = s.y + Math.sin(odomScreenAngle) * arrowLen;
+    const odomTip = worldToScreen(
+      robotX + Math.cos(odomTheta) * arrowLenWorld,
+      robotY + Math.sin(odomTheta) * arrowLenWorld
+    );
+    const odomScreenAngle = Math.atan2(odomTip.y - s.y, odomTip.x - s.x);
 
     ctx.strokeStyle = '#3b82f6'; // Xanh dương (blue-500)
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(s.x, s.y);
-    ctx.lineTo(odomArrowX, odomArrowY);
+    ctx.lineTo(odomTip.x, odomTip.y);
     ctx.stroke();
 
     const headLen = 8;
     const headAngle = 0.5;
     ctx.beginPath();
-    ctx.moveTo(odomArrowX, odomArrowY);
+    ctx.moveTo(odomTip.x, odomTip.y);
     ctx.lineTo(
-      odomArrowX - headLen * Math.cos(odomScreenAngle - headAngle),
-      odomArrowY - headLen * Math.sin(odomScreenAngle - headAngle)
+      odomTip.x - headLen * Math.cos(odomScreenAngle - headAngle),
+      odomTip.y - headLen * Math.sin(odomScreenAngle - headAngle)
     );
-    ctx.moveTo(odomArrowX, odomArrowY);
+    ctx.moveTo(odomTip.x, odomTip.y);
     ctx.lineTo(
-      odomArrowX - headLen * Math.cos(odomScreenAngle + headAngle),
-      odomArrowY - headLen * Math.sin(odomScreenAngle + headAngle)
+      odomTip.x - headLen * Math.cos(odomScreenAngle + headAngle),
+      odomTip.y - headLen * Math.sin(odomScreenAngle + headAngle)
     );
     ctx.stroke();
   }
 
   // 2. Mũi tên Heading Corrected/Filtered (đỏ lớn)
-  const screenAngle = -(robotTheta + Math.PI); // Y flipped + 180° heading correction
-  const arrowX = s.x + Math.cos(screenAngle) * arrowLen;
-  const arrowY = s.y + Math.sin(screenAngle) * arrowLen;
+  const arrowTip = worldToScreen(
+    robotX + Math.cos(robotTheta) * arrowLenWorld,
+    robotY + Math.sin(robotTheta) * arrowLenWorld
+  );
+  const screenAngle = Math.atan2(arrowTip.y - s.y, arrowTip.x - s.x);
 
   ctx.strokeStyle = '#ef4444'; // Đỏ (red-500)
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(s.x, s.y);
-  ctx.lineTo(arrowX, arrowY);
+  ctx.lineTo(arrowTip.x, arrowTip.y);
   ctx.stroke();
 
   // Arrowhead
   const headLen = 8;
   const headAngle = 0.5;
   ctx.beginPath();
-  ctx.moveTo(arrowX, arrowY);
+  ctx.moveTo(arrowTip.x, arrowTip.y);
   ctx.lineTo(
-    arrowX - headLen * Math.cos(screenAngle - headAngle),
-    arrowY - headLen * Math.sin(screenAngle - headAngle)
+    arrowTip.x - headLen * Math.cos(screenAngle - headAngle),
+    arrowTip.y - headLen * Math.sin(screenAngle - headAngle)
   );
-  ctx.moveTo(arrowX, arrowY);
+  ctx.moveTo(arrowTip.x, arrowTip.y);
   ctx.lineTo(
-    arrowX - headLen * Math.cos(screenAngle + headAngle),
-    arrowY - headLen * Math.sin(screenAngle + headAngle)
+    arrowTip.x - headLen * Math.cos(screenAngle + headAngle),
+    arrowTip.y - headLen * Math.sin(screenAngle + headAngle)
   );
   ctx.stroke();
 
@@ -694,23 +726,23 @@ const _NAV2_COSTMAP_LUT = (() => {
     let r, g, b, a;
     if (i >= 253) {
       // LETHAL — dark purple/black (obstacle cell itself)
-      r = 100; g = 0; b = 50; a = 180;
+      r = 100; g = 0; b = 50; a = 230;
     } else if (i >= 200) {
       // INSCRIBED — hot magenta/pink (robot WILL collide)
       const t = (i - 200) / 53;
-      r = 255; g = Math.round(20 * (1 - t)); b = Math.round(100 + 60 * t); a = 140;
+      r = 255; g = Math.round(20 * (1 - t)); b = Math.round(100 + 60 * t); a = 190;
     } else if (i >= 128) {
       // HIGH INFLATION — magenta → deep pink
       const t = (i - 128) / 72;
-      r = Math.round(180 + 75 * t); g = Math.round(30 * (1 - t)); b = Math.round(180 + 30 * t); a = Math.round(80 + 40 * t);
+      r = Math.round(180 + 75 * t); g = Math.round(30 * (1 - t)); b = Math.round(180 + 30 * t); a = Math.round(120 + 50 * t);
     } else if (i >= 50) {
       // MID INFLATION — cyan → magenta
       const t = (i - 50) / 78;
-      r = Math.round(t * 180); g = Math.round(220 * (1 - t * 0.85)); b = Math.round(255 - 55 * t); a = Math.round(40 + 40 * t);
+      r = Math.round(t * 180); g = Math.round(220 * (1 - t * 0.85)); b = Math.round(255 - 55 * t); a = Math.round(80 + 50 * t);
     } else {
       // LOW INFLATION — light cyan, very subtle
       const t = i / 50;
-      r = 0; g = Math.round(180 + 40 * t); b = 255; a = Math.round(10 + 30 * t);
+      r = 0; g = Math.round(180 + 40 * t); b = 255; a = Math.round(35 + 35 * t);
     }
     lut.push([r, g, b, a]);
   }
@@ -795,9 +827,13 @@ export function drawCostmapNav2(ctx, w, h, viewport, grid) {
 
   // Use imageSmoothingEnabled=false for crisp pixels
   const prevSmooth = ctx.imageSmoothingEnabled;
+  ctx.save();
+  ctx.translate(s.x, s.y);
+  ctx.rotate(viewport.rotation || 0);
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(_costmapCache.canvas, s.x, s.y, pixW, pixH);
+  ctx.drawImage(_costmapCache.canvas, 0, 0, pixW, pixH);
   ctx.imageSmoothingEnabled = prevSmooth;
+  ctx.restore();
 }
 
 // ============================================================
@@ -944,19 +980,25 @@ export function drawRobotFootprint(ctx, viewport, robotX, robotY, robotRadius = 
 // ============================================================
 
 export function drawLocalCostmapWindow(ctx, viewport, robotX, robotY, windowSize = 3.0) {
-  const { worldToScreen, scale } = viewport;
+  const { worldToScreen } = viewport;
   const half = windowSize / 2;
-  const tl = worldToScreen(robotX - half, robotY + half);
-  const br = worldToScreen(robotX + half, robotY - half);
-  const w = br.x - tl.x;
-  const h = br.y - tl.y;
+  const corners = [
+    worldToScreen(robotX - half, robotY + half),
+    worldToScreen(robotX + half, robotY + half),
+    worldToScreen(robotX + half, robotY - half),
+    worldToScreen(robotX - half, robotY - half),
+  ];
 
   // Dashed cyan border
   ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
   ctx.lineWidth = 1.5;
   ctx.setLineDash([6, 4]);
   ctx.beginPath();
-  ctx.roundRect(tl.x, tl.y, w, h, 4);
+  ctx.moveTo(corners[0].x, corners[0].y);
+  for (let i = 1; i < corners.length; i++) {
+    ctx.lineTo(corners[i].x, corners[i].y);
+  }
+  ctx.closePath();
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -964,7 +1006,7 @@ export function drawLocalCostmapWindow(ctx, viewport, robotX, robotY, windowSize
   ctx.fillStyle = 'rgba(6, 182, 212, 0.4)';
   ctx.font = '8px Inter, monospace';
   ctx.textAlign = 'left';
-  ctx.fillText('local_costmap', tl.x + 4, tl.y - 3);
+  ctx.fillText('local_costmap', corners[0].x + 4, corners[0].y - 3);
 }
 
 // ============================================================

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
 import useNavStore from '../../stores/navStore.js';
 import vi from '../../i18n/vi.js';
@@ -452,8 +452,21 @@ function JoystickControl({ robotId }) {
   const maxLin = 0.3;
   const maxAng = 1.5;
 
-  const move = (lin, ang) => sendManualControl(robotId, lin * maxLin, ang * maxAng);
-  const stop = () => stopRobot(robotId);
+  const moveIntervalRef = useRef(null);
+
+  const startMove = (lin, ang) => {
+    sendManualControl(robotId, lin * maxLin, ang * maxAng);
+    if (moveIntervalRef.current) clearInterval(moveIntervalRef.current);
+    moveIntervalRef.current = setInterval(() => {
+      sendManualControl(robotId, lin * maxLin, ang * maxAng);
+    }, 100);
+  };
+
+  const stopMove = () => {
+    if (moveIntervalRef.current) clearInterval(moveIntervalRef.current);
+    moveIntervalRef.current = null;
+    sendManualControl(robotId, 0, 0);
+  };
 
   // Keyboard WASD Controls
   useEffect(() => {
@@ -461,18 +474,18 @@ function JoystickControl({ robotId }) {
       if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'SELECT') return;
       
       switch(e.key.toLowerCase()) {
-        case 'w': move(1, 0); break;
-        case 's': move(-1, 0); break;
-        case 'a': move(0, 1); break; // Xoay trái (spin dương theo radian)
-        case 'd': move(0, -1); break; // Xoay phải (spin âm theo radian)
-        case ' ': stop(); break; // Space = Stop
+        case 'w': startMove(1, 0); break;
+        case 's': startMove(-1, 0); break;
+        case 'a': startMove(0, 1); break; // Xoay trái (spin dương theo radian)
+        case 'd': startMove(0, -1); break; // Xoay phải (spin âm theo radian)
+        case ' ': stopMove(); break; // Space = Stop
       }
     };
 
     const handleKeyUp = (e) => {
       if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'SELECT') return;
       if (['w','a','s','d'].includes(e.key.toLowerCase())) {
-        stop();
+        stopMove();
       }
     };
 
@@ -481,6 +494,7 @@ function JoystickControl({ robotId }) {
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      if (moveIntervalRef.current) clearInterval(moveIntervalRef.current);
     };
   }, [robotId]);
 
@@ -502,13 +516,13 @@ function JoystickControl({ robotId }) {
     <div>
       <div className="joystick">
         <div /> {/* empty */}
-        <button className="joystick__btn" onMouseDown={() => move(1, 0)} onMouseUp={stop} onMouseLeave={stop}>▲</button>
+        <button className="joystick__btn" onMouseDown={() => startMove(1, 0)} onMouseUp={stopMove} onMouseLeave={stopMove} onTouchStart={(e) => { e.preventDefault(); startMove(1, 0); }} onTouchEnd={stopMove}>▲</button>
         <div /> {/* empty */}
-        <button className="joystick__btn" onMouseDown={() => move(0, 1)} onMouseUp={stop} onMouseLeave={stop}>◄</button>
-        <button className="joystick__btn joystick__btn--stop" onClick={stop}>STOP</button>
-        <button className="joystick__btn" onMouseDown={() => move(0, -1)} onMouseUp={stop} onMouseLeave={stop}>►</button>
+        <button className="joystick__btn" onMouseDown={() => startMove(0, 1)} onMouseUp={stopMove} onMouseLeave={stopMove} onTouchStart={(e) => { e.preventDefault(); startMove(0, 1); }} onTouchEnd={stopMove}>◄</button>
+        <button className="joystick__btn joystick__btn--stop" onClick={stopMove} onTouchStart={(e) => { e.preventDefault(); stopMove(); }}>STOP</button>
+        <button className="joystick__btn" onMouseDown={() => startMove(0, -1)} onMouseUp={stopMove} onMouseLeave={stopMove} onTouchStart={(e) => { e.preventDefault(); startMove(0, -1); }} onTouchEnd={stopMove}>►</button>
         <div /> {/* empty */}
-        <button className="joystick__btn" onMouseDown={() => move(-1, 0)} onMouseUp={stop} onMouseLeave={stop}>▼</button>
+        <button className="joystick__btn" onMouseDown={() => startMove(-1, 0)} onMouseUp={stopMove} onMouseLeave={stopMove} onTouchStart={(e) => { e.preventDefault(); startMove(-1, 0); }} onTouchEnd={stopMove}>▼</button>
         <div /> {/* empty */}
       </div>
       

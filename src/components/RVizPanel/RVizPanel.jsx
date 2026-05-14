@@ -13,7 +13,7 @@
  *   - Topic Inspector
  */
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import useRobotStore from '../../stores/robotStore.js';
 import useNavStore from '../../stores/navStore.js';
 import useMapStore from '../../stores/mapStore.js';
@@ -134,7 +134,7 @@ export default function RVizPanel({ activePath }) {
 
   // Layer visibility — clean defaults, user can toggle from toolbar
   const [layers, setLayers] = useState({
-    grid: true, map: true, costmap: false, walls: true,
+    grid: true, map: true, costmap: true, walls: true,
     laser: true, path: true, robot: true, tf: false, frontier: false,
     footprint: true, localCostmap: false, dwaPreview: false, trail: false,
   });
@@ -192,6 +192,15 @@ export default function RVizPanel({ activePath }) {
   const dataSource = activeRobot?._sim ? 'sim'
     : (activeRobot?.telemetry?.hitl || activeRobot?.connection?.hitlEnabled) ? 'hitl'
       : activeRobot ? 'real' : 'none';
+
+  const costmapStats = useMemo(() => {
+    if (!grid?.costmap) return { hasData: false, activeCells: 0 };
+    let activeCells = 0;
+    for (let i = 0; i < grid.costmap.length; i++) {
+      if (grid.costmap[i] > 0) activeCells++;
+    }
+    return { hasData: true, activeCells };
+  }, [grid, grid?.costmapVersion, grid?.width, grid?.height]);
 
   // Stabilize simWorldSegments: use empty array in real mode to prevent
   // sim engine's 60Hz state updates from triggering canvas re-renders/flicker.
@@ -293,8 +302,8 @@ export default function RVizPanel({ activePath }) {
     const sy = e.clientY - rect.top;
     setCursorWorld(viewport.screenToWorld(sx, sy));
 
-    // Only delegate panning when in move tool
-    if (activeTool === 'move') {
+    // Pan in move tool; rotate with right mouse drag from any tool.
+    if (activeTool === 'move' || (e.buttons & 2)) {
       viewport.handlers.onMouseMove(e);
     }
   }, [viewport, activeTool]);
@@ -371,14 +380,26 @@ export default function RVizPanel({ activePath }) {
     setNavPath(null);
   }, [activeRobotId, navSession, navStopRobot, stopAppNavigation]);
 
-  // Right-click to clear measurements & goal
+  const handleCanvasMouseDown = useCallback((e) => {
+    if (activeTool === 'move' || e.button === 2) {
+      viewport.handlers.onMouseDown(e);
+    }
+  }, [activeTool, viewport]);
+
+  const handleCanvasMouseUp = useCallback((e) => {
+    if (activeTool === 'move' || e.button === 2) {
+      viewport.handlers.onMouseUp(e);
+    }
+  }, [activeTool, viewport]);
+
+  const handleCanvasMouseLeave = useCallback((e) => {
+    viewport.handlers.onMouseLeave(e);
+  }, [viewport]);
+
+  // Keep browser context menu out of the RViz canvas so right-drag can rotate.
   const handleContextMenu = useCallback((e) => {
     e.preventDefault();
-    if (measurePoints.p1) {
-      setMeasurePoints({ p1: null, p2: null });
-    }
-    handleClearGoal();
-  }, [measurePoints, handleClearGoal]);
+  }, []);
 
   // ── Render Loop ───────────────────────────────────────────
 
@@ -403,6 +424,7 @@ export default function RVizPanel({ activePath }) {
         worldToScreen: viewport.worldToScreen,
         screenToWorld: viewport.screenToWorld,
         scale: viewport.scale,
+        rotation: viewport.rotation,
       };
 
       // Draw layers in order (back to front)
@@ -421,7 +443,9 @@ export default function RVizPanel({ activePath }) {
 
       // Robot-specific layers
       if (telem.x !== undefined) {
-        const headingRad = (telem.heading ?? 0) * Math.PI / 180;
+        const headingRad = Number.isFinite(telem.headingRad)
+          ? telem.headingRad
+          : (telem.heading ?? 0) * Math.PI / 180;
 
         // Trail tracking — record robot position
         if (navSession?.active && layers.trail) {
@@ -525,6 +549,19 @@ export default function RVizPanel({ activePath }) {
             </button>
           )}
           <button
+            style={{
+              ...headerBtnStyle(layers.costmap),
+              color: layers.costmap ? '#fbbf24' : '#64748b',
+              borderColor: layers.costmap ? 'rgba(251, 191, 36, 0.45)' : 'rgba(255,255,255,0.08)',
+              background: layers.costmap ? 'rgba(251, 191, 36, 0.16)' : 'transparent',
+              minWidth: '62px',
+            }}
+            onClick={() => toggleLayer('costmap')}
+            title={costmapStats.hasData ? `Costmap: ${costmapStats.activeCells} active cells` : 'Costmap: no data yet'}
+          >
+            Costmap
+          </button>
+          <button
             style={headerBtnStyle(followRobot)}
             onClick={() => setFollowRobot(!followRobot)}
             title="Follow Robot"
@@ -605,10 +642,10 @@ export default function RVizPanel({ activePath }) {
               height: canvasSize.h,
               cursor: activeTool === 'move' ? 'grab' : 'crosshair',
             }}
-            onMouseDown={activeTool === 'move' ? viewport.handlers.onMouseDown : undefined}
+            onMouseDown={handleCanvasMouseDown}
             onMouseMove={handleCanvasMouseMove}
-            onMouseUp={activeTool === 'move' ? viewport.handlers.onMouseUp : undefined}
-            onMouseLeave={activeTool === 'move' ? viewport.handlers.onMouseLeave : undefined}
+            onMouseUp={handleCanvasMouseUp}
+            onMouseLeave={handleCanvasMouseLeave}
             onClick={handleCanvasClick}
             onContextMenu={handleContextMenu}
           />
@@ -621,13 +658,17 @@ export default function RVizPanel({ activePath }) {
           Cursor: ({cursorWorld.x.toFixed(2)}, {cursorWorld.y.toFixed(2)})m
         </span>
         <span>Zoom: {viewport.scale.toFixed(0)} px/m</span>
+        <span>Rot: {(viewport.rotation * 180 / Math.PI).toFixed(0)} deg</span>
         {activeRobot && (
           <span style={{ color: '#10b981' }}>
             Robot: {activeRobot.name} ({telem.x?.toFixed(2)}, {telem.y?.toFixed(2)})
           </span>
         )}
         {grid && (
-          <span>Map: {grid.width}×{grid.height} | Scans: {grid.scanCount}</span>
+          <span>
+            Map: {grid.width}x{grid.height} | Scans: {grid.scanCount}
+            {' '}| Costmap: {costmapStats.hasData ? `${costmapStats.activeCells} cells` : 'none'}
+          </span>
         )}
         {navSession?.active && (
           <span style={{ color: '#f59e0b', fontWeight: 600 }}>

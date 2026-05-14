@@ -138,7 +138,7 @@ export function OccupancyGridVisualizer({ grid, opacity = 0.9, warehouseCX = 5, 
 //   LASER SCAN OVERLAY
 // ============================================================
 
-export function LaserScanOverlay({ robotX, robotY, robotHeading, lidarPoints, warehouseCX = 5, warehouseCZ = 5 }) {
+export function LaserScanOverlay({ robotX, robotY, robotHeading, robotHeadingRad, lidarPoints, warehouseCX = 5, warehouseCZ = 5 }) {
   const { hitPositions, linePositions } = useMemo(() => {
     if (!lidarPoints || lidarPoints.length === 0) {
       return { hitPositions: new Float32Array(0), linePositions: new Float32Array(0) };
@@ -146,8 +146,10 @@ export function LaserScanOverlay({ robotX, robotY, robotHeading, lidarPoints, wa
 
     const hits = [];
     const lines = [];
-    // robotHeading is in degrees, convert to radians (2D convention: 0=+X, CCW)
-    const headingRad = (robotHeading ?? 0) * Math.PI / 180;
+    // 2D convention: 0=+X, CCW. Prefer telemetry headingRad to match RViz.
+    const headingRad = Number.isFinite(robotHeadingRad)
+      ? robotHeadingRad
+      : (robotHeading ?? 0) * Math.PI / 180;
     // Robot position in 3D coords
     const rx3D = robotX - warehouseCX;
     const rz3D = -(robotY - warehouseCZ);
@@ -178,7 +180,7 @@ export function LaserScanOverlay({ robotX, robotY, robotHeading, lidarPoints, wa
       hitPositions: new Float32Array(hits),
       linePositions: new Float32Array(lines),
     };
-  }, [robotX, robotY, robotHeading, lidarPoints, warehouseCX, warehouseCZ]);
+  }, [robotX, robotY, robotHeading, robotHeadingRad, lidarPoints, warehouseCX, warehouseCZ]);
 
   if (hitPositions.length === 0) return null;
 
