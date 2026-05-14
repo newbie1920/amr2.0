@@ -241,15 +241,17 @@ void lidarTask(void* pvParameters) {
             // Filter by distance validity instead of quality to maximize point count
             if (distance > 10.0f) {  // >10mm = valid (rejects noise/zero)
                 int deg = (int)roundf(angle) % 360;
+                // A1M8 is mounted flipped/backwards; keep raw table for 0x04, map in robot frame.
+                int mapDeg = (360 - deg + 180) % 360;
                 state.lidar.distances[deg] = (uint16_t)distance;
 
                 // Feed occupancy grid
                 if (state.nav.streamOccupancyGrid && !shouldFreezeMapping()) {
-                    gridMapper.add_point(angle, distance / 1000.0f);
+                    gridMapper.add_point((float)mapDeg, distance / 1000.0f);
                 }
 
                 // Close-range obstacle detection (front ±30°)
-                if ((deg <= 30 || deg >= 330) && distance > 50 && distance < 80) {
+                if ((mapDeg <= 30 || mapDeg >= 330) && distance > 50 && distance < 80) {
                     state.lidar.obstacleDetected = true;
                     state.lidar.lastObstacleTime = millis();
                 }

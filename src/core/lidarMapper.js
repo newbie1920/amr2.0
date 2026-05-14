@@ -670,6 +670,17 @@ export class OccupancyGrid {
     if (!grid || grid.width !== fullSize || grid.height !== fullSize || Math.abs(grid.resolution - resolution) > 0.001) {
       grid = new OccupancyGrid(fullSize, fullSize, resolution, 0, 0);
       console.log(`[OccupancyGrid] Created new ${fullSize}x${fullSize} grid from RLE frame`);
+    } else {
+      const originShift =
+        Math.hypot(grid.originX - originX, grid.originY - originY);
+      if (originShift > resolution * 0.5) {
+        grid.logOdds.fill(L_PRIOR);
+        grid.data.fill(128);
+        grid.costmap.fill(0);
+        grid.scanCount = 0;
+        grid.costmapVersion++;
+        console.log(`[OccupancyGrid] ESP grid origin shifted ${originShift.toFixed(3)}m; cleared stale browser grid`);
+      }
     }
 
     grid.originX = originX;
