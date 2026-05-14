@@ -103,8 +103,8 @@
 // ============================================================
 //   MOTOR INVERSION
 // ============================================================
-#define INVERT_LEFT_ENCODER   false
-#define INVERT_RIGHT_ENCODER  false
+#define INVERT_LEFT_ENCODER   true
+#define INVERT_RIGHT_ENCODER  true
 #define INVERT_LEFT_MOTOR     true
 #define INVERT_RIGHT_MOTOR    false
 

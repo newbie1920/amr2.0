@@ -30,6 +30,7 @@
 #include "battery_adc.h"
 #include "ina3221_power.h"
 #include "tasks.h"
+#include "encoder_driver.h"
 
 // ── External instances (from tasks.cpp) ─────────────────────
 extern Navigator navigator;
@@ -173,6 +174,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
         state.odom.distance = 0;
         state.motor.leftTicks = state.motor.rightTicks = 0;
         state.motor.lastTicksL = state.motor.lastTicksR = 0;
+        encoderLeftTicks = encoderRightTicks = 0;
         state.motor.targetLeftVel = state.motor.targetRightVel = 0;
         state.odom.gyroTheta = state.odom.encoderTheta = state.odom.fusedTheta = rt;
         state.tf.dx = state.tf.dy = state.tf.dTheta = 0;
@@ -318,6 +320,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
         state.odom.gyroTheta = state.odom.encoderTheta = state.odom.fusedTheta = state.odom.theta;
         state.odom.distance = 0;
         state.motor.leftTicks = state.motor.rightTicks = 0;
+        state.motor.lastTicksL = state.motor.lastTicksR = 0;
+        encoderLeftTicks = encoderRightTicks = 0;
         state.tf.dx = state.tf.dy = state.tf.dTheta = 0;
         applyTf();
         portEXIT_CRITICAL(&stateMux);
@@ -588,7 +592,7 @@ static void broadcast_full_telemetry() {
     telem["fTheta"] = state.odom.fusedTheta * 180.0f / PI;
 
     JsonObject enc = telem["enc"].to<JsonObject>();
-    enc["l"] = state.motor.leftTicks; enc["r"] = state.motor.rightTicks;
+    enc["l"] = encoderLeftTicks; enc["r"] = encoderRightTicks;
 
     telem["vL_t"] = state.motor.targetLeftVel; telem["vR_t"] = state.motor.targetRightVel;
     telem["vL_r"] = vL; telem["vR_r"] = vR;
@@ -727,4 +731,3 @@ void broadcast_telemetry() {
         }
     }
 }
-

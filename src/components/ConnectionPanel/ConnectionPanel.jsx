@@ -345,7 +345,7 @@ export default function ConnectionPanel() {
                         <div style={{ fontSize: '8px', color: '#64748b', marginTop: '3px' }}>
                           {currentNavMode === 'onboard'
                             ? 'Robot tự tìm đường — PC chỉ hiển thị telemetry'
-                            : 'Browser tính path A* + gửi waypoints cho ESP32'}
+                            : 'Browser tính path A* + gửi cmd_vel cho ESP32'}
                         </div>
                       </div>
                     );

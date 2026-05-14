@@ -68,6 +68,8 @@ const headerStyle = {
   flexShrink: 0,
 };
 
+const RVIZ_FRAME_MS = 1000 / 30;
+
 const titleStyle = {
   fontSize: '11px',
   fontWeight: 700,
@@ -122,6 +124,8 @@ export default function RVizPanel({ activePath }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const animFrameRef = useRef(null);
+  const lastRenderTimeRef = useRef(0);
+  const clearTrailTimeoutRef = useRef(null);
   const [canvasSize, setCanvasSize] = useState({ w: 400, h: 300 });
   const activeTool = useUIStore((s) => s.activeTool);
   const setActiveTool = useUIStore((s) => s.setActiveTool);
@@ -330,9 +334,14 @@ export default function RVizPanel({ activePath }) {
         .then((result) => {
           setIsNavLoading(false);
           if (result.success) {
-            // Onboard mode returns empty path (ESP32 manages it) — keep goal marker visible
             if (result.path && result.path.length > 0) {
+              const acceptedGoal = result.path[result.path.length - 1];
+              setGoalMarker({ x: acceptedGoal.x, y: acceptedGoal.y });
               setNavPath(result.path);
+            } else {
+              // Onboard mode returns no browser path. Clear any previous PC path
+              // so the view does not mix an old path with the new ESP32 goal.
+              setNavPath(null);
             }
           } else {
             console.warn(`[RVizTDTU] ❌ ${result.error}`);
@@ -410,11 +419,22 @@ export default function RVizPanel({ activePath }) {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const render = () => {
+    const render = (timestamp = 0) => {
+      if (timestamp - lastRenderTimeRef.current < RVIZ_FRAME_MS) {
+        animFrameRef.current = requestAnimationFrame(render);
+        return;
+      }
+      lastRenderTimeRef.current = timestamp;
+
       const { w, h } = canvasSize;
-      canvas.width = w * window.devicePixelRatio;
-      canvas.height = h * window.devicePixelRatio;
-      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const pixelW = Math.max(1, Math.floor(w * dpr));
+      const pixelH = Math.max(1, Math.floor(h * dpr));
+      if (canvas.width !== pixelW || canvas.height !== pixelH) {
+        canvas.width = pixelW;
+        canvas.height = pixelH;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       // Clear
       ctx.fillStyle = '#0c1219';
@@ -456,9 +476,12 @@ export default function RVizPanel({ activePath }) {
               robotTrailRef.current = robotTrailRef.current.slice(-MAX_TRAIL_POINTS);
             }
           }
-        } else if (!navSession?.active && robotTrailRef.current.length > 0) {
-          // Clear trail when nav session ends (keep for 3 seconds)
-          setTimeout(() => { robotTrailRef.current = []; }, 3000);
+        } else if (!navSession?.active && robotTrailRef.current.length > 0 && !clearTrailTimeoutRef.current) {
+          // Clear trail once after nav ends; avoid queuing a timeout every frame.
+          clearTrailTimeoutRef.current = setTimeout(() => {
+            robotTrailRef.current = [];
+            clearTrailTimeoutRef.current = null;
+          }, 3000);
         }
 
         // Robot trail (breadcrumb)
@@ -509,6 +532,10 @@ export default function RVizPanel({ activePath }) {
     animFrameRef.current = requestAnimationFrame(render);
     return () => {
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (clearTrailTimeoutRef.current) {
+        clearTimeout(clearTrailTimeoutRef.current);
+        clearTrailTimeoutRef.current = null;
+      }
     };
     // NOTE: simWorldSegments intentionally excluded when dataSource==='real'
     // to prevent sim engine tick updates from causing canvas flicker.

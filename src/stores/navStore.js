@@ -52,6 +52,9 @@ const APP_NAV = {
   maxAngularVel: 2.0,           // Max turning speed
   pursuitGain: 2.0,             // Angular gain for Pure Pursuit
   curveSlowdown: 0.4,           // Speed reduction factor when turning hard
+  pathDeviationTolerance: 0.55,  // If robot drifts farther from global path, replan from current pose
+  pathDeviationGraceMs: 900,
+  pathReplanCooldownMs: 1500,
   obstacleDwaThreshold: 8000,   // Only engage DWA if stuck for > 8s (ms)
 };
 
@@ -85,6 +88,40 @@ function buildAppNavOverlay(session) {
     nav_wp: session.currentWaypointIndex || 0,
     nav_total: session.path?.length || 0,
   };
+}
+
+function pointToSegmentDistance(px, py, ax, ay, bx, by) {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq <= 1e-9) {
+    return { distance: Math.hypot(px - ax, py - ay), t: 0 };
+  }
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return { distance: Math.hypot(px - cx, py - cy), t };
+}
+
+function measurePathDeviation(pose, path, startIndex = 0) {
+  if (!path || path.length === 0) {
+    return { distance: Infinity, segmentIndex: 0, t: 0 };
+  }
+  if (path.length === 1) {
+    return { distance: Math.hypot(pose.x - path[0].x, pose.y - path[0].y), segmentIndex: 0, t: 0 };
+  }
+
+  const firstSegment = Math.max(0, Math.min(startIndex, path.length - 2));
+  let best = { distance: Infinity, segmentIndex: firstSegment, t: 0 };
+  for (let i = firstSegment; i < path.length - 1; i++) {
+    const a = path[i];
+    const b = path[i + 1];
+    const hit = pointToSegmentDistance(pose.x, pose.y, a.x, a.y, b.x, b.y);
+    if (hit.distance < best.distance) {
+      best = { distance: hit.distance, segmentIndex: i, t: hit.t };
+    }
+  }
+  return best;
 }
 
 function setRobotArchitectureProfile(robot, profile) {
@@ -220,10 +257,16 @@ const useNavStore = create((set, get) => ({
   getNavMode: (robotId) => {
     const explicit = get().navModes[robotId];
     if (explicit) return explicit;
-    // Default: Always use PC nav (browser A* + Pure Pursuit)
-    // Browser holds the map → browser computes path → sends cmd_vel
-    // ESP32 onboard nav only when user explicitly switches via UI
-    return 'pc';
+    const robot = getRobotStore().robots[robotId];
+    if (robot?._sim) return 'pc';
+
+    const telemetry = robot?.telemetry || {};
+    if (telemetry.architecture === 'pc_slam' || telemetry.onboardNavEnabled === false) {
+      return 'pc';
+    }
+
+    // Real robots default to the firmware-reported onboard pipeline.
+    return 'onboard';
   },
 
   /**
@@ -456,6 +499,8 @@ const useNavStore = create((set, get) => ({
                 currentWaypointIndex: startIdx,
                 recoveryMode: null,
                 status: 'TRACK',
+                _offPathSince: null,
+                _lastReplanTime: Date.now(),
                 lastProgressTime: Date.now(),
                 lastProgressPose: { x: currentPose.x, y: currentPose.y },
               };
@@ -531,7 +576,7 @@ const useNavStore = create((set, get) => ({
           return buildAppNavOverlay(nextSession);
       }
       
-      const remainingPath = nextSession.path.slice(nextSession.currentWaypointIndex);
+      let remainingPath = nextSession.path.slice(nextSession.currentWaypointIndex);
       if (remainingPath.length === 0) {
         if (mux) mux.release(VEL_SOURCE.NAVIGATION);
         nextSession.status = 'TRACK';
@@ -548,7 +593,36 @@ const useNavStore = create((set, get) => ({
       let forwardBlocked = false;
       const currentSpeed = Math.abs(vel.v);
       const replanCooldownMs = 800; // Don't re-trigger replan within 800ms
-      const timeSinceLastReplan = now - (nextSession._lastForwardBlockTime || 0);
+      const timeSinceLastReplan = now - (nextSession._lastReplanTime || nextSession._lastForwardBlockTime || 0);
+
+      const deviation = measurePathDeviation(
+        pose,
+        nextSession.path,
+        Math.max(0, nextSession.currentWaypointIndex - 1),
+      );
+      if (deviation.distance <= APP_NAV.pathDeviationTolerance) {
+        nextSession._offPathSince = null;
+        const rejoinIdx = Math.min(nextSession.path.length - 1, deviation.segmentIndex + 1);
+        if (rejoinIdx > nextSession.currentWaypointIndex) {
+          nextSession.currentWaypointIndex = rejoinIdx;
+          remainingPath = nextSession.path.slice(nextSession.currentWaypointIndex);
+        }
+      } else if (distToGoal > APP_NAV.lookaheadDist) {
+        nextSession._offPathSince = nextSession._offPathSince || now;
+        const offPathFor = now - nextSession._offPathSince;
+        if (offPathFor >= APP_NAV.pathDeviationGraceMs && timeSinceLastReplan >= APP_NAV.pathReplanCooldownMs) {
+          if (mux) mux.send(VEL_SOURCE.NAVIGATION, 0, 0);
+          console.warn(`[AppNav] Off global path by ${deviation.distance.toFixed(2)}m for ${offPathFor}ms; replanning from current pose`);
+          nextSession.recoveryMode = 'REPLAN';
+          nextSession.status = 'RECOVERY_REPLAN';
+          nextSession.lastProgressTime = now;
+          nextSession._lastReplanTime = now;
+          set((s) => ({
+            appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
+          }));
+          return buildAppNavOverlay(nextSession);
+        }
+      }
       
       if (grid && grid.costmap && currentSpeed > 0.02 && timeSinceLastReplan > replanCooldownMs) {
         const scanSteps = 6;
@@ -582,7 +656,7 @@ const useNavStore = create((set, get) => ({
         nextSession.recoveryMode = 'REPLAN';
         nextSession.status = 'RECOVERY_REPLAN';
         nextSession.lastProgressTime = now;
-        nextSession._lastForwardBlockTime = now; // Cooldown timestamp
+        nextSession._lastReplanTime = now; // Cooldown timestamp
         set((s) => ({
           appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
         }));
@@ -650,7 +724,7 @@ const useNavStore = create((set, get) => ({
           nextSession.recoveryMode = 'REPLAN';
           nextSession.status = 'RECOVERY_REPLAN';
           nextSession.lastProgressTime = now;
-          nextSession._lastForwardBlockTime = now;
+          nextSession._lastReplanTime = now;
           set((s) => ({
             appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
           }));
@@ -793,18 +867,20 @@ const useNavStore = create((set, get) => ({
       const startX = telem.x ?? 0;
       const startY = telem.y ?? 0;
       const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
+      const enterPcBrowserMode = () => {
+        if (robot.adapter?.connected) {
+          robot.adapter.setDualMode('pc_browser');
+        } else if (robot.connection?.connected) {
+          robot.connection.setDualMode('pc_browser');
+        }
+      };
+      enterPcBrowserMode();
 
       // Helper: send direct path (fallback when A* fails or no grid)
       const sendDirectPath = (reason) => {
         console.log(`[NavStore] 📍 PC Nav fallback (${reason}): direct path to goal`);
         const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
-        get().startAppNavigation(robotId, path, finalHeading, true);
-        // Also send to ESP32 as waypoints
-        if (robot.adapter) {
-          robot.adapter.navigate(path, finalHeading);
-        } else if (robot.connection) {
-          robot.connection.navigate(path, finalHeading);
-        }
+        get().startAppNavigation(robotId, path, finalHeading, false);
         return { success: true, path };
       };
 
@@ -826,17 +902,8 @@ const useNavStore = create((set, get) => ({
         const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
         const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
         if (result.success && result.path.length > 1) {
-          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints. Offloading execution to ESP32.`);
-            
-          // Start UI tracking session but mark as offloaded
-          get().startAppNavigation(robotId, result.path, finalHeading, true);
-          
-          // Inject ext_waypoints to ESP32 via binary protocol
-          if (robot.adapter) {
-              robot.adapter.navigate(result.path, finalHeading);
-          } else if (robot.connection) {
-              robot.connection.navigate(result.path, finalHeading);
-          }
+          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints. Browser Pure Pursuit will send cmd_vel.`);
+          get().startAppNavigation(robotId, result.path, finalHeading, false);
 
           return { success: true, path: result.path };
         } else {
