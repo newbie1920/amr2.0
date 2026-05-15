@@ -17,6 +17,8 @@ import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react'
 import useRobotStore from '../../stores/robotStore.js';
 import useNavStore from '../../stores/navStore.js';
 import useMapStore from '../../stores/mapStore.js';
+import { resolveMapFramePose } from '../../core/poseFrames.js';
+import { buildDirectPath } from '../../core/navigationPathPolicy.js';
 import { useRVizViewport } from './useRVizViewport.js';
 import RVizToolbar from './RVizToolbar.jsx';
 import TopicInspector from './TopicInspector.jsx';
@@ -120,6 +122,24 @@ import useUIStore from '../../stores/uiStore.js';
 //   COMPONENT
 // ============================================================
 
+function pathFromCurrentPose(path, currentWaypointIndex, pose) {
+  if (!path || path.length < 2 || !pose) return path;
+  const startIdx = Math.max(0, Math.min(currentWaypointIndex ?? 0, path.length - 1));
+  const remaining = path.slice(startIdx);
+  if (remaining.length === 0) return [{ x: pose.x, y: pose.y }, path[path.length - 1]];
+
+  const first = remaining[0];
+  if (Math.hypot(first.x - pose.x, first.y - pose.y) <= 0.03) {
+    return remaining;
+  }
+  return [{ x: pose.x, y: pose.y }, ...remaining];
+}
+
+function headingDegFromRad(rad) {
+  if (!Number.isFinite(rad)) return null;
+  return ((rad * 180 / Math.PI) % 360 + 360) % 360;
+}
+
 export default function RVizPanel({ activePath }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
@@ -133,6 +153,7 @@ export default function RVizPanel({ activePath }) {
   const [cursorWorld, setCursorWorld] = useState({ x: 0, y: 0 });
   const [measurePoints, setMeasurePoints] = useState({ p1: null, p2: null });
   const [goalMarker, setGoalMarker] = useState(null); // {x, y} world coords
+  const [pendingGoalPose, setPendingGoalPose] = useState(null); // {x, y, headingRad}
   const [navPath, setNavPath] = useState(null); // planned path [{x,y}, ...]
   const [isNavLoading, setIsNavLoading] = useState(false); // pathfinding in progress
 
@@ -156,6 +177,9 @@ export default function RVizPanel({ activePath }) {
     if (activeTool !== 'measure') {
       setMeasurePoints({ p1: null, p2: null });
     }
+    if (activeTool !== 'goal') {
+      setPendingGoalPose(null);
+    }
   }, [activeTool]);
 
   // Store data
@@ -173,6 +197,8 @@ export default function RVizPanel({ activePath }) {
   const stopAppNavigation = useNavStore((s) => s.stopAppNavigation);
   const navStopRobot = useNavStore((s) => s.navStopRobot);
   const dwaTrajectories = useNavStore((s) => s.dwaTrajectories);
+  const obstacleAvoidanceEnabled = useNavStore((s) => s.obstacleAvoidanceEnabled);
+  const setObstacleAvoidanceEnabled = useNavStore((s) => s.setObstacleAvoidanceEnabled);
 
   // Robot trail tracking
   const robotTrailRef = useRef([]);
@@ -187,10 +213,13 @@ export default function RVizPanel({ activePath }) {
   const telem = activeRobot?.telemetry || {};
   const grid = activeRobotId ? occupancyGrid[activeRobotId] : null;
   const tf = activeRobotId ? (mapToOdom[activeRobotId] || { dx: 0, dy: 0, dTheta: 0 }) : { dx: 0, dy: 0, dTheta: 0 };
+  const robotPose = activeRobotId
+    ? resolveMapFramePose(activeRobot, { mapToOdom }, activeRobotId)
+    : null;
   const navSession = activeRobotId ? appNavigationSessions[activeRobotId] : null;
   const firstSimInfo = Object.values(simInfo)[0];
   const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
-  const hasCancelableGoal = !!goalMarker || !!navSession?.active || ['TRACK', 'F_TURN', 'RECOVERY_SPIN', 'RECOVERY_BACKUP', 'RECOVERY_REPLAN', 'PAUSED'].includes(telem.nav);
+  const hasCancelableGoal = !!pendingGoalPose || !!goalMarker || !!navSession?.active || ['TRACK', 'F_TURN', 'RECOVERY_SPIN', 'RECOVERY_BACKUP', 'RECOVERY_REPLAN', 'PAUSED'].includes(telem.nav);
 
   // Data source detection for mode badge
   const dataSource = activeRobot?._sim ? 'sim'
@@ -220,6 +249,65 @@ export default function RVizPanel({ activePath }) {
       startMapping(activeRobotId, getRobotStore);
     }
   }, [activeRobotId, isMapping, startMapping, stopMapping]);
+
+  const submitNavigationGoal = useCallback((goal) => {
+    if (!activeRobotId || !goal) return;
+
+    const finalHeadingDeg = headingDegFromRad(goal.headingRad);
+    setPendingGoalPose(null);
+    setGoalMarker({ x: goal.x, y: goal.y, headingRad: goal.headingRad });
+    setIsNavLoading(true);
+    console.log(`[RVizTDTU] Nav Goal: (${goal.x.toFixed(2)}, ${goal.y.toFixed(2)}), heading=${finalHeadingDeg?.toFixed(1) ?? 'auto'} deg`);
+
+    navigateToGoal(activeRobotId, goal.x, goal.y, finalHeadingDeg)
+      .then((result) => {
+        setIsNavLoading(false);
+        if (result.success) {
+          if (result.path && result.path.length > 0) {
+            const acceptedGoal = result.path[result.path.length - 1];
+            setGoalMarker({ x: acceptedGoal.x, y: acceptedGoal.y, headingRad: goal.headingRad });
+            setNavPath(result.path);
+          } else {
+            setNavPath(null);
+          }
+        } else {
+          console.warn(`[RVizTDTU] ${result.error}`);
+          setGoalMarker(null);
+          setNavPath(null);
+        }
+      })
+      .catch((err) => {
+        setIsNavLoading(false);
+        console.error('[RVizTDTU] Nav error:', err);
+        setGoalMarker(null);
+        setNavPath(null);
+      });
+
+    setActiveTool('move');
+  }, [activeRobotId, navigateToGoal, setActiveTool]);
+
+  const cancelPendingGoal = useCallback(() => {
+    setPendingGoalPose(null);
+    setGoalMarker(null);
+    setNavPath(null);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingGoalPose) return undefined;
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitNavigationGoal(pendingGoalPose);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        cancelPendingGoal();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [pendingGoalPose, submitNavigationGoal, cancelPendingGoal]);
 
   // Viewport
   const viewport = useRVizViewport(canvasSize.w, canvasSize.h);
@@ -293,10 +381,10 @@ export default function RVizPanel({ activePath }) {
   // ── Follow Robot ──────────────────────────────────────────
 
   useEffect(() => {
-    if (followRobot && telem.x !== undefined) {
-      viewport.followRobot(telem.x, telem.y);
+    if (followRobot && robotPose) {
+      viewport.followRobot(robotPose.x, robotPose.y);
     }
-  }, [followRobot, telem.x, telem.y]);
+  }, [followRobot, robotPose?.x, robotPose?.y]);
 
   // ── Canvas Mouse Handlers ─────────────────────────────────
 
@@ -304,13 +392,22 @@ export default function RVizPanel({ activePath }) {
     const rect = e.currentTarget.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
-    setCursorWorld(viewport.screenToWorld(sx, sy));
+    const world = viewport.screenToWorld(sx, sy);
+    setCursorWorld(world);
+
+    if (pendingGoalPose) {
+      const dx = world.x - pendingGoalPose.x;
+      const dy = world.y - pendingGoalPose.y;
+      if (Math.hypot(dx, dy) > 0.03) {
+        setPendingGoalPose(prev => prev ? { ...prev, headingRad: Math.atan2(dy, dx) } : prev);
+      }
+    }
 
     // Pan in move tool; rotate with right mouse drag from any tool.
-    if (activeTool === 'move' || (e.buttons & 2)) {
+    if (!pendingGoalPose && (activeTool === 'move' || (e.buttons & 2))) {
       viewport.handlers.onMouseMove(e);
     }
-  }, [viewport, activeTool]);
+  }, [viewport, activeTool, pendingGoalPose]);
 
   const handleCanvasClick = useCallback((e) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -324,40 +421,13 @@ export default function RVizPanel({ activePath }) {
         return;
       }
 
-      // Set goal marker immediately for visual feedback
-      setGoalMarker({ x: world.x, y: world.y });
-      setIsNavLoading(true);
-      console.log(`[RVizTDTU] 🎯 Nav Goal: (${world.x.toFixed(2)}, ${world.y.toFixed(2)})`);
-
-      // Delegate pathfinding + navigation to navStore (Point-to-Go)
-      navigateToGoal(activeRobotId, world.x, world.y)
-        .then((result) => {
-          setIsNavLoading(false);
-          if (result.success) {
-            if (result.path && result.path.length > 0) {
-              const acceptedGoal = result.path[result.path.length - 1];
-              setGoalMarker({ x: acceptedGoal.x, y: acceptedGoal.y });
-              setNavPath(result.path);
-            } else {
-              // Onboard mode returns no browser path. Clear any previous PC path
-              // so the view does not mix an old path with the new ESP32 goal.
-              setNavPath(null);
-            }
-          } else {
-            console.warn(`[RVizTDTU] ❌ ${result.error}`);
-            setGoalMarker(null);
-            setNavPath(null);
-          }
-        })
-        .catch((err) => {
-          setIsNavLoading(false);
-          console.error('[RVizTDTU] Nav error:', err);
-          setGoalMarker(null);
-          setNavPath(null);
-        });
-
-      // Auto-revert to move tool after placing goal
-      setActiveTool('move');
+      const headingRad = robotPose
+        ? Math.atan2(world.y - robotPose.y, world.x - robotPose.x)
+        : 0;
+      setPendingGoalPose({ x: world.x, y: world.y, headingRad });
+      setGoalMarker(null);
+      setNavPath(null);
+      console.log(`[RVizTDTU] Pending Nav Goal: (${world.x.toFixed(2)}, ${world.y.toFixed(2)})`);
     } else if (activeTool === 'pose') {
       if (activeRobotId) {
         const robot = robots[activeRobotId];
@@ -376,7 +446,7 @@ export default function RVizPanel({ activePath }) {
         setMeasurePoints({ p1: world, p2: null });
       }
     }
-  }, [activeTool, measurePoints, viewport, activeRobotId, telem, robots, navigateToGoal]);
+  }, [activeTool, measurePoints, viewport, activeRobotId, telem, robots, robotPose]);
 
   const handleClearGoal = useCallback(() => {
     if (activeRobotId) {
@@ -385,30 +455,42 @@ export default function RVizPanel({ activePath }) {
         stopAppNavigation(activeRobotId, 'CANCELED', true);
       }
     }
+    setPendingGoalPose(null);
     setGoalMarker(null);
     setNavPath(null);
   }, [activeRobotId, navSession, navStopRobot, stopAppNavigation]);
 
   const handleCanvasMouseDown = useCallback((e) => {
+    if (pendingGoalPose && e.button === 2) {
+      e.preventDefault();
+      return;
+    }
     if (activeTool === 'move' || e.button === 2) {
       viewport.handlers.onMouseDown(e);
     }
-  }, [activeTool, viewport]);
+  }, [activeTool, viewport, pendingGoalPose]);
 
   const handleCanvasMouseUp = useCallback((e) => {
+    if (pendingGoalPose && e.button === 2) {
+      e.preventDefault();
+      return;
+    }
     if (activeTool === 'move' || e.button === 2) {
       viewport.handlers.onMouseUp(e);
     }
-  }, [activeTool, viewport]);
+  }, [activeTool, viewport, pendingGoalPose]);
 
   const handleCanvasMouseLeave = useCallback((e) => {
     viewport.handlers.onMouseLeave(e);
   }, [viewport]);
 
-  // Keep browser context menu out of the RViz canvas so right-drag can rotate.
+  // Keep browser context menu out of the RViz canvas; right-click confirms pending goal pose.
   const handleContextMenu = useCallback((e) => {
     e.preventDefault();
-  }, []);
+    if (pendingGoalPose) {
+      submitNavigationGoal(pendingGoalPose);
+    }
+  }, [pendingGoalPose, submitNavigationGoal]);
 
   // ── Render Loop ───────────────────────────────────────────
 
@@ -459,19 +541,24 @@ export default function RVizPanel({ activePath }) {
       if (layers.frontier && grid && grid.frontierCells) drawFrontiers(ctx, w, h, vp, grid.frontierCells, grid);
 
       // Navigation path (from click-to-navigate or active nav session)
-      const displayPath = navSession?.path || navPath || activePath;
+      const displayPath = navSession?.active
+        ? pathFromCurrentPose(navSession.path, navSession.currentWaypointIndex, robotPose)
+        : (navSession?.path || navPath || activePath);
 
       // Robot-specific layers
-      if (telem.x !== undefined) {
-        const headingRad = Number.isFinite(telem.headingRad)
+      if (robotPose) {
+        const poseX = robotPose.x;
+        const poseY = robotPose.y;
+        const headingRad = robotPose.theta;
+        const odomHeadingRad = Number.isFinite(telem.headingRad)
           ? telem.headingRad
           : (telem.heading ?? 0) * Math.PI / 180;
 
         // Trail tracking — record robot position
         if (navSession?.active && layers.trail) {
           const lastPt = robotTrailRef.current[robotTrailRef.current.length - 1];
-          if (!lastPt || Math.hypot(telem.x - lastPt.x, telem.y - lastPt.y) > 0.03) {
-            robotTrailRef.current.push({ x: telem.x, y: telem.y });
+          if (!lastPt || Math.hypot(poseX - lastPt.x, poseY - lastPt.y) > 0.03) {
+            robotTrailRef.current.push({ x: poseX, y: poseY });
             if (robotTrailRef.current.length > MAX_TRAIL_POINTS) {
               robotTrailRef.current = robotTrailRef.current.slice(-MAX_TRAIL_POINTS);
             }
@@ -488,31 +575,37 @@ export default function RVizPanel({ activePath }) {
         if (layers.trail) drawRobotTrail(ctx, vp, robotTrailRef.current);
 
         // Local costmap window
-        if (layers.localCostmap && navSession?.active) drawLocalCostmapWindow(ctx, vp, telem.x, telem.y);
+        if (layers.localCostmap && navSession?.active) drawLocalCostmapWindow(ctx, vp, poseX, poseY);
 
         // Animated path (replaces basic drawPath when navigating)
         if (layers.path && displayPath && navSession?.active) {
-          drawAnimatedPath(ctx, w, h, vp, displayPath, telem.x, telem.y);
+          drawAnimatedPath(ctx, w, h, vp, displayPath, poseX, poseY);
         } else if (layers.path && displayPath) {
           drawPath(ctx, w, h, vp, displayPath);
+        }
+        if (layers.path && pendingGoalPose) {
+          const pendingRoute = buildDirectPath({ x: poseX, y: poseY }, pendingGoalPose);
+          if (pendingRoute.length > 1) drawPath(ctx, w, h, vp, pendingRoute);
         }
 
         // DWA trajectory preview
         const dwaTrajectory = activeRobotId ? dwaTrajectories[activeRobotId] : null;
         if (layers.dwaPreview && dwaTrajectory) drawDWATrajectory(ctx, vp, dwaTrajectory);
 
-        if (layers.laser) drawLaserScan(ctx, w, h, vp, telem.x, telem.y, headingRad, telem.lidar);
-        if (layers.footprint) drawRobotFootprint(ctx, vp, telem.x, telem.y);
+        if (layers.laser) drawLaserScan(ctx, w, h, vp, poseX, poseY, headingRad, telem.lidar);
+        if (layers.footprint) drawRobotFootprint(ctx, vp, poseX, poseY);
         if (layers.robot) {
           const odomTheta = telem.odomTheta !== undefined ? telem.odomTheta : null;
-          drawRobotPose(ctx, w, h, vp, telem.x, telem.y, headingRad, 0.12, telem.linearVel || 0, odomTheta);
+          drawRobotPose(ctx, w, h, vp, poseX, poseY, headingRad, 0.12, telem.linearVel || 0, odomTheta);
         }
-        if (layers.tf) drawTFFrames(ctx, w, h, vp, { x: telem.x, y: telem.y, theta: headingRad }, tf);
+        if (layers.tf) drawTFFrames(ctx, w, h, vp, { x: telem.x, y: telem.y, theta: odomHeadingRad }, tf);
       }
 
-      // Goal marker — show enhanced version during active nav, simple marker otherwise
-      if (goalMarker && navSession?.active && telem.x !== undefined) {
-        drawGoalPoseArrow(ctx, vp, goalMarker, telem.x, telem.y);
+      // Goal marker — pending pose uses selected heading, active nav keeps final heading.
+      if (pendingGoalPose && robotPose) {
+        drawGoalPoseArrow(ctx, vp, pendingGoalPose, robotPose.x, robotPose.y, pendingGoalPose.headingRad);
+      } else if (goalMarker && navSession?.active && robotPose) {
+        drawGoalPoseArrow(ctx, vp, goalMarker, robotPose.x, robotPose.y, goalMarker.headingRad);
       } else if (goalMarker) {
         // Also show for Onboard mode where there's no browser navSession
         drawGoalMarker(ctx, vp, goalMarker);
@@ -542,7 +635,8 @@ export default function RVizPanel({ activePath }) {
     // When dataSource changes, the effect re-runs via dataSource dep.
   }, [canvasSize, viewport, layers, grid, telem, activePath,
     dataSource === 'real' ? null : simWorldSegments,
-    tf, measurePoints, cursorWorld, goalMarker, navPath, navSession, dwaTrajectories, activeRobotId, dataSource]);
+    tf, measurePoints, cursorWorld, pendingGoalPose, goalMarker, navPath, navSession, dwaTrajectories,
+    activeRobotId, dataSource, robotPose?.x, robotPose?.y, robotPose?.theta]);
 
   // ── JSX ───────────────────────────────────────────────────
 
@@ -589,6 +683,19 @@ export default function RVizPanel({ activePath }) {
             Costmap
           </button>
           <button
+            style={{
+              ...headerBtnStyle(obstacleAvoidanceEnabled),
+              color: obstacleAvoidanceEnabled ? '#22c55e' : '#64748b',
+              borderColor: obstacleAvoidanceEnabled ? 'rgba(34, 197, 94, 0.45)' : 'rgba(255,255,255,0.08)',
+              background: obstacleAvoidanceEnabled ? 'rgba(34, 197, 94, 0.14)' : 'transparent',
+              minWidth: '58px',
+            }}
+            onClick={() => setObstacleAvoidanceEnabled(!obstacleAvoidanceEnabled)}
+            title={obstacleAvoidanceEnabled ? 'Né vật cản: ON' : 'Né vật cản: OFF'}
+          >
+            Né VC
+          </button>
+          <button
             style={headerBtnStyle(followRobot)}
             onClick={() => setFollowRobot(!followRobot)}
             title="Follow Robot"
@@ -604,7 +711,7 @@ export default function RVizPanel({ activePath }) {
           </button>
           <button
             style={headerBtnStyle(false)}
-            onClick={() => viewport.centerOn(telem.x ?? 5, telem.y ?? 5)}
+            onClick={() => viewport.centerOn(robotPose?.x ?? 5, robotPose?.y ?? 5)}
             title="Center on Robot"
           >
             ⊕ Center
@@ -624,7 +731,7 @@ export default function RVizPanel({ activePath }) {
           dataSource={dataSource}
         />
         <div ref={containerRef} style={canvasStyle}>
-          {activeTool === 'goal' && (
+          {activeTool === 'goal' && !pendingGoalPose && (
             <div style={{
               position: 'absolute',
               top: '16px',
@@ -641,6 +748,38 @@ export default function RVizPanel({ activePath }) {
               border: '1px solid rgba(255,255,255,0.2)'
             }}>
               👆 Hãy nhấp chuột vào vị trí trên bản đồ để Robot di chuyển tới
+            </div>
+          )}
+          {pendingGoalPose && (
+            <div style={{
+              position: 'absolute',
+              top: '16px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              background: 'rgba(15, 23, 42, 0.94)',
+              color: '#fff',
+              padding: '8px 12px',
+              borderRadius: '8px',
+              fontWeight: 700,
+              boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+              zIndex: 11,
+              border: '1px solid rgba(168, 85, 247, 0.45)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+            }}>
+              <span>Auto waypoints</span>
+              <span>Heading {headingDegFromRad(pendingGoalPose.headingRad)?.toFixed(0)} deg</span>
+              <span style={{ color: '#c4b5fd', fontSize: '10px', fontWeight: 600 }}>
+                move mouse to rotate, Enter / right-click to go
+              </span>
+              <button
+                style={{ ...headerBtnStyle(false), color: '#cbd5e1', marginLeft: 0 }}
+                onClick={cancelPendingGoal}
+                title="Cancel goal pose"
+              >
+                Cancel
+              </button>
             </div>
           )}
           {isNavLoading && (
@@ -688,7 +827,7 @@ export default function RVizPanel({ activePath }) {
         <span>Rot: {(viewport.rotation * 180 / Math.PI).toFixed(0)} deg</span>
         {activeRobot && (
           <span style={{ color: '#10b981' }}>
-            Robot: {activeRobot.name} ({telem.x?.toFixed(2)}, {telem.y?.toFixed(2)})
+            Robot: {activeRobot.name} ({robotPose?.x?.toFixed(2)}, {robotPose?.y?.toFixed(2)})
           </span>
         )}
         {grid && (
@@ -702,7 +841,12 @@ export default function RVizPanel({ activePath }) {
             🧭 {navSession.status} WP:{navSession.currentWaypointIndex}/{navSession.path?.length}
           </span>
         )}
-        {goalMarker && !navSession?.active && (
+        {pendingGoalPose && (
+          <span style={{ color: '#c084fc' }}>
+            Goal: ({pendingGoalPose.x.toFixed(2)}, {pendingGoalPose.y.toFixed(2)}) H:{headingDegFromRad(pendingGoalPose.headingRad)?.toFixed(0)} deg
+          </span>
+        )}
+        {goalMarker && !navSession?.active && !pendingGoalPose && (
           <span style={{ color: '#3b82f6' }}>
             🎯 Goal: ({goalMarker.x.toFixed(2)}, {goalMarker.y.toFixed(2)})
           </span>

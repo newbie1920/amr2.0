@@ -1123,16 +1123,22 @@ export function drawAnimatedPath(ctx, w, h, viewport, path, robotX, robotY) {
 //   GOAL POSE ARROW (Nav2-style large arrow at goal)
 // ============================================================
 
-export function drawGoalPoseArrow(ctx, viewport, goal, robotX, robotY) {
+export function drawGoalPoseArrow(ctx, viewport, goal, robotX, robotY, headingRad = null) {
   if (!goal) return;
 
   const { worldToScreen, scale } = viewport;
   const s = worldToScreen(goal.x, goal.y);
   const t = Date.now() / 1000;
 
-  // Compute heading from robot to goal for the arrow direction
-  const heading = Math.atan2(goal.y - robotY, goal.x - robotX);
-  const screenAngle = -heading; // Flip Y for screen
+  // Compute heading from the selected goal pose, falling back to robot->goal.
+  const heading = Number.isFinite(headingRad)
+    ? headingRad
+    : Math.atan2(goal.y - robotY, goal.x - robotX);
+  const headingTip = worldToScreen(
+    goal.x + Math.cos(heading) * 0.5,
+    goal.y + Math.sin(heading) * 0.5
+  );
+  const screenAngle = Math.atan2(headingTip.y - s.y, headingTip.x - s.x);
 
   // Animated pulse ring
   const pulseR = 14 + 5 * Math.sin(t * 2.5);

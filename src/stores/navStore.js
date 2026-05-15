@@ -17,6 +17,8 @@ import { normalizeAngle } from '../core/mathUtils.js';
 import { navWorkerApi } from '../core/navWorkerSetup.js';
 import { injectTrafficIntoGridData } from '../core/trafficManager.js';
 import { registerStore, getRobotStoreState, getMapStoreState, getDWAStoreState } from './storeRegistry.js';
+import { resolveMapFramePose } from '../core/poseFrames.js';
+import { buildDirectPath, isDirectPathClear } from '../core/navigationPathPolicy.js';
 
 // NOTE: useRobotStore is NOT imported at top-level to avoid circular dependency.
 // robotStore imports navStore, so navStore cannot import robotStore at evaluation time.
@@ -57,6 +59,17 @@ const APP_NAV = {
   pathReplanCooldownMs: 1500,
   obstacleDwaThreshold: 8000,   // Only engage DWA if stuck for > 8s (ms)
 };
+
+const OBSTACLE_AVOIDANCE_KEY = 'amr_obstacle_avoidance_enabled';
+
+function loadObstacleAvoidanceEnabled() {
+  try {
+    const raw = localStorage.getItem(OBSTACLE_AVOIDANCE_KEY);
+    return raw == null ? true : raw !== 'false';
+  } catch {
+    return true;
+  }
+}
 
 // ============================================================
 //   HELPERS
@@ -218,10 +231,21 @@ const useNavStore = create((set, get) => ({
   dwaTrajectories: {},       // { robotId: [{x,y},...] } — DWA chosen trajectory for viz
   robotTrails: {},           // { robotId: [{x,y},...] } — breadcrumb trail history
   navModes: {},              // { robotId: 'onboard' | 'pc' } — explicit nav mode per robot
+  obstacleAvoidanceEnabled: loadObstacleAvoidanceEnabled(),
 
   // ============================================================
   //   ACTIONS
   // ============================================================
+
+  setObstacleAvoidanceEnabled: (enabled) => {
+    const next = !!enabled;
+    try {
+      localStorage.setItem(OBSTACLE_AVOIDANCE_KEY, String(next));
+    } catch {
+      // localStorage can be unavailable in tests or privacy-restricted contexts.
+    }
+    set({ obstacleAvoidanceEnabled: next });
+  },
 
   /**
    * Set navigation mode for a robot: 'onboard' (ESP32 finds path) or 'pc' (browser A* + DWA)
@@ -350,16 +374,14 @@ const useNavStore = create((set, get) => ({
     const state = get();
     const session = state.appNavigationSessions[id];
     if (!session?.active) return null;
+    const obstacleAvoidanceEnabled = state.obstacleAvoidanceEnabled !== false;
 
     const robotState = getRobotStore();
     const mapState = getMapStore();
+    const robot = robotState.robots[id];
     const mux = robotState.velocityMuxes[id];
     const grid = mapState.mapperInstances[id] || mapState.occupancyGrid[id];
-    const pose = {
-      x: telem.x ?? 0,
-      y: telem.y ?? 0,
-      theta: ((telem.heading ?? 0) * Math.PI) / 180.0,
-    };
+    const pose = resolveMapFramePose({ ...robot, telemetry: telem }, mapState, id);
     const vel = {
       v: telem.linearVel ?? 0,
       w: telem.angularVel ?? 0,
@@ -624,7 +646,7 @@ const useNavStore = create((set, get) => ({
         }
       }
       
-      if (grid && grid.costmap && currentSpeed > 0.02 && timeSinceLastReplan > replanCooldownMs) {
+      if (obstacleAvoidanceEnabled && grid && grid.costmap && currentSpeed > 0.02 && timeSinceLastReplan > replanCooldownMs) {
         const scanSteps = 6;
         // Dynamic braking distance based on current speed
         const scanDist = Math.max(0.20, Math.min(0.40, currentSpeed * 1.2 + 0.10));
@@ -684,7 +706,7 @@ const useNavStore = create((set, get) => ({
       // ── LOOKAHEAD PATH COLLISION CHECK ──
       // Scan the upcoming path (up to 2.5 meters ahead) to see if SLAM has newly discovered an obstacle.
       // We sample along the path segments to catch obstacles intersecting long straight lines.
-      if (grid && grid.costmap && timeSinceLastReplan > replanCooldownMs) {
+      if (obstacleAvoidanceEnabled && grid && grid.costmap && timeSinceLastReplan > replanCooldownMs) {
         let pathDistChecked = 0;
         let lastX = pose.x;
         let lastY = pose.y;
@@ -863,9 +885,6 @@ const useNavStore = create((set, get) => ({
     if (navMode === 'pc') {
       // PC Navigation: Browser computes A* path + Pure Pursuit local planner
       console.log(`[NavStore] 🖥️ PC Nav mode: browser A* + Pure Pursuit`);
-      const telem = robot.telemetry || {};
-      const startX = telem.x ?? 0;
-      const startY = telem.y ?? 0;
       const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
       const enterPcBrowserMode = () => {
         if (robot.adapter?.connected) {
@@ -875,14 +894,21 @@ const useNavStore = create((set, get) => ({
         }
       };
       enterPcBrowserMode();
+      const startPose = resolveMapFramePose(robot, mapState, robotId);
+      const startX = startPose.x;
+      const startY = startPose.y;
 
       // Helper: send direct path (fallback when A* fails or no grid)
       const sendDirectPath = (reason) => {
         console.log(`[NavStore] 📍 PC Nav fallback (${reason}): direct path to goal`);
-        const path = [{ x: startX, y: startY }, { x: goalX, y: goalY }];
+        const path = buildDirectPath(startPose, { x: goalX, y: goalY });
         get().startAppNavigation(robotId, path, finalHeading, false);
         return { success: true, path };
       };
+
+      if (get().obstacleAvoidanceEnabled === false) {
+        return sendDirectPath('obstacle avoidance disabled');
+      }
 
       if (!grid) {
         return sendDirectPath('no grid available');
@@ -890,6 +916,10 @@ const useNavStore = create((set, get) => ({
 
       if (!navWorkerApi) {
         return sendDirectPath('NavWorker not available');
+      }
+
+      if (isDirectPathClear(grid, startPose, { x: goalX, y: goalY })) {
+        return sendDirectPath('clear line-of-sight');
       }
 
       try {
