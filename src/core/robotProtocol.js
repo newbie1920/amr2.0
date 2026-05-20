@@ -65,6 +65,8 @@ export class RobotConnection {
       nav: 'IDLE',           // Navigator state (IDLE/TURN/DRIVE/REV/F_TURN/DONE/ERROR)
       navWp: 0,              // Current waypoint index
       navTotal: 0,           // Total waypoints
+      navRecovering: false,
+      navRecoveryAttempts: 0,
       // INA3221 Power Monitor
       battV: 0,              // Điện áp pin (V)
       battA: 0,              // Dòng pin (A)
@@ -75,7 +77,12 @@ export class RobotConnection {
       gridStreamEnabled: true,
       onboardNavEnabled: true,
       slam: { score: 0, tfNorm: 0, tfDeg: 0, coverage: 0 },
+      traj: null,
+      track: null,
+      pid: null,
       path: [],              // ESP32 generated onboard A* path
+      pathDebug: null,       // One-shot onboard planner debug payload
+      planner: null,
     };
 
     // Callbacks
@@ -282,6 +289,7 @@ export class RobotConnection {
    * Phân tán: Gửi tọa độ đích để ESP32 tự tìm đường (A*)
    */
   goto(x, y, finalHeading = null) {
+    this._send({ type: 'config', planner: { debugPath: false } });
     const msg = { cmd: 'goto', x, y };
     if (finalHeading !== null && finalHeading !== undefined) {
       msg.finalHeading = finalHeading;
@@ -423,7 +431,7 @@ export class RobotConnection {
   setDualMode(mode) {
     // Sync local architectureProfile so mapStore detects the correct pipeline
     if (mode === 'pc_browser') {
-      this.architectureProfile = 'pc_slam';
+      this.architectureProfile = 'debug_browser';
     } else {
       this.architectureProfile = 'hybrid';
     }
@@ -508,8 +516,24 @@ export class RobotConnection {
 
       // NAV_ACK
       if (data.type === 'nav_ack') {
-        console.log(`[Robot ${this.name}] NAV_ACK: ${data.wp_count} waypoints, finalH=${data.finalH}°`);
+        console.log(`[Robot ${this.name}] NAV_ACK: accepted=${data.accepted !== false}, wp=${data.wp_count ?? 0}, mode=${data.mode ?? 'unknown'}`);
         if (this.onNavAck) this.onNavAck(data);
+        return;
+      }
+
+      if (data.type === 'goto_ack') {
+        console.log(`[Robot ${this.name}] GOTO_ACK: accepted=${data.accepted}, reason=${data.reason}, goal=(${data.x}, ${data.y})`);
+        if (this.onNavAck) this.onNavAck(data);
+        return;
+      }
+
+      if (data.type === 'config_ack') {
+        console.log(`[Robot ${this.name}] CONFIG_ACK: scope=${data.scope ?? 'unknown'}, accepted=${data.accepted !== false}`);
+        return;
+      }
+
+      if (data.type === 'nav_path') {
+        this._handleNavPathMessage(data);
         return;
       }
 
@@ -522,7 +546,7 @@ export class RobotConnection {
 
       // MODE_ACK — ESP32 confirmed dual-mode switch
       if (data.type === 'mode_ack') {
-        const profile = data.mode === 'pc_browser' ? 'pc_slam' : 'hybrid';
+        const profile = (data.mode === 'pc_browser' || data.mode === 'debug_browser') ? 'debug_browser' : 'hybrid';
         this.architectureProfile = profile;
         console.log(`[Robot ${this.name}] MODE_ACK: ${data.mode} → architectureProfile=${profile}`);
         return;
@@ -553,12 +577,28 @@ export class RobotConnection {
 
       // NAV_ACK — ESP32 đã nhận path thành công
       if (data.type === 'nav_ack') {
-        console.log(`[Robot ${this.name}] NAV_ACK: ${data.wp_count} waypoints, finalH=${data.finalH}°`);
+        console.log(`[Robot ${this.name}] NAV_ACK: accepted=${data.accepted !== false}, wp=${data.wp_count ?? 0}, mode=${data.mode ?? 'unknown'}`);
         if (this.onNavAck) this.onNavAck(data);
         return;
       }
 
+      if (data.type === 'goto_ack') {
+        console.log(`[Robot ${this.name}] GOTO_ACK: accepted=${data.accepted}, reason=${data.reason}, goal=(${data.x}, ${data.y})`);
+        if (this.onNavAck) this.onNavAck(data);
+        return;
+      }
+
+      if (data.type === 'config_ack') {
+        console.log(`[Robot ${this.name}] CONFIG_ACK: scope=${data.scope ?? 'unknown'}, accepted=${data.accepted !== false}`);
+        return;
+      }
+
       // MAP_ACK — ESP32 confirmed static map received
+      if (data.type === 'nav_path') {
+        this._handleNavPathMessage(data);
+        return;
+      }
+
       if (data.type === 'map_ack') {
         console.log(`[Robot ${this.name}] MAP_ACK: ${data.w}x${data.h}, ${data.bytes} bytes`);
         if (this.onMapAck) this.onMapAck(data);
@@ -567,7 +607,7 @@ export class RobotConnection {
 
       // MODE_ACK — ESP32 confirmed dual-mode switch
       if (data.type === 'mode_ack') {
-        const profile = data.mode === 'pc_browser' ? 'pc_slam' : 'hybrid';
+        const profile = (data.mode === 'pc_browser' || data.mode === 'debug_browser') ? 'debug_browser' : 'hybrid';
         this.architectureProfile = profile;
         console.log(`[Robot ${this.name}] MODE_ACK: ${data.mode} → architectureProfile=${profile}`);
         return;
@@ -634,6 +674,77 @@ export class RobotConnection {
 
     this.lastPong = Date.now();
     this.missedPongs = 0;
+  }
+
+  _normalizePlanPoints(points) {
+    if (!Array.isArray(points)) return [];
+
+    return points
+      .map((pt) => {
+        if (Array.isArray(pt)) {
+          return { x: Number(pt[0]), y: Number(pt[1]) };
+        }
+        if (pt && typeof pt === 'object') {
+          return { x: Number(pt.x), y: Number(pt.y) };
+        }
+        return null;
+      })
+      .filter((pt) => pt && Number.isFinite(pt.x) && Number.isFinite(pt.y));
+  }
+
+  _normalizeGoalPoint(goal) {
+    if (Array.isArray(goal)) {
+      const x = Number(goal[0]);
+      const y = Number(goal[1]);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    }
+    if (goal && typeof goal === 'object') {
+      const x = Number(goal.x);
+      const y = Number(goal.y);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    }
+    return null;
+  }
+
+  _handleNavPathMessage(data) {
+    const waypoints = this._normalizePlanPoints(data.waypoints);
+    const raw = this._normalizePlanPoints(data.raw);
+    const goal = this._normalizeGoalPoint(data.goal);
+    const pathDebug = {
+      type: 'nav_path',
+      planner: data.planner ?? 'astar',
+      ok: data.ok !== false,
+      reason: data.reason ?? '',
+      planId: data.planId ?? null,
+      waypoints,
+      raw,
+      rawTotal: Number(data.rawTotal ?? raw.length),
+      rawStride: Number(data.rawStride ?? 1),
+      rawCount: Number(data.rawCount ?? raw.length),
+      debugPath: data.debugPath !== false,
+      goal,
+      ts: Date.now(),
+    };
+
+    this.telemetry = {
+      ...this.telemetry,
+      planner: {
+        ...(this.telemetry.planner || {}),
+        mode: pathDebug.planner,
+        debugPath: pathDebug.debugPath,
+      },
+      path: waypoints,
+      pathDebug,
+    };
+
+    console.log(
+      `[Robot ${this.name}] NAV_PATH: ${pathDebug.planner} ${pathDebug.ok ? 'ok' : 'fail'} ` +
+      `wp=${waypoints.length} raw=${pathDebug.rawCount}/${pathDebug.rawTotal} reason=${pathDebug.reason}`
+    );
+
+    if (this.onTelemetry) {
+      this.onTelemetry(this.telemetry);
+    }
   }
 
   /**
@@ -734,6 +845,8 @@ export class RobotConnection {
       nav: data.nav ?? this.telemetry.nav,
       navWp: data.nav_wp ?? this.telemetry.navWp,
       navTotal: data.nav_total ?? this.telemetry.navTotal,
+      navRecovering: data.nav_recovering ?? this.telemetry.navRecovering,
+      navRecoveryAttempts: data.nav_rec ?? this.telemetry.navRecoveryAttempts,
       architecture: data.arch ?? this.telemetry.architecture,
       gridStreamEnabled: data.grid_stream ?? this.telemetry.gridStreamEnabled,
       onboardNavEnabled: data.onboard_nav ?? this.telemetry.onboardNavEnabled,
@@ -749,6 +862,14 @@ export class RobotConnection {
       // HITL mode
       hitl: data.hitl ?? this.telemetry.hitl,
       slam: data.slam ?? this.telemetry.slam,
+      traj: data.traj ?? this.telemetry.traj,
+      planner: data.planner ?? this.telemetry.planner,
+      track: data.track ?? this.telemetry.track ?? {
+        eX: data.eX ?? 0,
+        eY: data.eY ?? 0,
+        eYaw: data.eYaw ?? 0,
+      },
+      pid: data.pid ?? this.telemetry.pid,
       // SLAM map-frame pose (from ESP32 ICP correction)
       // These are the corrected positions used by firmware for grid mapping
       slamMapX: data.slam?.mX ?? this.telemetry.slamMapX,
@@ -759,6 +880,7 @@ export class RobotConnection {
       explore_goals: data.explore_goals ?? this.telemetry.explore_goals,
       explore_frontiers: data.explore_frontiers ?? this.telemetry.explore_frontiers,
       path: data.path ?? this.telemetry.path,
+      pathDebug: data.pathDebug ?? this.telemetry.pathDebug,
     };
 
     if (this.hitlEnabled) {

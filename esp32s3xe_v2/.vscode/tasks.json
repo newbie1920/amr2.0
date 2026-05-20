@@ -1,29 +1,4 @@
 {
     "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "🔄 Reset WiFi (ESP32)",
-            "type": "shell",
-            "command": "powershell",
-            "args": ["-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/serial_cmd.ps1", "-Command", "reset_wifi"],
-            "problemMatcher": [],
-            "presentation": { "reveal": "always", "panel": "shared" }
-        },
-        {
-            "label": "🔌 Reboot ESP32",
-            "type": "shell",
-            "command": "powershell",
-            "args": ["-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/serial_cmd.ps1", "-Command", "reboot"],
-            "problemMatcher": [],
-            "presentation": { "reveal": "always", "panel": "shared" }
-        },
-        {
-            "label": "📡 Show ESP32 IP",
-            "type": "shell",
-            "command": "powershell",
-            "args": ["-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/scripts/serial_cmd.ps1", "-Command", "ip"],
-            "problemMatcher": [],
-            "presentation": { "reveal": "always", "panel": "shared" }
-        }
-    ]
+    "tasks": []
 }

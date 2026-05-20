@@ -1,56 +1,94 @@
-# 🤖 AMR 2.0 - Hệ Thống Quản Lý Robot Vận Chuyển Tự Động (WMS & Fleet Management)
+# AMR 2.0 - Vehicle-Brain Autonomous Mobile Robot
 
-AMR 2.0 (Autonomous Mobile Robot 2.0) là dự án phần mềm quản lý và điều hướng hệ thống xe tự hành (AMR) phục vụ trong môi trường kho xưởng. Hệ thống có khả năng tự động xử lý hàng hóa (Nhập/Xuất), dẫn đường cho xe, theo dõi trạng thái di chuyển trực tiếp trên bản đồ 3D và kết nối chặt chẽ với hệ cơ sở dữ liệu kho bãi.
+AMR 2.0 là dự án xe tự hành dùng ESP32-S3 làm bộ não vận hành chính. Firmware trên xe xử lý cảm biến, mapping/localization, path planning, trajectory tracking, PID và an toàn realtime. App React/Tauri là trạm điều khiển và giám sát: gửi mission/goal/config/manual command, hiển thị map/path/telemetry và hỗ trợ debug/demo.
 
-## ✨ Tính Năng Nổi Bật
+Pipeline chuẩn:
 
-1. **Giao Diện Bản Đồ 3D (3D Warehouse Map)**: 
-   - Mô phỏng không gian nhà kho theo thời gian thực (Real-time).
-   - Tự động hiển thị các vị trí của kệ hàng, trụ sạc (Charging Stations) và cổng giao dịch hàng.
-2. **Hệ Thống Dẫn Đường Tự Động (Pathfinding)**: 
-   - Tự động tính toán đường đi tối ưu (A* Algorithm) từ vị trí hiện tại đến kệ hàng hoặc cổng xuất/nhập.
-   - Gửi quỹ đạo chuẩn xác (Trajetory & Waypoints) xuống xe qua giao thức kết nối siêu tốc WebSocket.
-3. **Quản Lý Nhiệm Vụ Kho (WMS - Warehouse Management System)**:
-   - Dễ dàng tạo phiếu Nhập và Xuất kho.
-   - Quản lý Số lượng, SKU, và tự động liên kết dữ liệu mượt mà lên Supabase.
-   - Giao việc tự động: Khi có phiếu mới, xe tự tính toán đường đi, làm nhiệm vụ và tự báo cáo.
-4. **Điều Khiển Bằng Tay (Manual Override)**:
-   - Hỗ trợ thao tác thủ công (WASD / Mũi tên) để gửi lệnh vận tốc cơ bản (Linear/Angular) giúp nhân sự dễ gỡ rối tình huống ngặt nghèo.
-   - Nút Dừng Khẩn Cấp (E-STOP) giúp kích hoạt phanh trên toàn bộ phi đội xe ngay lập tức.
-5. **Đồng Bộ Dữ Liệu Thời Gian Thực**:
-   - Giao tiếp với Firmware (ESP32-S3) bằng WebSocket với tốc độ cực cao, giúp theo dõi Pin, thông số cảm biến, IMU, toạ độ liên tục.
-
-## 🛠 Công Nghệ Sử Dụng
-
-Phần Mềm Quản Trị (App Desktop & Web):
-- **Framework**: Tauri, React 19, Vite
-- **Ngôn ngữ**: JavaScript (JSX), CSS thuần túy.
-- **Quản lý State**: Zustand
-- **Hiển thị 3D Map**: Three.js, React Three Fiber & Drei
-- **Backend / Database**: Supabase (PostgreSQL)
-
-Mảng Firmware & Điều khiển nhúng (ESP32-S3):
-- **Ngôn ngữ**: C++ (PlatformIO)
-- **Giao thức**: WebSocket, WiFi
-- Phụ trách vi điều khiển tốc độ, phản hồi PID, theo dõi Encoder và cập nhật vị trí tương đối.
-
-## 🚀 Hướng Dẫn Cài Đặt (Local Development)
-
-### Yêu Cầu Hệ Thống:
-- [Node.js](https://nodejs.org/en/) & `npm`
-- [Rust](https://www.rust-lang.org/) (nếu biên dịch Tauri Desktop App)
-
-### Khởi Chạy Dự Án:
-```bash
-# 1. Cài đặt các gói phụ thuộc
-npm install
-
-# 2. Khởi chạy Web Server cục bộ (Giao diện chạy trên trình duyệt web)
-npm run dev
-
-# 3. Khởi chạy App Desktop (Tauri)
-npm run tauri dev
+```text
+App gửi goal/config -> ESP32 xử lý localization/mapping/planning/tracking/PID -> xe chạy -> app xem telemetry/map/path/status
 ```
 
----
-*Phát triển bởi Lê Minh Đạt.*
+## Tính năng chính
+
+1. **Robot firmware-first**
+   - ESP32-S3 đọc Lidar, Encoder, IMU, pin/dòng.
+   - Firmware giữ `RobotState`, odometry, occupancy grid, ICP/localization, navigation và PID.
+   - Xe tự thực thi an toàn, app không phải bộ não điều hướng của robot thật.
+
+2. **Điều hướng tự hành**
+   - Firmware có các module pathfinder, navigator, DWA/frontier và PID bánh xe.
+   - Hướng nghiên cứu tiếp theo: kinodynamic S-curve trajectory, feedback-linearized tracking và adaptive PID.
+
+3. **App điều khiển/giám sát**
+   - RViz/warehouse map để xem pose, Lidar, map, path, costmap và trạng thái.
+   - Gửi `goal`, `navigate`, `cmd_vel`, `brake`, config/tuning và mission.
+   - Browser-side planner/simulator chỉ dùng cho demo, debug và regression, không phải source of truth cho robot thật.
+
+4. **WMS / Task UI**
+   - Quản lý nhiệm vụ kho, trạng thái robot và dữ liệu hàng hóa.
+   - Có thể kết nối Supabase cho dữ liệu realtime.
+
+## Công nghệ
+
+### Firmware xe
+
+- ESP32-S3 N16R8
+- C++ / Arduino / PlatformIO
+- FreeRTOS tasks
+- WebSocket, MQTT discovery, OTA
+- Lidar A1M8, encoder, IMU MPU6050, INA3221/OLED
+
+### App giám sát
+
+- React 19, Vite, Tauri
+- Zustand
+- Three.js / React Three Fiber
+- WebSocket telemetry and command UI
+
+## Cấu trúc dự án
+
+```text
+AMR2.0/
+├─ esp32s3xe_v2/                    # Não chính của xe
+│  ├─ src/drivers/                  # Motor, encoder, lidar, IMU, battery, OLED
+│  ├─ src/perception/               # Odometry, occupancy grid, ICP/SLAM
+│  ├─ src/navigation/               # A*/Theta*, DWA, frontier, navigator
+│  ├─ src/navigation/trajectory/    # Hướng S-curve / kinodynamic trajectory
+│  ├─ src/control/                  # Hướng wheel PID / adaptive PID
+│  └─ src/network/                  # WebSocket telemetry and commands
+├─ src/                             # App điều khiển/giám sát
+│  ├─ components/
+│  ├─ stores/
+│  ├─ core/protocol/
+│  ├─ core/visualization/
+│  └─ core/sim/
+├─ docs/
+│  ├─ 01_TDTU_Thesis/
+│  ├─ 02_Architecture/
+│  ├─ 03_Research/
+│  ├─ 03_Development_Logs/
+│  └─ knowledge/
+├─ scripts/
+└─ tests/
+```
+
+## Local Development
+
+```bash
+npm install
+npm.cmd run dev
+```
+
+Firmware:
+
+```bash
+cd esp32s3xe_v2
+pio run
+```
+
+## Tài liệu quan trọng
+
+- `docs/02_Architecture/VEHICLE_BRAIN_ARCHITECTURE.md`
+- `esp32s3xe_v2/ARCHITECTURE.md`
+- `docs/03_Research/APPLICATION_TO_AMR2.md`
+- `docs/01_TDTU_Thesis/PROJECT_REPORT.md`

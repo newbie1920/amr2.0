@@ -13,6 +13,7 @@ private:
     float Kp, Ki, Kd, FF;
     float error_sum = 0.0f;
     float last_error = 0.0f;
+    float last_output = 0.0f;
     float dt;
     float max_integral;
     float deadzone_pwm;
@@ -27,6 +28,7 @@ public:
         if (fabsf(velocity_ref) < 0.01f && fabsf(velocity_meas) < 0.01f) {
             error_sum = 0.0f;
             last_error = 0.0f;
+            last_output = 0.0f;
             return 0.0f;
         }
 
@@ -47,13 +49,23 @@ public:
         else if (velocity_ref < -0.01f) u_out -= deadzone_pwm;
 
         last_error = error;
+        last_output = u_out;
         return u_out;
     }
 
     void reset() {
         error_sum = 0.0f;
         last_error = 0.0f;
+        last_output = 0.0f;
     }
+
+    float getLastError() const { return last_error; }
+    float getIntegral() const { return error_sum; }
+    float getLastOutput() const { return last_output; }
+    float getKp() const { return Kp; }
+    float getKi() const { return Ki; }
+    float getKd() const { return Kd; }
+    float getFf() const { return FF; }
 };
 
 #endif // PID_CONTROLLER_H

@@ -30,6 +30,7 @@
 #include "pathfinder.h"
 #include "pathfinder_types.h"
 #include "frontier_explorer.h"
+#include "network_comm.h"
 
 // ── PID controllers (allocated once) ─────────────────────────
 WheelPID leftPID(KP_VEL, KI_VEL, 0, FF_GAIN_LEFT, 1.0f / CONTROL_FREQ_HZ, 5.0f, (float)MIN_PWM);
@@ -51,6 +52,10 @@ FrontierExplorer explorer;
 // ── FreeRTOS Queue for GoTo requests ─────────────────────────
 QueueHandle_t pathfinderQueue = NULL;
 static unsigned long lastDwaTime = 0;
+static constexpr float NAV_STRAIGHT_RATE_HOLD_GAIN = 0.35f;
+static constexpr float NAV_STRAIGHT_RATE_HOLD_MAX_W = 0.12f;
+static constexpr float NAV_STRAIGHT_RATE_HOLD_W_BAND = 0.12f;
+static constexpr float NAV_STRAIGHT_RATE_HOLD_MIN_V = 0.04f;
 
 // ============================================================
 //   CONTROL TASK (Core 1, 50Hz)
@@ -146,6 +151,17 @@ void controlTask(void* pvParameters) {
             // Convert (v, w) → wheel velocities
             float v = navigator.cmdLinear;
             float w = navigator.cmdAngular;
+            if (navigator.state == NAV_TRACKING &&
+                fabsf(v) > NAV_STRAIGHT_RATE_HOLD_MIN_V &&
+                fabsf(w) < NAV_STRAIGHT_RATE_HOLD_W_BAND) {
+                const float measuredW = (state.motor.vR_meas - state.motor.vL_meas) *
+                                        WHEEL_RADIUS / WHEEL_SEPARATION;
+                const float rateHold = constrain((w - measuredW) * NAV_STRAIGHT_RATE_HOLD_GAIN,
+                                                 -NAV_STRAIGHT_RATE_HOLD_MAX_W,
+                                                 NAV_STRAIGHT_RATE_HOLD_MAX_W);
+                w += rateHold;
+                navigator.cmdAngular = w;
+            }
             state.motor.targetLeftVel  = (v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS;
             state.motor.targetRightVel = (v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS;
             state.motor.lastCmdTime = millis();
@@ -211,13 +227,20 @@ void lidarTask(void* pvParameters) {
     auto shouldFreezeMapping = []() -> bool {
         const float vRobot = (state.motor.vR_meas + state.motor.vL_meas) * 0.5f * WHEEL_RADIUS;
         const float wRobot = (state.motor.vR_meas - state.motor.vL_meas) * WHEEL_RADIUS / WHEEL_SEPARATION;
+        const bool navActive =
+            state.nav.allowOnboardNav &&
+            (navigator.state == NAV_TRACKING ||
+             navigator.state == NAV_FINAL_TURN ||
+             navigator.state == NAV_RECOVERY_SPIN ||
+             navigator.state == NAV_RECOVERY_BACKUP ||
+             navigator.state == NAV_RECOVERY_WAIT);
         const bool recovering =
             navigator.state == NAV_RECOVERY_SPIN ||
             navigator.state == NAV_RECOVERY_BACKUP ||
             navigator.state == NAV_RECOVERY_WAIT;
         const bool reversing = vRobot < -0.02f;
         const bool turningHard = fabsf(wRobot) > 0.45f;
-        return recovering || reversing || turningHard;
+        return navActive || recovering || reversing || turningHard;
     };
 
     for (;;) {
@@ -349,7 +372,8 @@ void lidarTask(void* pvParameters) {
                             float errMapX = errX * cosMap - errY * sinMap;
                             float errMapY = errX * sinMap + errY * cosMap;
 
-                            updateTf(errMapX, errMapY, errT, qualityWeight);
+                            // DEBUG: Disable SLAM TF correction to diagnose heading spin
+                            // updateTf(errMapX, errMapY, errT, qualityWeight);
                         }
 
                         // Update SLAM diagnostics for browser UI
@@ -422,10 +446,14 @@ void pathfinderTask(void* pvParameters) {
             LOG_I("A*", "Computing path: (%.2f,%.2f) → (%.2f,%.2f)",
                   req.startX, req.startY, req.goalX, req.goalY);
 
+            static uint32_t planSeq = 0;
             Waypoint path[MAX_WAYPOINTS];
+            PathPlanDebug debug;
+            debug.planId = ++planSeq;
             int wpCount = pathfinder.computePath(
                 req.startX, req.startY, req.goalX, req.goalY,
-                path, MAX_WAYPOINTS);
+                path, MAX_WAYPOINTS, &debug);
+            debug.planId = planSeq;
 
             if (wpCount > 0) {
                 navigator.loadPath(path, wpCount, req.finalHeading);
@@ -436,6 +464,7 @@ void pathfinderTask(void* pvParameters) {
                     explorer.blacklistCurrentGoal();
                 }
             }
+            broadcast_nav_path(debug, path, wpCount);
         }
     }
 }

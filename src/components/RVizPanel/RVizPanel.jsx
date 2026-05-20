@@ -42,6 +42,9 @@ import {
   drawAnimatedPath,
   drawGoalPoseArrow,
   drawRobotTrail,
+  drawPlannerRawNodes,
+  drawCurrentWaypoint,
+  drawTrajectoryReferenceTrail,
 } from './rvizLayers.js';
 
 // ============================================================
@@ -202,7 +205,10 @@ export default function RVizPanel({ activePath }) {
 
   // Robot trail tracking
   const robotTrailRef = useRef([]);
+  const trajectoryRefTrailRef = useRef([]);
+  const lastPathPlanIdRef = useRef(null);
   const MAX_TRAIL_POINTS = 200;
+  const MAX_TRAJ_REF_POINTS = 180;
 
   // Find active robot
   const robotList = Object.values(robots);
@@ -217,6 +223,10 @@ export default function RVizPanel({ activePath }) {
     ? resolveMapFramePose(activeRobot, { mapToOdom }, activeRobotId)
     : null;
   const navSession = activeRobotId ? appNavigationSessions[activeRobotId] : null;
+  const pathDebug = telem.pathDebug || null;
+  const onboardWaypoints = pathDebug?.waypoints?.length > 0
+    ? pathDebug.waypoints
+    : (telem.path?.length > 0 ? telem.path : null);
   const firstSimInfo = Object.values(simInfo)[0];
   const isMapping = activeRobotId ? !!mappingActive[activeRobotId] : false;
   const hasCancelableGoal = !!pendingGoalPose || !!goalMarker || !!navSession?.active || ['TRACK', 'F_TURN', 'RECOVERY_SPIN', 'RECOVERY_BACKUP', 'RECOVERY_REPLAN', 'PAUSED'].includes(telem.nav);
@@ -264,8 +274,7 @@ export default function RVizPanel({ activePath }) {
         setIsNavLoading(false);
         if (result.success) {
           if (result.path && result.path.length > 0) {
-            const acceptedGoal = result.path[result.path.length - 1];
-            setGoalMarker({ x: acceptedGoal.x, y: acceptedGoal.y, headingRad: goal.headingRad });
+            setGoalMarker({ x: goal.x, y: goal.y, headingRad: goal.headingRad });
             setNavPath(result.path);
           } else {
             setNavPath(null);
@@ -290,6 +299,7 @@ export default function RVizPanel({ activePath }) {
     setPendingGoalPose(null);
     setGoalMarker(null);
     setNavPath(null);
+    trajectoryRefTrailRef.current = [];
   }, []);
 
   useEffect(() => {
@@ -337,6 +347,7 @@ export default function RVizPanel({ activePath }) {
     if (prevNavActive.current && !isActive) {
       setGoalMarker(null);
       setNavPath(null);
+      trajectoryRefTrailRef.current = [];
     }
     prevNavActive.current = isActive;
   }, [navSession?.active]);
@@ -354,12 +365,37 @@ export default function RVizPanel({ activePath }) {
           setTimeout(() => {
             setGoalMarker(null);
             setNavPath(null);
+            trajectoryRefTrailRef.current = [];
           }, 2000); // Show goal for 2s after completion for visual feedback
         }
       }
     }
     prevNavStatus.current = navStatus;
   }, [telem.nav, goalMarker, navSession?.active]);
+
+  useEffect(() => {
+    if (!activeRobotId) {
+      trajectoryRefTrailRef.current = [];
+      lastPathPlanIdRef.current = null;
+      return;
+    }
+
+    if (pathDebug?.planId != null && lastPathPlanIdRef.current !== pathDebug.planId) {
+      trajectoryRefTrailRef.current = [];
+      lastPathPlanIdRef.current = pathDebug.planId;
+    }
+
+    const traj = telem.traj;
+    if (!traj?.active || !Number.isFinite(traj.x) || !Number.isFinite(traj.y)) return;
+
+    const lastPt = trajectoryRefTrailRef.current[trajectoryRefTrailRef.current.length - 1];
+    if (!lastPt || Math.hypot(traj.x - lastPt.x, traj.y - lastPt.y) > 0.02) {
+      trajectoryRefTrailRef.current.push({ x: traj.x, y: traj.y });
+      if (trajectoryRefTrailRef.current.length > MAX_TRAJ_REF_POINTS) {
+        trajectoryRefTrailRef.current = trajectoryRefTrailRef.current.slice(-MAX_TRAJ_REF_POINTS);
+      }
+    }
+  }, [activeRobotId, pathDebug?.planId, telem.traj?.active, telem.traj?.x, telem.traj?.y]);
 
   // ── Wheel Event (Non-Passive) ─────────────────────────────
 
@@ -543,7 +579,12 @@ export default function RVizPanel({ activePath }) {
       // Navigation path (from click-to-navigate or active nav session)
       const displayPath = navSession?.active
         ? pathFromCurrentPose(navSession.path, navSession.currentWaypointIndex, robotPose)
-        : (navSession?.path || navPath || activePath);
+        : (navSession?.path || navPath || onboardWaypoints || activePath);
+      const targetPath = navSession?.path || onboardWaypoints || navPath || activePath || [];
+      const currentWaypointIndex = navSession?.active
+        ? navSession.currentWaypointIndex
+        : (Number.isFinite(telem.navWp) ? telem.navWp : 0);
+      const currentWaypoint = targetPath?.[Math.max(0, Math.min(currentWaypointIndex ?? 0, Math.max(0, targetPath.length - 1)))];
 
       // Robot-specific layers
       if (robotPose) {
@@ -577,11 +618,21 @@ export default function RVizPanel({ activePath }) {
         // Local costmap window
         if (layers.localCostmap && navSession?.active) drawLocalCostmapWindow(ctx, vp, poseX, poseY);
 
+        if (layers.path && pathDebug?.raw?.length > 0) {
+          const rawPathCacheKey = `${activeRobotId || 'none'}:${pathDebug.planId ?? 'no-plan'}:${pathDebug.rawCount ?? pathDebug.raw.length}`;
+          drawPlannerRawNodes(ctx, vp, pathDebug.raw, rawPathCacheKey);
+        }
+
         // Animated path (replaces basic drawPath when navigating)
         if (layers.path && displayPath && navSession?.active) {
           drawAnimatedPath(ctx, w, h, vp, displayPath, poseX, poseY);
         } else if (layers.path && displayPath) {
           drawPath(ctx, w, h, vp, displayPath);
+        }
+        if (layers.path) {
+          drawCurrentWaypoint(ctx, vp, currentWaypoint);
+          const trajectoryCacheKey = `${activeRobotId || 'none'}:${pathDebug?.planId ?? 'no-plan'}:${trajectoryRefTrailRef.current.length}`;
+          drawTrajectoryReferenceTrail(ctx, vp, trajectoryRefTrailRef.current, telem.traj, trajectoryCacheKey);
         }
         if (layers.path && pendingGoalPose) {
           const pendingRoute = buildDirectPath({ x: poseX, y: poseY }, pendingGoalPose);

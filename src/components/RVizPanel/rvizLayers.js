@@ -23,6 +23,9 @@ const COLORS = {
   robotFill: 'rgba(34, 197, 94, 0.15)',
   path: '#3b82f6',
   pathDashed: [8, 4],
+  plannerRaw: '#f97316',
+  trajectoryRef: '#e879f9',
+  currentWaypoint: '#facc15',
   frontier: '#06b6d4',
   wallSegment: 'rgba(255, 255, 255, 0.7)',
   tfX: '#ef4444',
@@ -31,6 +34,40 @@ const COLORS = {
   costmapHigh: 'rgba(239, 68, 68, 0.5)',
   measure: '#f59e0b',
 };
+
+const _objectIds = new WeakMap();
+let _nextObjectId = 1;
+
+function _objectCacheId(value) {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return 'none';
+  if (!_objectIds.has(value)) _objectIds.set(value, _nextObjectId++);
+  return _objectIds.get(value);
+}
+
+function _viewportCacheKey(w, h, viewport) {
+  const origin = viewport.worldToScreen(0, 0);
+  const unitX = viewport.worldToScreen(1, 0);
+  const unitY = viewport.worldToScreen(0, 1);
+  return [
+    Math.round(w),
+    Math.round(h),
+    Math.round((viewport.scale || 0) * 100),
+    Math.round((viewport.rotation || 0) * 10000),
+    Math.round(origin.x * 10),
+    Math.round(origin.y * 10),
+    Math.round(unitX.x * 10),
+    Math.round(unitX.y * 10),
+    Math.round(unitY.x * 10),
+    Math.round(unitY.y * 10),
+  ].join(':');
+}
+
+function _createLayerCanvas(w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.ceil(w));
+  canvas.height = Math.max(1, Math.ceil(h));
+  return canvas;
+}
 
 function getVisibleWorldBounds(w, h, viewport, spacing = 1) {
   const corners = [
@@ -329,15 +366,179 @@ export function drawPath(ctx, w, h, viewport, path) {
   }
 }
 
+let _plannerRawCache = { key: '', canvas: null };
+
+function _paintPlannerRawNodes(ctx, viewport, rawNodes) {
+  if (!rawNodes || rawNodes.length === 0) return;
+
+  const { worldToScreen, scale } = viewport;
+  const radius = Math.max(1.4, Math.min(3.2, scale * 0.015));
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(249, 115, 22, 0.7)';
+  ctx.strokeStyle = 'rgba(249, 115, 22, 0.35)';
+  ctx.lineWidth = 1;
+
+  if (rawNodes.length > 1) {
+    ctx.beginPath();
+    const first = worldToScreen(rawNodes[0].x, rawNodes[0].y);
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < rawNodes.length; i++) {
+      const p = worldToScreen(rawNodes[i].x, rawNodes[i].y);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  for (const node of rawNodes) {
+    const p = worldToScreen(node.x, node.y);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+export function drawPlannerRawNodes(ctx, viewport, rawNodes, cacheKey = null) {
+  if (!rawNodes || rawNodes.length === 0) return;
+
+  const canvas = ctx.canvas;
+  const w = canvas.clientWidth || canvas.width;
+  const h = canvas.clientHeight || canvas.height;
+  const key = [
+    cacheKey ?? _objectCacheId(rawNodes),
+    rawNodes.length,
+    _viewportCacheKey(w, h, viewport),
+  ].join('|');
+
+  if (_plannerRawCache.key !== key || !_plannerRawCache.canvas) {
+    const layer = _createLayerCanvas(w, h);
+    const layerCtx = layer.getContext('2d');
+    _paintPlannerRawNodes(layerCtx, viewport, rawNodes);
+    _plannerRawCache = { key, canvas: layer };
+  }
+
+  ctx.drawImage(_plannerRawCache.canvas, 0, 0, w, h);
+}
+
+export function drawCurrentWaypoint(ctx, viewport, waypoint) {
+  if (!waypoint) return;
+
+  const { worldToScreen } = viewport;
+  const p = worldToScreen(waypoint.x, waypoint.y);
+
+  ctx.save();
+  ctx.strokeStyle = COLORS.currentWaypoint;
+  ctx.fillStyle = 'rgba(250, 204, 21, 0.18)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(p.x - 6, p.y);
+  ctx.lineTo(p.x + 6, p.y);
+  ctx.moveTo(p.x, p.y - 6);
+  ctx.lineTo(p.x, p.y + 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+let _trajectoryRefCache = { key: '', canvas: null };
+
+function _paintTrajectoryReferenceTrail(ctx, viewport, trail, currentRef = null) {
+  if ((!trail || trail.length < 2) && !currentRef) return;
+
+  const { worldToScreen } = viewport;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(232, 121, 249, 0.72)';
+  ctx.fillStyle = COLORS.trajectoryRef;
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 4]);
+
+  if (trail && trail.length > 1) {
+    const first = worldToScreen(trail[0].x, trail[0].y);
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    for (let i = 1; i < trail.length; i++) {
+      const p = worldToScreen(trail[i].x, trail[i].y);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  if (trail) {
+    for (let i = 0; i < trail.length; i += 6) {
+      const p = worldToScreen(trail[i].x, trail[i].y);
+      ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+    }
+  }
+
+  if (currentRef && Number.isFinite(currentRef.x) && Number.isFinite(currentRef.y)) {
+    const p = worldToScreen(currentRef.x, currentRef.y);
+    ctx.strokeStyle = COLORS.trajectoryRef;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+export function drawTrajectoryReferenceTrail(ctx, viewport, trail, currentRef = null, cacheKey = null) {
+  if ((!trail || trail.length < 2) && !currentRef) return;
+
+  const canvas = ctx.canvas;
+  const w = canvas.clientWidth || canvas.width;
+  const h = canvas.clientHeight || canvas.height;
+  const refKey = currentRef && Number.isFinite(currentRef.x) && Number.isFinite(currentRef.y)
+    ? `${Math.round(currentRef.x * 100)}:${Math.round(currentRef.y * 100)}`
+    : 'none';
+  const key = [
+    cacheKey ?? _objectCacheId(trail),
+    trail?.length ?? 0,
+    refKey,
+    _viewportCacheKey(w, h, viewport),
+  ].join('|');
+
+  if (_trajectoryRefCache.key !== key || !_trajectoryRefCache.canvas) {
+    const layer = _createLayerCanvas(w, h);
+    const layerCtx = layer.getContext('2d');
+    _paintTrajectoryReferenceTrail(layerCtx, viewport, trail, currentRef);
+    _trajectoryRefCache = { key, canvas: layer };
+  }
+
+  ctx.drawImage(_trajectoryRefCache.canvas, 0, 0, w, h);
+}
+
 // ============================================================
 //   6. LASER SCAN POINTS
 // ============================================================
 
-export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, lidarPts) {
+let _laserScanCache = { key: '', canvas: null, pointsId: null, sortedPts: [] };
+
+function _getSortedLaserPoints(lidarPts) {
+  const pointsId = _objectCacheId(lidarPts);
+  if (_laserScanCache.pointsId === pointsId) return _laserScanCache.sortedPts;
+
+  _laserScanCache.pointsId = pointsId;
+  _laserScanCache.sortedPts = [...lidarPts]
+    .filter((pt) => {
+      const distM = pt.d / 1000.0;
+      return distM >= 0.05 && distM <= 8.0;
+    })
+    .sort((a, b) => a.a - b.a);
+  return _laserScanCache.sortedPts;
+}
+
+function _paintLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, lidarPts) {
   if (!lidarPts || lidarPts.length === 0) return;
 
   const { worldToScreen, scale } = viewport;
   const rScreen = worldToScreen(robotX, robotY);
+  const sortedPts = _getSortedLaserPoints(lidarPts);
+  if (sortedPts.length === 0) return;
 
   // 1. FoV Area (vùng rẻ quạt màu vàng nhạt)
   ctx.fillStyle = 'rgba(250, 204, 21, 0.08)'; // Vàng nhạt
@@ -345,10 +546,8 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
   ctx.moveTo(rScreen.x, rScreen.y);
 
   // Sắp xếp góc để vẽ polygon liên tục
-  const sortedPts = [...lidarPts].sort((a, b) => a.a - b.a);
   for (const pt of sortedPts) {
     const distM = pt.d / 1000.0;
-    if (distM < 0.05 || distM > 8.0) continue;
 
     const worldAngle = robotTheta + (pt.a * Math.PI) / 180;
     const hx = robotX + Math.cos(worldAngle) * distM;
@@ -363,10 +562,9 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
   ctx.strokeStyle = COLORS.laserRay;
   ctx.lineWidth = 0.5;
   ctx.beginPath();
-  for (let i = 0; i < lidarPts.length; i += 10) {
-    const pt = lidarPts[i];
+  for (let i = 0; i < sortedPts.length; i += 10) {
+    const pt = sortedPts[i];
     const distM = pt.d / 1000.0;
-    if (distM < 0.05 || distM > 8.0) continue;
 
     const worldAngle = robotTheta + (pt.a * Math.PI) / 180;
     const hx = robotX + Math.cos(worldAngle) * distM;
@@ -382,9 +580,8 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
   const dotSize = Math.max(1.5, Math.min(4, scale * 0.04));
   ctx.fillStyle = COLORS.laserHit;
 
-  for (const pt of lidarPts) {
+  for (const pt of sortedPts) {
     const distM = pt.d / 1000.0;
-    if (distM < 0.05 || distM > 8.0) continue;
 
     const worldAngle = robotTheta + (pt.a * Math.PI) / 180;
     const hx = robotX + Math.cos(worldAngle) * distM;
@@ -393,6 +590,29 @@ export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, l
 
     ctx.fillRect(hScreen.x - dotSize / 2, hScreen.y - dotSize / 2, dotSize, dotSize);
   }
+}
+
+export function drawLaserScan(ctx, w, h, viewport, robotX, robotY, robotTheta, lidarPts, cacheKey = null) {
+  if (!lidarPts || lidarPts.length === 0) return;
+
+  const key = [
+    cacheKey ?? _objectCacheId(lidarPts),
+    lidarPts.length,
+    Math.round((robotX || 0) * 1000),
+    Math.round((robotY || 0) * 1000),
+    Math.round((robotTheta || 0) * 10000),
+    _viewportCacheKey(w, h, viewport),
+  ].join('|');
+
+  if (_laserScanCache.key !== key || !_laserScanCache.canvas) {
+    const layer = _createLayerCanvas(w, h);
+    const layerCtx = layer.getContext('2d');
+    _paintLaserScan(layerCtx, w, h, viewport, robotX, robotY, robotTheta, lidarPts);
+    _laserScanCache.key = key;
+    _laserScanCache.canvas = layer;
+  }
+
+  ctx.drawImage(_laserScanCache.canvas, 0, 0, w, h);
 }
 
 // ============================================================

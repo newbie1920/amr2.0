@@ -28,6 +28,7 @@
 #define LOGODDS_MIN_FREE -50
 #define LOGODDS_MAX LOGODDS_MAX_OCC
 #define LOGODDS_MIN LOGODDS_MIN_FREE
+#define LOGODDS_DECAY_FACTOR 0.8f  // Hệ số suy giảm vật cản cũ
 
 // ── LiDAR range ──────────────────────────────────────────────
 #define LIDAR_MAX_RANGE 6.0f
@@ -104,6 +105,12 @@ public:
 
     void update_grid() {
         if (!grid) return;
+
+        // Log-odds decay: suy giảm vật cản cũ ngoài tầm quét hiện tại để tránh bám nhiễu
+        for (int i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
+            grid[i] = (int8_t)(grid[i] * LOGODDS_DECAY_FACTOR);
+        }
+
         for (int i = 0; i < point_count; i++) {
             const LidarPoint& pt = points[i];
             if (!pt.quality) continue;

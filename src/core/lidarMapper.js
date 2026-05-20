@@ -20,6 +20,7 @@ const L_OCC = 0.9;
 const L_FREE = -0.2; // Giảm sức mạnh xóa bóng ma để giữ vật cản tĩnh
 const L_MIN = -5.0;
 const L_MAX = 10.0; // Tăng giới hạn nhớ để vật cản không bị quên
+const L_DECAY_FACTOR = 0.8; // Hệ số suy giảm Log-odds vật cản cũ để giảm nhiễu
 const MAX_LIDAR_RANGE_M = 6.0;   // A1M8 max 12m — cap at 6m for stable mapping
 const MIN_LIDAR_RANGE_M = 0.12;  // Lọc noise thân robot
 
@@ -135,6 +136,11 @@ export class OccupancyGrid {
     const robotGY = rg.gy;
 
     if (!this.inBounds(robotGX, robotGY)) return;
+
+    // Log-odds decay: suy giảm vật cản cũ ngoài tầm quét để tránh bám nhiễu bóng ma
+    for (let i = 0; i < this.logOdds.length; i++) {
+      this.logOdds[i] *= L_DECAY_FACTOR;
+    }
 
     for (let i = 0; i < lidarPoints.length; i++) {
       const pt = lidarPoints[i];
@@ -379,6 +385,65 @@ export class OccupancyGrid {
     }
     
     // Bump version to notify UI layer that costmap data has changed
+    this.costmapVersion++;
+  }
+
+  inflateWindowObstacles(viewStartX, viewStartY, viewW, viewH, inflationRadius = 6) {
+    this.costmap.fill(0);
+    const w = this.width;
+    const h = this.height;
+    const res = this.resolution;
+    const inscribedCells = Math.ceil(INSCRIBED_RADIUS / res);
+    const minGX = Math.max(0, viewStartX - inflationRadius);
+    const minGY = Math.max(0, viewStartY - inflationRadius);
+    const maxGX = Math.min(w - 1, viewStartX + viewW + inflationRadius);
+    const maxGY = Math.min(h - 1, viewStartY + viewH + inflationRadius);
+    const distGrid = new Float32Array(w * h);
+    distGrid.fill(9999);
+    const queue = [];
+
+    for (let gy = viewStartY; gy < viewStartY + viewH && gy < h; gy++) {
+      for (let gx = viewStartX; gx < viewStartX + viewW && gx < w; gx++) {
+        const idx = gy * w + gx;
+        if (this.logOdds[idx] > 0.5) {
+          this.costmap[idx] = 254;
+          distGrid[idx] = 0;
+          queue.push(idx);
+        }
+      }
+    }
+
+    let qi = 0;
+    while (qi < queue.length) {
+      const idx = queue[qi++];
+      const gx = idx % w;
+      const gy = Math.floor(idx / w);
+      const parentDist = distGrid[idx];
+
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = gx + dx;
+          const ny = gy + dy;
+          if (nx < minGX || nx > maxGX || ny < minGY || ny > maxGY) continue;
+          const nIdx = ny * w + nx;
+          const stepDist = (dx !== 0 && dy !== 0) ? 1.414 : 1.0;
+          const newDist = parentDist + stepDist;
+          if (newDist >= distGrid[nIdx] || newDist > inflationRadius) continue;
+
+          distGrid[nIdx] = newDist;
+          const distMeters = newDist * res;
+          const cost = newDist <= inscribedCells
+            ? 253
+            : Math.round(252 * Math.exp(-COST_SCALING_FACTOR * (distMeters - INSCRIBED_RADIUS)));
+          if (cost > 0 && cost > this.costmap[nIdx]) {
+            this.costmap[nIdx] = cost;
+            queue.push(nIdx);
+          }
+        }
+      }
+    }
+
     this.costmapVersion++;
   }
 
@@ -688,6 +753,8 @@ export class OccupancyGrid {
     grid.robotX = robotX;
     grid.robotY = robotY;
     grid.robotHeading = robotHeading;
+    grid.logOdds.fill(L_PRIOR);
+    grid.data.fill(128);
 
     let offset = 35;
     let decodedCount = 0;
@@ -731,10 +798,8 @@ export class OccupancyGrid {
 
     grid._syncDataFromLogOdds();
 
-    // Re-inflate costmap 
-    // Todo: optimize to only inflate view window for performance
     const inflCells = Math.ceil(INFLATION_RADIUS_M / grid.resolution);
-    grid.inflateObstacles(inflCells);
+    grid.inflateWindowObstacles(viewStartX, viewStartY, viewW, viewH, inflCells);
 
     grid._dirty = true;
     grid.lastUpdate = Date.now();

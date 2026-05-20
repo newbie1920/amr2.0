@@ -38,6 +38,7 @@ const APP_NAV = {
   progressDistance: 0.03,
   progressTimeoutMs: 6000,
   goalTolerance: 0.18,
+  realGoalTolerance: 0.10,
   finalHeadingTolerance: 0.12,
   rotateGain: 1.6,
   rotateMaxW: 0.9,
@@ -50,6 +51,7 @@ const APP_NAV = {
   // Pure Pursuit parameters
   lookaheadDist: 0.5,           // Look-ahead distance (meters)
   maxLinearVel: 0.8,            // Max forward speed
+  realMaxLinearVel: 0.42,       // Real robots need a calmer final approach than SimBot
   minLinearVel: 0.05,           // Min forward speed
   maxAngularVel: 2.0,           // Max turning speed
   pursuitGain: 2.0,             // Angular gain for Pure Pursuit
@@ -284,12 +286,7 @@ const useNavStore = create((set, get) => ({
     const robot = getRobotStore().robots[robotId];
     if (robot?._sim) return 'pc';
 
-    const telemetry = robot?.telemetry || {};
-    if (telemetry.architecture === 'pc_slam' || telemetry.onboardNavEnabled === false) {
-      return 'pc';
-    }
-
-    // Real robots default to the firmware-reported onboard pipeline.
+    // Real robots default to firmware authority. Browser navigation is explicit debug mode only.
     return 'onboard';
   },
 
@@ -426,6 +423,7 @@ const useNavStore = create((set, get) => ({
 
     const goal = nextSession.goal;
     const distToGoal = Math.hypot(goal.x - pose.x, goal.y - pose.y);
+    const goalTolerance = robot?._sim ? APP_NAV.goalTolerance : APP_NAV.realGoalTolerance;
 
     // ── PAUSED ──
     if (nextSession.paused) {
@@ -438,7 +436,7 @@ const useNavStore = create((set, get) => ({
     }
 
     // ── GOAL REACHED ──
-    if (distToGoal <= APP_NAV.goalTolerance) {
+    if (distToGoal <= goalTolerance) {
       if (nextSession.finalHeadingRad != null) {
         const err = normalizeAngle(nextSession.finalHeadingRad - pose.theta);
         if (Math.abs(err) > APP_NAV.finalHeadingTolerance) {
@@ -452,6 +450,7 @@ const useNavStore = create((set, get) => ({
         }
       }
 
+      if (mux) mux.send(VEL_SOURCE.NAVIGATION, 0, 0);
       get().stopAppNavigation(id, 'DONE', true);
       return { nav: 'DONE', nav_wp: nextSession.path.length, nav_total: nextSession.path.length };
     }
@@ -754,6 +753,64 @@ const useNavStore = create((set, get) => ({
         }
       }
 
+      if (obstacleAvoidanceEnabled && grid && grid.costmap && !nextSession.offloaded) {
+        if (!state.navComputationBusy[id]) {
+          set((s) => ({
+            navComputationBusy: { ...s.navComputationBusy, [id]: true },
+          }));
+
+          const navSessions = get().appNavigationSessions;
+          const trafficGridData = injectTrafficIntoGridData(grid.serialize(), id, robotState.robots, navSessions);
+          const config = getDWAStore().dwaConfig;
+
+          navWorkerApi.computeVelocity(pose, vel, remainingPath, trafficGridData, config, telem.lidar)
+            .then((result) => {
+              const fresh = get().appNavigationSessions[id];
+              if (!fresh?.active) return; // Session ended or paused
+
+              if (result && result.ok && result.v !== undefined) {
+                if (mux) {
+                  mux.send(VEL_SOURCE.NAVIGATION, result.v, result.w);
+                }
+                set((s) => ({
+                  dwaTrajectories: { ...s.dwaTrajectories, [id]: result.trajectory || [] }
+                }));
+              } else {
+                console.warn('[AppNav] MPPI local planner failed or blocked, reason:', result?.reason);
+                // If MPPI fails completely (e.g., all trajectories collided), trigger recovery replan
+                if (result?.reason === 'all_trajectories_collided') {
+                  const updated = {
+                    ...fresh,
+                    recoveryMode: 'REPLAN',
+                    status: 'RECOVERY_REPLAN',
+                    lastProgressTime: Date.now(),
+                    _lastReplanTime: Date.now(),
+                  };
+                  set((s) => ({
+                    appNavigationSessions: { ...s.appNavigationSessions, [id]: updated },
+                  }));
+                }
+              }
+
+              set((s) => ({
+                navComputationBusy: { ...s.navComputationBusy, [id]: false },
+              }));
+            })
+            .catch((err) => {
+              console.error('[AppNav] Local planner computeVelocity error:', err);
+              set((s) => ({
+                navComputationBusy: { ...s.navComputationBusy, [id]: false },
+              }));
+            });
+        }
+
+        nextSession.status = 'TRACK';
+        set((s) => ({
+          appNavigationSessions: { ...s.appNavigationSessions, [id]: nextSession },
+        }));
+        return buildAppNavOverlay(nextSession);
+      }
+
       // Compute heading error to target
       const targetHeading = Math.atan2(targetWp.y - pose.y, targetWp.x - pose.x);
       const headingErr = normalizeAngle(targetHeading - pose.theta);
@@ -764,7 +821,7 @@ const useNavStore = create((set, get) => ({
       cmdW = Math.max(-APP_NAV.maxAngularVel, Math.min(APP_NAV.maxAngularVel, cmdW));
 
       // Speed control: slow down on sharp turns, speed up on straights
-      let cmdV = APP_NAV.maxLinearVel;
+      let cmdV = robot?._sim ? APP_NAV.maxLinearVel : APP_NAV.realMaxLinearVel;
       if (absErr > 0.3) {
         // Turning: reduce speed proportionally
         const turnFactor = Math.max(APP_NAV.curveSlowdown, 1.0 - absErr / 1.57);
@@ -778,8 +835,12 @@ const useNavStore = create((set, get) => ({
       if (absErr > 1.2) cmdV = 0; // Override min for in-place rotation
 
       // Distance to goal — slow approach
-      if (distToGoal < 0.4) {
-        cmdV = Math.min(cmdV, distToGoal * 0.5);
+      if (distToGoal < 0.55) {
+        const approachGain = robot?._sim ? 0.5 : 0.35;
+        cmdV = Math.min(cmdV, distToGoal * approachGain);
+      }
+      if (!robot?._sim && distToGoal < 0.25) {
+        cmdV = Math.min(cmdV, 0.08);
       }
 
       if (mux) mux.send(VEL_SOURCE.NAVIGATION, cmdV, cmdW);
@@ -883,8 +944,8 @@ const useNavStore = create((set, get) => ({
     const navMode = get().getNavMode(robotId);
     
     if (navMode === 'pc') {
-      // PC Navigation: Browser computes A* path + Pure Pursuit local planner
-      console.log(`[NavStore] 🖥️ PC Nav mode: browser A* + Pure Pursuit`);
+      // PC Navigation: explicit browser debug/simulation path only.
+      console.log(`[NavStore] Debug PC Nav mode: browser A* + app-side path follower`);
       const grid = mapState.mapperInstances[robotId] || mapState.occupancyGrid[robotId];
       const enterPcBrowserMode = () => {
         if (robot.adapter?.connected) {
@@ -900,7 +961,7 @@ const useNavStore = create((set, get) => ({
 
       // Helper: send direct path (fallback when A* fails or no grid)
       const sendDirectPath = (reason) => {
-        console.log(`[NavStore] 📍 PC Nav fallback (${reason}): direct path to goal`);
+        console.log(`[NavStore] Debug PC Nav fallback (${reason}): direct path to goal`);
         const path = buildDirectPath(startPose, { x: goalX, y: goalY });
         get().startAppNavigation(robotId, path, finalHeading, false);
         return { success: true, path };
@@ -932,7 +993,7 @@ const useNavStore = create((set, get) => ({
         const trafficGridData = injectTrafficIntoGridData(grid.serialize(), robotId, robotState.robots, navSessions);
         const result = await navWorkerApi.findPath(trafficGridData, startX, startY, goalX, goalY, true, true);
         if (result.success && result.path.length > 1) {
-          console.log(`[NavStore] ✅ PC path: ${result.path.length} waypoints. Browser Pure Pursuit will send cmd_vel.`);
+          console.log(`[NavStore] Debug PC path: ${result.path.length} waypoints. Browser path follower will send cmd_vel.`);
           get().startAppNavigation(robotId, result.path, finalHeading, false);
 
           return { success: true, path: result.path };

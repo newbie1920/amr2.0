@@ -1,0 +1,1 @@
+# Please read /.gemini/GEMINI.md for all system instructions, workflow rules, and project context.

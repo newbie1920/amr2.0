@@ -168,10 +168,11 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
   eg.gx = Math.max(0, Math.min(grid.width - 1, eg.gx));
   eg.gy = Math.max(0, Math.min(grid.height - 1, eg.gy));
 
-  // If goal is blocked (obstacle or pink/purple zone) → find nearest free cell
+  // If goal is truly blocked (occupied/lethal) -> find nearest free cell.
+  // Inflation cost alone should not move the user's selected goal marker.
   let goalBlocked = grid.isOccupied(eg.gx, eg.gy);
   if (!goalBlocked && useCostmap && grid.costmap && grid.inBounds(eg.gx, eg.gy)) {
-    if (grid.costmap[eg.gy * grid.width + eg.gx] >= 100) goalBlocked = true;
+    if (grid.costmap[eg.gy * grid.width + eg.gx] >= 200) goalBlocked = true;
   }
   
   if (goalBlocked) {
@@ -242,7 +243,7 @@ export function findPathOnGrid(grid, startX, startY, goalX, goalY, options = {})
         const goalG = grid.worldToGrid(goalX, goalY);
         let goalSafe = true;
         if (grid.costmap && grid.inBounds(goalG.gx, goalG.gy)) {
-          if (grid.costmap[goalG.gy * grid.width + goalG.gx] >= 100) goalSafe = false;
+          if (grid.costmap[goalG.gy * grid.width + goalG.gx] >= 200) goalSafe = false;
         }
         if (grid.isOccupied && grid.isOccupied(goalG.gx, goalG.gy)) goalSafe = false;
         if (goalSafe) {

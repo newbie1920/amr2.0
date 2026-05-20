@@ -117,7 +117,7 @@ export class RealRobotAdapter extends BaseRobotAdapter {
   recalibrateGyro() { this._conn.recalibrateGyro(); }
   setBrake(enabled) { this._conn.setBrake(enabled); }
   setArchitectureProfile(profile) { this._conn.setArchitectureProfile(profile); }
-  setDualMode(mode) { this.architectureProfile = mode === 'pc_browser' ? 'pc_slam' : 'hybrid'; this._conn.setDualMode(mode); }
+  setDualMode(mode) { this.architectureProfile = mode === 'pc_browser' ? 'debug_browser' : 'hybrid'; this._conn.setDualMode(mode); }
   sendConfig(config) { this._conn.sendConfig(config); }
   sendMapData(grid) { return this._conn.sendMapData(grid); }
 

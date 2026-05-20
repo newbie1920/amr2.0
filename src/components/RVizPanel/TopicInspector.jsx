@@ -75,11 +75,15 @@ const topicHzStyle = (active) => ({
 // ============================================================
 
 export default function TopicInspector({ telemetry, mapToOdom, grid, navSession, simInfo }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
 
   const telem = telemetry || {};
   const tf = mapToOdom || { dx: 0, dy: 0, dTheta: 0 };
   const lidar = telem.lidar || [];
+  const pathDebug = telem.pathDebug || null;
+  const planner = telem.planner || {};
+  const slam = telem.slam || {};
+  const track = telem.track || null;
   const hasData = !!telem.x;
 
   // Compute lidar stats
@@ -117,6 +121,12 @@ export default function TopicInspector({ telemetry, mapToOdom, grid, navSession,
       active: tf.dx !== 0 || tf.dy !== 0,
     },
     {
+      name: '/slam_tf',
+      value: `rms=${(slam.rms ?? 0).toFixed(3)} score=${(slam.score ?? 0).toFixed(2)} tf=${(slam.tfNorm ?? Math.hypot(tf.dx, tf.dy)).toFixed(3)}m/${(slam.tfDeg ?? (tf.dTheta * 180 / Math.PI)).toFixed(1)}deg scans=${slam.scans ?? grid?.scanCount ?? 0}`,
+      hz: '2Hz',
+      active: !!(telem.slam || tf.dx || tf.dy),
+    },
+    {
       name: '/map',
       value: grid
         ? `${grid.width}×${grid.height}  res=${grid.resolution}m  scans=${grid.scanCount}`
@@ -126,11 +136,49 @@ export default function TopicInspector({ telemetry, mapToOdom, grid, navSession,
     },
     {
       name: '/nav_status',
-      value: navSession?.active
-        ? `${navSession.status}  wp=${navSession.currentWaypointIndex}/${navSession.path?.length}`
-        : 'IDLE',
+      value: `${telem.nav ?? navSession?.status ?? 'IDLE'}  wp=${telem.navWp ?? navSession?.currentWaypointIndex ?? 0}/${telem.navTotal ?? navSession?.path?.length ?? 0}  rec=${telem.navRecoveryAttempts ?? 0}`,
       hz: '10Hz',
-      active: navSession?.active,
+      active: !!(navSession?.active || telem.nav),
+    },
+    {
+      name: '/planner_path',
+      value: pathDebug
+        ? `${pathDebug.planner ?? 'astar'} ${pathDebug.ok ? 'ok' : 'fail'}  wp=${pathDebug.waypoints?.length ?? 0}  raw=${pathDebug.rawCount ?? pathDebug.raw?.length ?? 0}/${pathDebug.rawTotal ?? 0}  stride=${pathDebug.rawStride ?? 1}  tgt=${telem.navWp ?? 0}`
+        : `planner=${planner.mode ?? 'astar'} debug=${planner.debugPath !== false}`,
+      hz: pathDebug ? 'event' : 'cfg',
+      active: !!(pathDebug || planner.mode),
+    },
+    {
+      name: '/trajectory',
+      value: telem.traj
+        ? `x=${(telem.traj.x ?? 0).toFixed(2)} y=${(telem.traj.y ?? 0).toFixed(2)} v=${(telem.traj.v ?? 0).toFixed(2)} ${telem.traj.profileType ?? 'profile'} p=${Math.round((telem.traj.progress ?? 0) * 100)}% target=${telem.traj.target ?? 0}`
+        : 'No trajectory reference',
+      hz: '50Hz',
+      active: !!telem.traj?.active,
+    },
+    {
+      name: '/tracking_error',
+      value: track
+        ? `eX=${(track.eX ?? 0).toFixed(3)} eY=${(track.eY ?? 0).toFixed(3)} body=${(track.bodyEx ?? 0).toFixed(3)}/${(track.bodyEy ?? 0).toFixed(3)} eYaw=${((track.eYaw ?? 0) * 180 / Math.PI).toFixed(1)}deg`
+        : 'No tracking data',
+      hz: '50Hz',
+      active: !!track,
+    },
+    {
+      name: '/track_cmd',
+      value: track
+        ? `cmd=${(track.cmdLinear ?? telem.linearVel ?? 0).toFixed(3)}/${(track.cmdAngular ?? telem.angularVel ?? 0).toFixed(3)} ref=${(track.refX ?? telem.traj?.x ?? 0).toFixed(2)},${(track.refY ?? telem.traj?.y ?? 0).toFixed(2)}`
+        : `cmd=${(telem.linearVel ?? 0).toFixed(3)}/${(telem.angularVel ?? 0).toFixed(3)}`,
+      hz: '50Hz',
+      active: !!(track || telem.linearVel || telem.angularVel),
+    },
+    {
+      name: '/wheel_pid',
+      value: telem.pid
+        ? `${telem.pid.mode ?? 'fixed'} L:${(telem.pid.lError ?? 0).toFixed(2)} R:${(telem.pid.rError ?? 0).toFixed(2)} pwm=${telem.pid.lPwm ?? 0}/${telem.pid.rPwm ?? 0}`
+        : `L:${(telem.targetVelL ?? 0).toFixed(2)}/${(telem.measuredVelL ?? 0).toFixed(2)} R:${(telem.targetVelR ?? 0).toFixed(2)}/${(telem.measuredVelR ?? 0).toFixed(2)}`,
+      hz: '50Hz',
+      active: !!(telem.pid || telem.targetVelL || telem.targetVelR),
     },
   ];
 

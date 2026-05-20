@@ -1,0 +1,19 @@
+{
+  "project": "AMR2.0",
+  "language": "vi",
+  "preferred_shell": "powershell",
+  "commands": {
+    "frontend_test": "npm.cmd run test",
+    "frontend_build": "npm.cmd run build",
+    "frontend_check": "npm.cmd run check",
+    "trajectory_benchmark": "npm.cmd run benchmark:trajectory",
+    "report_plots": "npm.cmd run report:plots",
+    "firmware_build": "python -m platformio run"
+  },
+  "paths": {
+    "firmware": "esp32s3xe_v2",
+    "app": "src",
+    "docs": "docs",
+    "tests": "tests"
+  }
+}

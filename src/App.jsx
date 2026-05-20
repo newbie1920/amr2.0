@@ -92,7 +92,7 @@ function SplitPane({ left, right, defaultRatio = 0.55, minLeft = 300, minRight =
 
 function App() {
   const [activePath, setActivePath] = useState(null);
-  const [viewMode, setViewMode] = useState('split'); // 'gazebo', 'rviz', 'split'
+  const [viewMode, setViewMode] = useState('rviz'); // 'gazebo', 'rviz', 'split'
   const [isLeftSidebarCollapsed, setIsLeftSidebarCollapsed] = useState(() => {
     return localStorage.getItem('amr_left_sidebar_collapsed') === 'true';
   });

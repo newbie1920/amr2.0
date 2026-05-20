@@ -1,7 +1,8 @@
-# AMR 2.0 v2 — Firmware Architecture
+# AMR 2.0 v2 — Firmware Vehicle-Brain Architecture
 
 > ESP32-S3 N16R8 | FreeRTOS | Layered Modular Design  
 > Ported from monolithic v1 (963 LOC main.cpp) → modular v2 (~2500 LOC across 20+ files)
+> The firmware is the operational brain for the physical robot; the app is the HMI/operator station.
 
 ---
 
@@ -33,7 +34,8 @@
 | **Layer 0: Core** | `robot_state`, `tasks`, `config`, `log` | Central state, task creation, constants |
 | **Layer 1: Drivers** | `motor_driver`, `encoder_driver`, `imu_mpu6050`, `lidar_a1m8`, `oled_display`, `ina3221_power`, `battery_adc` | Hardware abstraction |
 | **Layer 2: Perception** | `odometry`, `occupancy_grid`, `icp_matcher` | Sensor fusion, mapping, SLAM |
-| **Layer 3: Navigation** | `navigator`, `dwa_planner`, `pathfinder`, `frontier_explorer`, `pid_controller` | Path planning, obstacle avoidance |
+| **Layer 3: Navigation** | `navigator`, `dwa_planner`, `pathfinder`, `frontier_explorer`, future `trajectory` | Path planning, trajectory generation/tracking, obstacle avoidance |
+| **Layer 3b: Control** | current `pid_controller`, future `src/control` | Wheel velocity PID, adaptive PID/gain scheduling |
 | **Layer 4: Network** | `network_comm` (WiFi + WebSocket + MQTT + OTA) | Communication, telemetry, remote control |
 
 ## 3. Data Flow

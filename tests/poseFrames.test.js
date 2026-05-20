@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { resolveMapFramePose } from '../src/core/poseFrames.js';
 import { buildDirectPath, isDirectPathClear } from '../src/core/navigationPathPolicy.js';
+import { findPathOnGrid } from '../src/core/lidarPathfinder.js';
 
 function makeGrid({ blocked = [], lethal = [] } = {}) {
   const width = 10;
@@ -31,8 +32,15 @@ function makeGrid({ blocked = [], lethal = [] } = {}) {
     isOccupied(gx, gy) {
       return logOdds[gy * width + gx] > 0.3;
     },
+    getLogOdds(gx, gy) {
+      if (!this.inBounds(gx, gy)) return 1;
+      return logOdds[gy * width + gx];
+    },
     worldToGrid(wx, wy) {
       return { gx: Math.floor(wx), gy: Math.floor(wy) };
+    },
+    gridToWorld(gx, gy) {
+      return { x: gx + 0.5, y: gy + 0.5 };
     },
   };
 }
@@ -73,6 +81,27 @@ test('resolveMapFramePose prefers real PC SLAM map pose', () => {
   assert.equal(pose.frame, 'map');
 });
 
+test('resolveMapFramePose uses fast firmware map pose for real onboard robot', () => {
+  const robot = {
+    telemetry: {
+      x: 1,
+      y: 2,
+      headingRad: 0.1,
+      onboardNavEnabled: true,
+      slamMapX: 4,
+      slamMapY: 5,
+      slamMapTheta: 0.7,
+    },
+  };
+
+  const pose = resolveMapFramePose(robot, { mapToOdom: { r1: { dx: 10, dy: 10, dTheta: 1 } } }, 'r1');
+  assert.equal(pose.x, 1);
+  assert.equal(pose.y, 2);
+  assert.equal(pose.theta, 0.1);
+  assert.equal(pose.source, 'firmware');
+  assert.equal(pose.frame, 'map');
+});
+
 test('resolveMapFramePose falls back to mapToOdom for real PC SLAM', () => {
   const robot = {
     adapter: { architectureProfile: 'pc_slam' },
@@ -110,4 +139,15 @@ test('buildDirectPath inserts intermediate waypoints for a clear straight goal',
     { x: 0.5, y: 0 },
     { x: 0.75, y: 0 },
   ]);
+});
+
+test('findPathOnGrid preserves an inflated but non-lethal clicked goal', () => {
+  const grid = makeGrid({ lethal: [[5, 5, 100]] });
+  const result = findPathOnGrid(grid, 1.2, 1.2, 5.2, 5.2, {
+    allowUnknown: true,
+    useCostmap: true,
+  });
+
+  assert.equal(result.success, true);
+  assert.deepEqual(result.path[result.path.length - 1], { x: 5.2, y: 5.2 });
 });

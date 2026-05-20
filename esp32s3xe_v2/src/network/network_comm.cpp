@@ -47,6 +47,50 @@ static WiFiManager wm;
 
 static unsigned long lastTelemetryTime = 0;
 
+void broadcast_nav_path(const PathPlanDebug& debug, const Waypoint* waypoints, int waypointCount) {
+    JsonDocument msg;
+    msg["type"] = "nav_path";
+    msg["planner"] = debug.planner;
+    msg["ok"] = debug.ok;
+    msg["reason"] = debug.reason;
+    msg["planId"] = debug.planId;
+    msg["rawTotal"] = debug.rawTotal;
+    msg["rawStride"] = debug.rawStride;
+    msg["rawCount"] = debug.rawCount;
+    msg["debugPath"] = debug.debugPath;
+
+    JsonArray goal = msg["goal"].to<JsonArray>();
+    goal.add(debug.goalX);
+    goal.add(debug.goalY);
+
+    JsonArray wpArr = msg["waypoints"].to<JsonArray>();
+    int safeWpCount = constrain(waypointCount, 0, MAX_WAYPOINTS);
+    for (int i = 0; i < safeWpCount; i++) {
+        JsonArray pt = wpArr.add<JsonArray>();
+        pt.add(waypoints[i].x);
+        pt.add(waypoints[i].y);
+    }
+
+    if (debug.debugPath) {
+        JsonArray rawArr = msg["raw"].to<JsonArray>();
+        int safeRawCount = constrain(debug.rawCount, 0, PATHFINDER_DEBUG_MAX_RAW);
+        for (int i = 0; i < safeRawCount; i++) {
+            JsonArray pt = rawArr.add<JsonArray>();
+            pt.add(debug.rawX[i]);
+            pt.add(debug.rawY[i]);
+        }
+    }
+
+    static uint8_t buf[12288];
+    size_t required = measureMsgPack(msg);
+    if (required > sizeof(buf)) {
+        LOG_W("NAVPATH", "nav_path payload too large: %u > %u", (unsigned)required, (unsigned)sizeof(buf));
+        return;
+    }
+    size_t len = serializeMsgPack(msg, buf, sizeof(buf));
+    if (len > 0) webSocket.broadcastBIN(buf, len);
+}
+
 // ── Architecture Profile ────────────────────────────────────
 void setArchitectureProfile(const char* profile) {
     if (strcmp(profile, "pc_slam") == 0) {
@@ -237,8 +281,23 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
             }
             float endH = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
             navigator.loadPath(tempWps, count, endH);
-            JsonDocument ack; ack["type"] = "nav_ack"; ack["wp_count"] = count;
-            static uint8_t buf[64];
+            JsonDocument ack;
+            ack["type"] = "nav_ack";
+            ack["accepted"] = true;
+            ack["source"] = "navigate";
+            ack["wp_count"] = count;
+            ack["mode"] = (state.nav.mode == RobotState::MODE_PC_BROWSER) ? "debug_browser" : "onboard";
+            if (!isnan(endH)) ack["finalH"] = endH * 180.0f / PI;
+            static uint8_t buf[128];
+            size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+            webSocket.sendBIN(num, buf, len);
+        } else {
+            JsonDocument ack;
+            ack["type"] = "nav_ack";
+            ack["accepted"] = false;
+            ack["source"] = "navigate";
+            ack["reason"] = "invalid_path";
+            static uint8_t buf[96];
             size_t len = serializeMsgPack(ack, buf, sizeof(buf));
             webSocket.sendBIN(num, buf, len);
         }
@@ -252,7 +311,23 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
         req.startX = pose.x; req.startY = pose.y;
         req.goalX = doc["x"]; req.goalY = doc["y"];
         req.finalHeading = doc["finalHeading"].isNull() ? NAN : doc["finalHeading"].as<float>() * PI / 180.0f;
-        if (pathfinderQueue) xQueueSend(pathfinderQueue, &req, 0);
+        bool accepted = false;
+        const char* reason = "queue_unavailable";
+        if (pathfinderQueue) {
+            accepted = xQueueSend(pathfinderQueue, &req, 0) == pdTRUE;
+            reason = accepted ? "queued" : "queue_full";
+        }
+        JsonDocument ack;
+        ack["type"] = "goto_ack";
+        ack["accepted"] = accepted;
+        ack["reason"] = reason;
+        ack["x"] = req.goalX;
+        ack["y"] = req.goalY;
+        ack["mode"] = "onboard";
+        if (!isnan(req.finalHeading)) ack["finalH"] = req.finalHeading * 180.0f / PI;
+        static uint8_t buf[128];
+        size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+        webSocket.sendBIN(num, buf, len);
     }
 
     // ── Traffic (multi-robot obstacles) ──
@@ -279,8 +354,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
         // ACK
         JsonDocument ack;
         ack["type"] = "mode_ack";
-        ack["mode"] = (state.nav.mode == RobotState::MODE_PC_BROWSER) ? "pc_browser" : "onboard";
-        static uint8_t buf[64];
+        ack["mode"] = (state.nav.mode == RobotState::MODE_PC_BROWSER) ? "debug_browser" : "onboard";
+        ack["onboard_nav"] = state.nav.allowOnboardNav;
+        ack["grid_stream"] = state.nav.streamOccupancyGrid;
+        static uint8_t buf[128];
         size_t len = serializeMsgPack(ack, buf, sizeof(buf));
         webSocket.sendBIN(num, buf, len);
     }
@@ -305,8 +382,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
 
             JsonDocument ack;
             ack["type"] = "ext_wp_ack";
+            ack["accepted"] = true;
             ack["wp_count"] = count;
-            static uint8_t buf[64];
+            ack["mode"] = "debug_waypoints";
+            if (!isnan(endH)) ack["finalH"] = endH * 180.0f / PI;
+            static uint8_t buf[128];
             size_t len = serializeMsgPack(ack, buf, sizeof(buf));
             webSocket.sendBIN(num, buf, len);
         }
@@ -359,6 +439,98 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     }
 
     if (doc["cmd"] == "brake") state.motor.brakeEnabled = doc["val"];
+
+    const char* msgType = doc["type"] | "";
+    if (strcmp(msgType, "config") == 0 || doc["cmd"] == "config") {
+        JsonObject plannerCfg = doc["planner"].as<JsonObject>();
+        if (!plannerCfg.isNull()) {
+            const char* mode = plannerCfg["mode"] | "";
+            if (strcmp(mode, "theta_los") == 0 || strcmp(mode, "theta") == 0) {
+                pathfinder.setPlannerMode(PLANNER_THETA_LOS);
+            } else if (strcmp(mode, "astar") == 0 || strcmp(mode, "a_star") == 0) {
+                pathfinder.setPlannerMode(PLANNER_ASTAR);
+            }
+            if (!plannerCfg["debugPath"].isNull()) {
+                pathfinder.setDebugPathEnabled(plannerCfg["debugPath"].as<bool>());
+            }
+
+            JsonDocument ack;
+            ack["type"] = "config_ack";
+            ack["accepted"] = true;
+            ack["scope"] = "planner";
+            ack["mode"] = pathfinder.plannerModeName();
+            ack["debugPath"] = pathfinder.debugPathIsEnabled();
+            static uint8_t buf[160];
+            size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+            webSocket.sendBIN(num, buf, len);
+        }
+
+        JsonObject trajCfg = doc["trajectory"].as<JsonObject>();
+        if (!trajCfg.isNull()) {
+            TrajectoryConfig cfg = navigator.trajectoryConfig;
+            const char* mode = trajCfg["mode"] | "";
+            if (strcmp(mode, "adaptive_scurve") == 0 || strcmp(mode, "scurve") == 0) {
+                cfg.mode = TRAJ_PROFILE_ADAPTIVE_SCURVE;
+            } else if (strcmp(mode, "legacy_ramp") == 0 || strcmp(mode, "legacy") == 0) {
+                cfg.mode = TRAJ_PROFILE_LEGACY_RAMP;
+            }
+            if (!trajCfg["enabled"].isNull()) cfg.enabled = trajCfg["enabled"].as<bool>();
+            if (!trajCfg["vMax"].isNull()) cfg.vMax = trajCfg["vMax"].as<float>();
+            if (!trajCfg["aMax"].isNull()) cfg.aMax = trajCfg["aMax"].as<float>();
+            if (!trajCfg["jMax"].isNull()) cfg.jMax = trajCfg["jMax"].as<float>();
+            navigator.setTrajectoryConfig(cfg);
+
+            JsonDocument ack;
+            ack["type"] = "config_ack";
+            ack["accepted"] = true;
+            ack["scope"] = "trajectory";
+            ack["enabled"] = navigator.trajectoryConfig.enabled;
+            ack["mode"] = trajectoryProfileModeName(navigator.trajectoryConfig.mode);
+            ack["vMax"] = navigator.trajectoryConfig.vMax;
+            ack["aMax"] = navigator.trajectoryConfig.aMax;
+            ack["jMax"] = navigator.trajectoryConfig.jMax;
+            static uint8_t buf[192];
+            size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+            webSocket.sendBIN(num, buf, len);
+        }
+
+        JsonObject trackCfg = doc["tracking"].as<JsonObject>();
+        if (!trackCfg.isNull()) {
+            TrackingConfig cfg = navigator.trackingConfig;
+            const char* mode = trackCfg["mode"] | "";
+            if (strcmp(mode, "fl_regularized") == 0 || strcmp(mode, "feedback_linearized") == 0) {
+                cfg.mode = TRACK_CTRL_FL_REGULARIZED;
+            } else if (strcmp(mode, "backstepping") == 0 || strcmp(mode, "classic") == 0) {
+                cfg.mode = TRACK_CTRL_BACKSTEPPING;
+            }
+            if (!trackCfg["straightYawGuard"].isNull()) cfg.straightYawGuard = trackCfg["straightYawGuard"].as<bool>();
+            if (!trackCfg["straightYawGuardGain"].isNull()) cfg.straightYawGuardGain = trackCfg["straightYawGuardGain"].as<float>();
+            if (!trackCfg["lateralVelocityFloor"].isNull()) cfg.lateralVelocityFloor = trackCfg["lateralVelocityFloor"].as<float>();
+            if (!trackCfg["flLateralDecayMin"].isNull()) cfg.flLateralDecayMin = trackCfg["flLateralDecayMin"].as<float>();
+            if (!trackCfg["flSegmentAngularLimit"].isNull()) cfg.flSegmentAngularLimit = trackCfg["flSegmentAngularLimit"].as<float>();
+            if (!trackCfg["flKx"].isNull()) cfg.flKx = trackCfg["flKx"].as<float>();
+            if (!trackCfg["flKy"].isNull()) cfg.flKy = trackCfg["flKy"].as<float>();
+            if (!trackCfg["flKth"].isNull()) cfg.flKth = trackCfg["flKth"].as<float>();
+            navigator.setTrackingConfig(cfg);
+
+            JsonDocument ack;
+            ack["type"] = "config_ack";
+            ack["accepted"] = true;
+            ack["scope"] = "tracking";
+            ack["mode"] = navigator.trackingModeName();
+            ack["straightYawGuard"] = navigator.trackingConfig.straightYawGuard;
+            ack["straightYawGuardGain"] = navigator.trackingConfig.straightYawGuardGain;
+            ack["lateralVelocityFloor"] = navigator.trackingConfig.lateralVelocityFloor;
+            ack["flLateralDecayMin"] = navigator.trackingConfig.flLateralDecayMin;
+            ack["flSegmentAngularLimit"] = navigator.trackingConfig.flSegmentAngularLimit;
+            ack["flKx"] = navigator.trackingConfig.flKx;
+            ack["flKy"] = navigator.trackingConfig.flKy;
+            ack["flKth"] = navigator.trackingConfig.flKth;
+            static uint8_t buf[320];
+            size_t len = serializeMsgPack(ack, buf, sizeof(buf));
+            webSocket.sendBIN(num, buf, len);
+        }
+    }
 
     // ── Manual velocity control ──
     if (!doc["linear"].isNull() && !navigator.isNavigating()) {
@@ -611,6 +783,9 @@ static void broadcast_full_telemetry() {
     telem["explore"] = explorer.getStateName();
     telem["explore_goals"] = explorer.exploredGoals;
     telem["explore_frontiers"] = explorer.frontierCellCount;
+    JsonObject planner = telem["planner"].to<JsonObject>();
+    planner["mode"] = pathfinder.plannerModeName();
+    planner["debugPath"] = pathfinder.debugPathIsEnabled();
 
     // SLAM diagnostics
     JsonObject slam = telem["slam"].to<JsonObject>();
@@ -627,6 +802,59 @@ static void broadcast_full_telemetry() {
     telem["eX"] = navigator.error_x;
     telem["eY"] = navigator.error_y;
     telem["eYaw"] = navigator.error_yaw;
+
+    JsonObject traj = telem["traj"].to<JsonObject>();
+    traj["active"] = navigator.trajRef.active;
+    traj["done"] = navigator.trajRef.done;
+    traj["x"] = navigator.trajRef.x;
+    traj["y"] = navigator.trajRef.y;
+    traj["theta"] = navigator.trajRef.theta;
+    traj["v"] = navigator.trajRef.v;
+    traj["w"] = navigator.trajRef.w;
+    traj["target"] = navigator.trajRef.targetIndex;
+    traj["profileType"] = navigator.trajRef.profileType;
+    traj["profileMode"] = navigator.trajRef.profileMode;
+    traj["progress"] = navigator.trajRef.segmentProgress;
+    traj["segmentTime"] = navigator.trajRef.segmentTime;
+    traj["tTotal"] = navigator.trajRef.segmentDuration;
+    traj["enabled"] = navigator.trajectoryConfig.enabled;
+    traj["mode"] = trajectoryProfileModeName(navigator.trajectoryConfig.mode);
+    traj["vMax"] = navigator.trajectoryConfig.vMax;
+    traj["aMax"] = navigator.trajectoryConfig.aMax;
+    traj["jMax"] = navigator.trajectoryConfig.jMax;
+
+    JsonObject track = telem["track"].to<JsonObject>();
+    track["eX"] = navigator.error_x;
+    track["eY"] = navigator.error_y;
+    track["eYaw"] = navigator.error_yaw;
+    track["bodyEx"] = navigator.body_error_x;
+    track["bodyEy"] = navigator.body_error_y;
+    track["cmdLinear"] = navigator.cmdLinear;
+    track["cmdAngular"] = navigator.cmdAngular;
+    track["refX"] = navigator.ref_x;
+    track["refY"] = navigator.ref_y;
+    track["refTheta"] = navigator.ref_theta;
+    track["refV"] = navigator.ref_v;
+    track["refW"] = navigator.ref_w;
+    track["controller"] = navigator.trackingModeName();
+    track["straightYawGuard"] = navigator.trackingConfig.straightYawGuard;
+    track["lateralVelocityFloor"] = navigator.trackingConfig.lateralVelocityFloor;
+    track["flLateralDecayMin"] = navigator.trackingConfig.flLateralDecayMin;
+    track["flSegmentAngularLimit"] = navigator.trackingConfig.flSegmentAngularLimit;
+
+    JsonObject pid = telem["pid"].to<JsonObject>();
+    pid["mode"] = "fixed";
+    pid["lTarget"] = state.motor.targetLeftVel;
+    pid["rTarget"] = state.motor.targetRightVel;
+    pid["lMeasured"] = vL;
+    pid["rMeasured"] = vR;
+    pid["lError"] = leftPID.getLastError();
+    pid["rError"] = rightPID.getLastError();
+    pid["lPwm"] = (int)state.motor.pwmLeft;
+    pid["rPwm"] = (int)state.motor.pwmRight;
+    pid["kp"] = leftPID.getKp();
+    pid["ki"] = leftPID.getKi();
+    pid["kd"] = leftPID.getKd();
 
     // INA3221 power
     if (state.power.inaAvailable) {

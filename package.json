@@ -8,6 +8,8 @@
     "build": "vite build",
     "test": "node --test \"tests/**/*.test.js\"",
     "check": "npm run test && npm run build",
+    "report:plots": "node scripts/generate_report_plots.js",
+    "benchmark:trajectory": "node scripts/benchmark_trajectory_tracking.js",
     "preview": "vite preview",
     "tauri": "tauri",
     "clean-bg": "powershell.exe -ExecutionPolicy Bypass -File .\\scripts\\kill_background_tasks.ps1"

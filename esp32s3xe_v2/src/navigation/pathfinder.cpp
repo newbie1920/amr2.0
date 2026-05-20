@@ -149,6 +149,61 @@ float AStarPathfinder::heuristic(int x1, int y1, int x2, int y2) const {
     return 1.0f * (dx + dy) + (1.414f - 2.0f) * std::min(dx, dy);
 }
 
+void AStarPathfinder::gridToWorld(int gx, int gy, float& wx, float& wy) const {
+    if (slamMap) {
+        wx = slamMap->grid_to_world_x(gx);
+        wy = slamMap->grid_to_world_y(gy);
+    } else {
+        wx = gx * mapResolution;
+        wy = gy * mapResolution;
+    }
+}
+
+bool AStarPathfinder::lineOfSightClear(int x0, int y0, int x1, int y1, uint8_t safetyThreshold) const {
+    int dx = abs(x1 - x0);
+    int dy = abs(y1 - y0);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+    int x = x0;
+    int y = y0;
+
+    for (;;) {
+        if (getCombinedCost(x, y) >= safetyThreshold) return false;
+        if (x == x1 && y == y1) return true;
+
+        int e2 = 2 * err;
+        if (e2 > -dy) {
+            err -= dy;
+            x += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y += sy;
+        }
+        if (x < 0 || x >= mapWidth || y < 0 || y >= mapHeight) return false;
+    }
+}
+
+void AStarPathfinder::fillDebugRaw(PathPlanDebug* debug, const int* pathX, const int* pathY, int rawLen) const {
+    if (!debug || !debugPathEnabled || rawLen <= 0) return;
+
+    debug->rawTotal = rawLen;
+    int sampleCount = std::min(rawLen, PATHFINDER_DEBUG_MAX_RAW);
+    debug->rawCount = sampleCount;
+    debug->rawStride = (rawLen <= PATHFINDER_DEBUG_MAX_RAW)
+        ? 1
+        : (rawLen + PATHFINDER_DEBUG_MAX_RAW - 1) / PATHFINDER_DEBUG_MAX_RAW;
+
+    for (int i = 0; i < sampleCount; i++) {
+        int src = (sampleCount <= 1)
+            ? 0
+            : (int)roundf((float)i * (float)(rawLen - 1) / (float)(sampleCount - 1));
+        src = constrain(src, 0, rawLen - 1);
+        gridToWorld(pathX[src], pathY[src], debug->rawX[i], debug->rawY[i]);
+    }
+}
+
 // ── Douglas-Peucker path simplification ──────────────────────
 // Operates on the raw node-pool indices list to avoid extra allocation.
 static float perpendicularDist(int px, int py, int ax, int ay, int bx, int by) {
@@ -184,8 +239,20 @@ static void dpSimplify(const int* xs, const int* ys, int start, int end,
 
 int AStarPathfinder::computePath(float startX, float startY,
                                   float goalX,  float goalY,
-                                  Waypoint* outPath, int maxWaypoints) {
-    if (!isInitialized() || !nodePool || !nodeIdx) return 0;
+                                  Waypoint* outPath, int maxWaypoints,
+                                  PathPlanDebug* debug) {
+    if (debug) {
+        *debug = PathPlanDebug{};
+        debug->planner = plannerModeName();
+        debug->debugPath = debugPathEnabled;
+        debug->goalX = goalX;
+        debug->goalY = goalY;
+    }
+
+    if (!isInitialized() || !nodePool || !nodeIdx) {
+        if (debug) debug->reason = "not_initialized";
+        return 0;
+    }
 
     // Convert world → grid coordinates
     // When using SLAM map, use its origin-aware helpers for correct conversion
@@ -210,6 +277,7 @@ int AStarPathfinder::computePath(float startX, float startY,
 
     if (getCombinedCost(goalGX, goalGY) >= PATHFINDER_COST_LETHAL) {
         Serial.println("[A*] Goal is in lethal zone!");
+        if (debug) debug->reason = "goal_lethal";
         return 0;
     }
 
@@ -314,6 +382,7 @@ int AStarPathfinder::computePath(float startX, float startY,
 
     if (bestNodeIdx == -1) {
         Serial.println("[A*] No path found.");
+        if (debug) debug->reason = "no_path";
         return 0;
     }
 
@@ -324,7 +393,11 @@ int AStarPathfinder::computePath(float startX, float startY,
     if (!pathX) {
         pathX = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
         pathY = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
-        if (!pathX || !pathY) { Serial.println("[A*] PSRAM alloc failed for path!"); return 0; }
+        if (!pathX || !pathY) {
+            Serial.println("[A*] PSRAM alloc failed for path!");
+            if (debug) debug->reason = "alloc_path_failed";
+            return 0;
+        }
     }
     int rawLen = 0;
 
@@ -333,7 +406,11 @@ int AStarPathfinder::computePath(float startX, float startY,
         static int* tmp = nullptr;
         if (!tmp) {
             tmp = (int*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(int), MALLOC_CAP_SPIRAM);
-            if (!tmp) { Serial.println("[A*] PSRAM alloc failed for tmp!"); return 0; }
+            if (!tmp) {
+                Serial.println("[A*] PSRAM alloc failed for tmp!");
+                if (debug) debug->reason = "alloc_tmp_failed";
+                return 0;
+            }
         }
         int tmpLen = 0;
         int curr   = bestNodeIdx;
@@ -349,17 +426,42 @@ int AStarPathfinder::computePath(float startX, float startY,
         }
     }
 
-    // ── Douglas-Peucker smoothing (eps = 1.5 cells ≈ 15 cm) ─
+    fillDebugRaw(debug, pathX, pathY, rawLen);
+    if (rawLen <= 0) {
+        if (debug) debug->reason = "empty_raw_path";
+        return 0;
+    }
+
+    // ── Douglas-Peucker or LOS smoothing ─────────────────────
     const float DP_EPS = 1.5f;
     static bool* keep = nullptr;
     if (!keep) {
         keep = (bool*)heap_caps_malloc(PATHFINDER_MAX_NODES * sizeof(bool), MALLOC_CAP_SPIRAM);
-        if (!keep) { Serial.println("[A*] PSRAM alloc failed for keep!"); return 0; }
+        if (!keep) {
+            Serial.println("[A*] PSRAM alloc failed for keep!");
+            if (debug) debug->reason = "alloc_keep_failed";
+            return 0;
+        }
     }
     memset(keep, 0, rawLen * sizeof(bool));
     keep[0]        = true;
     keep[rawLen-1] = true;
-    dpSimplify(pathX, pathY, 0, rawLen - 1, DP_EPS, keep);
+    if (plannerMode == PLANNER_THETA_LOS && rawLen > 2) {
+        int anchor = 0;
+        while (anchor < rawLen - 1) {
+            int farthest = anchor + 1;
+            for (int j = rawLen - 1; j > anchor + 1; j--) {
+                if (lineOfSightClear(pathX[anchor], pathY[anchor], pathX[j], pathY[j], 180)) {
+                    farthest = j;
+                    break;
+                }
+            }
+            keep[farthest] = true;
+            anchor = farthest;
+        }
+    } else {
+        dpSimplify(pathX, pathY, 0, rawLen - 1, DP_EPS, keep);
+    }
 
     // ── Build Waypoint output ────────────────────────────────
     int wpCount = 0;
@@ -372,14 +474,7 @@ int AStarPathfinder::computePath(float startX, float startY,
         float dy = (float)(cy - prevY);
         float hdg = (dx != 0.0f || dy != 0.0f) ? atan2f(dy, dx) : 0.0f;
 
-        // Convert grid → world using mapper helpers if SLAM, else raw multiplication
-        if (slamMap) {
-            outPath[wpCount].x = slamMap->grid_to_world_x(cx);
-            outPath[wpCount].y = slamMap->grid_to_world_y(cy);
-        } else {
-            outPath[wpCount].x = cx * mapResolution;
-            outPath[wpCount].y = cy * mapResolution;
-        }
+        gridToWorld(cx, cy, outPath[wpCount].x, outPath[wpCount].y);
         outPath[wpCount].heading    = hdg;
         outPath[wpCount].useReverse = false;
 
@@ -389,5 +484,13 @@ int AStarPathfinder::computePath(float startX, float startY,
 
     Serial.printf("[A*] Path found! Raw: %d nodes → Smoothed: %d WPs (used %d pool nodes)\n",
                   rawLen, wpCount, nodeCount);
+    if (wpCount > 0) {
+        outPath[wpCount - 1].x = goalX;
+        outPath[wpCount - 1].y = goalY;
+    }
+    if (debug) {
+        debug->ok = wpCount > 0;
+        debug->reason = wpCount > 0 ? "ok" : "empty_waypoints";
+    }
     return wpCount;
 }

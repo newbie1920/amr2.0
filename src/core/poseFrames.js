@@ -12,6 +12,11 @@ function telemetryPose(telem = {}) {
   return { x, y, theta: normalizeAngle(theta), source: 'odom', frame: 'odom' };
 }
 
+function firmwareMapPose(telem = {}) {
+  const pose = telemetryPose(telem);
+  return { ...pose, source: 'firmware', frame: 'map' };
+}
+
 export function isPcSlamRobot(robot) {
   const telem = robot?.telemetry || {};
   return !!(
@@ -30,9 +35,15 @@ export function isPcSlamRobot(robot) {
 export function resolveMapFramePose(robot, mapState, robotId) {
   const telem = robot?.telemetry || {};
   const odom = telemetryPose(telem);
+  const pcSlam = isPcSlamRobot(robot);
 
-  if (!isPcSlamRobot(robot)) {
+  const isSimOrHitl = !!(robot?._sim || telem.hitl || robot?.connection?.hitlEnabled);
+  if (isSimOrHitl) {
     return odom;
+  }
+
+  if (!pcSlam) {
+    return firmwareMapPose(telem);
   }
 
   const slamX = finiteNumber(telem.slamMapX);
