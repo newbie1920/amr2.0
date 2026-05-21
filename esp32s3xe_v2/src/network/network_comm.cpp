@@ -31,6 +31,7 @@
 #include "ina3221_power.h"
 #include "tasks.h"
 #include "encoder_driver.h"
+#include "drive_control.h"
 
 // ── External instances (from tasks.cpp) ─────────────────────
 extern Navigator navigator;
@@ -535,10 +536,21 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length)
     // ── Manual velocity control ──
     if (!doc["linear"].isNull() && !navigator.isNavigating()) {
         if (!state.motor.brakeEnabled) {
-            float v = doc["linear"], w = doc["angular"];
-            state.motor.targetLeftVel  = constrain((v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-            state.motor.targetRightVel = constrain((v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS, -30.0f, 30.0f);
-            state.motor.lastCmdTime = millis();
+            static bool manualStraightHoldActive = false;
+            static float manualStraightHoldTheta = 0.0f;
+
+            float v = doc["linear"];
+            float w = doc["angular"] | 0.0f;
+            PoseSnapshot pose = getOdomPose();
+            const bool straightHold = driveCanHoldStraight(v, w);
+            if (straightHold && !manualStraightHoldActive) {
+                manualStraightHoldTheta = pose.theta;
+                manualStraightHoldActive = true;
+            } else if (!straightHold) {
+                manualStraightHoldActive = false;
+            }
+            driveSetVelocityTargets(v, w, manualStraightHoldActive,
+                                    manualStraightHoldTheta, pose.theta);
         }
     }
 }
@@ -841,6 +853,15 @@ static void broadcast_full_telemetry() {
     track["lateralVelocityFloor"] = navigator.trackingConfig.lateralVelocityFloor;
     track["flLateralDecayMin"] = navigator.trackingConfig.flLateralDecayMin;
     track["flSegmentAngularLimit"] = navigator.trackingConfig.flSegmentAngularLimit;
+
+    JsonObject drive = telem["drive"].to<JsonObject>();
+    drive["hold"] = state.motor.headingHoldActive;
+    drive["v"] = state.motor.cmdLinear;
+    drive["wReq"] = state.motor.cmdAngularRequested;
+    drive["wApplied"] = state.motor.cmdAngularApplied;
+    drive["wMeasured"] = w_fused;
+    drive["headingErr"] = state.motor.headingHoldError;
+    drive["headingCorr"] = state.motor.headingHoldCorrection;
 
     JsonObject pid = telem["pid"].to<JsonObject>();
     pid["mode"] = "fixed";

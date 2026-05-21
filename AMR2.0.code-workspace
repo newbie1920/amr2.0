@@ -4,8 +4,8 @@
 			"path": "."
 		},
 		{
-			"name": "esp32s3xe",
-			"path": "../../Users/ADMIN/Documents/PlatformIO/Projects/esp32s3xe"
+			"name": "esp32s3xe_v2",
+			"path": "esp32s3xe_v2"
 		}
 	],
 	"settings": {}

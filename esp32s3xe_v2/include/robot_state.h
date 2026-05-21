@@ -59,7 +59,13 @@ struct RobotState {
         float targetRightVel = 0.0f;
         float pwmLeft  = 0.0f;
         float pwmRight = 0.0f;
+        float cmdLinear = 0.0f;
+        float cmdAngularRequested = 0.0f;
+        float cmdAngularApplied = 0.0f;
+        float headingHoldError = 0.0f;
+        float headingHoldCorrection = 0.0f;
         unsigned long lastCmdTime = 0;
+        bool headingHoldActive = false;
         bool brakeEnabled = false;
     } motor;
 
@@ -104,6 +110,35 @@ struct RobotState {
         const char* archProfile = "hybrid";
         NavMode mode = MODE_ONBOARD;
     } nav;
+
+    // Bench 1m straight-run diagnostic (runtime only, no flash writes).
+    struct {
+        bool active = false;
+        bool completed = false;
+        uint32_t runId = 0;
+        const char* status = "idle";
+        const char* reason = "idle";
+        float targetDistance = 1.0f;
+        float speed = 0.12f;
+        float startX = 0.0f;
+        float startY = 0.0f;
+        float startTheta = 0.0f;
+        float startOdomDistance = 0.0f;
+        long startLeftTicks = 0;
+        long startRightTicks = 0;
+        unsigned long startMs = 0;
+        unsigned long elapsedMs = 0;
+        float distance = 0.0f;
+        float straightLineDistance = 0.0f;
+        float headingDelta = 0.0f;
+        float leftDistance = 0.0f;
+        float rightDistance = 0.0f;
+        long leftTicks = 0;
+        long rightTicks = 0;
+        float avgPwmLeft = 0.0f;
+        float avgPwmRight = 0.0f;
+        uint16_t samples = 0;
+    } bench;
 
     // ── ICP/SLAM diagnostics ──
     struct {

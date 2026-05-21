@@ -31,6 +31,7 @@
 #include "pathfinder_types.h"
 #include "frontier_explorer.h"
 #include "network_comm.h"
+#include "drive_control.h"
 
 // ── PID controllers (allocated once) ─────────────────────────
 WheelPID leftPID(KP_VEL, KI_VEL, 0, FF_GAIN_LEFT, 1.0f / CONTROL_FREQ_HZ, 5.0f, (float)MIN_PWM);
@@ -52,10 +53,6 @@ FrontierExplorer explorer;
 // ── FreeRTOS Queue for GoTo requests ─────────────────────────
 QueueHandle_t pathfinderQueue = NULL;
 static unsigned long lastDwaTime = 0;
-static constexpr float NAV_STRAIGHT_RATE_HOLD_GAIN = 0.35f;
-static constexpr float NAV_STRAIGHT_RATE_HOLD_MAX_W = 0.12f;
-static constexpr float NAV_STRAIGHT_RATE_HOLD_W_BAND = 0.12f;
-static constexpr float NAV_STRAIGHT_RATE_HOLD_MIN_V = 0.04f;
 
 // ============================================================
 //   CONTROL TASK (Core 1, 50Hz)
@@ -77,6 +74,7 @@ void controlTask(void* pvParameters) {
         if (millis() - state.motor.lastCmdTime > CMD_TIMEOUT_MS) {
             state.motor.targetLeftVel = 0;
             state.motor.targetRightVel = 0;
+            state.motor.headingHoldActive = false;
         }
 
         // ── Brake override ───────────────────────────────
@@ -85,24 +83,12 @@ void controlTask(void* pvParameters) {
         if (state.motor.brakeEnabled) {
             targetL = 0;
             targetR = 0;
+            state.motor.headingHoldActive = false;
         }
 
-        // ── Cross-coupling sync ──────────────────────────
-        float sync = (state.motor.vL_meas - state.motor.vR_meas) - (targetL - targetR);
-        if (fabsf(targetL) > 0.01f || fabsf(targetR) > 0.01f) {
-            targetL -= 0.5f * sync;
-            targetR += 0.5f * sync;
-        }
-
-        // ── PID compute ──────────────────────────────────
+        // ── Independent wheel PID compute ────────────────
         float pwmL = leftPID.update(state.motor.vL_meas, targetL);
         float pwmR = rightPID.update(state.motor.vR_meas, targetR);
-
-        // Cross-coupling PWM adjustment
-        if (fabsf(targetL) > 0.01f || fabsf(targetR) > 0.01f) {
-            pwmL -= 3.0f * sync;
-            pwmR += 3.0f * sync;
-        }
 
         pwmL = constrain(pwmL, -255.0f, 255.0f);
         pwmR = constrain(pwmR, -255.0f, 255.0f);
@@ -151,20 +137,13 @@ void controlTask(void* pvParameters) {
             // Convert (v, w) → wheel velocities
             float v = navigator.cmdLinear;
             float w = navigator.cmdAngular;
-            if (navigator.state == NAV_TRACKING &&
-                fabsf(v) > NAV_STRAIGHT_RATE_HOLD_MIN_V &&
-                fabsf(w) < NAV_STRAIGHT_RATE_HOLD_W_BAND) {
-                const float measuredW = (state.motor.vR_meas - state.motor.vL_meas) *
-                                        WHEEL_RADIUS / WHEEL_SEPARATION;
-                const float rateHold = constrain((w - measuredW) * NAV_STRAIGHT_RATE_HOLD_GAIN,
-                                                 -NAV_STRAIGHT_RATE_HOLD_MAX_W,
-                                                 NAV_STRAIGHT_RATE_HOLD_MAX_W);
-                w += rateHold;
-                navigator.cmdAngular = w;
-            }
-            state.motor.targetLeftVel  = (v - w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS;
-            state.motor.targetRightVel = (v + w * WHEEL_SEPARATION / 2.0f) / WHEEL_RADIUS;
-            state.motor.lastCmdTime = millis();
+            const bool straightHold =
+                navigator.state == NAV_TRACKING &&
+                fabsf(navigator.ref_w) < 0.001f &&
+                driveCanHoldStraight(v, w);
+            DriveTargetResult drive = driveSetVelocityTargets(
+                v, w, straightHold, navigator.ref_theta, mapPose.theta);
+            navigator.cmdAngular = drive.angular;
         }
 
         // ── Feed WDT ─────────────────────────────────────
